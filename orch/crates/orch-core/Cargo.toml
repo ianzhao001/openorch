@@ -1,0 +1,10 @@
+[package]
+name = "orch-core"
+version = "0.1.0"
+edition = "2021"
+description = "多 Agent 协同机制：协议 v0 域模型与投影（design/01-02）"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"

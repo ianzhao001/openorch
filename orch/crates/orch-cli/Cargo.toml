@@ -1,0 +1,16 @@
+[package]
+name = "orch-cli"
+version = "0.1.0"
+edition = "2021"
+description = "多 Agent 协同机制运行时 CLI（M1 切片：doctor / status / schema）"
+
+[[bin]]
+name = "orch"
+path = "src/main.rs"
+
+[dependencies]
+orch-core = { path = "../orch-core" }
+orch-host = { path = "../orch-host" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
