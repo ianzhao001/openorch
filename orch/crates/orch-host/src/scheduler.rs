@@ -85,6 +85,62 @@ pub struct DomainAdmission<'a> {
     pub domain_capacity: usize,
 }
 
+/// Dependency-specific dispatch decision.  An unfinished dependency and a
+/// completed dependency that is absent from the attempt baseline require
+/// different operator actions, so they remain distinct typed outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependencyAdmission {
+    Admitted,
+    BlockedByDependency {
+        blockers: Vec<String>,
+    },
+    ForwardBaselineRequired {
+        dependency: String,
+        merge_sha: String,
+        attempt_base_sha: String,
+    },
+}
+
+/// Decide whether a task's declared dependencies admit one concrete attempt
+/// baseline.  Missing dependencies take precedence over stale-baseline
+/// repair so callers never conflate "not finished" with "finished, but this
+/// tree is old".  Both dependency order and duplicate declarations are kept.
+pub fn dependency_dispatch_admission(
+    depends_on: &[String],
+    recorded_with_merge: &[(String, String)],
+    attempt_base_sha: Option<&str>,
+    base_contains: &dyn Fn(&str) -> bool,
+) -> DependencyAdmission {
+    let recorded = recorded_with_merge
+        .iter()
+        .map(|(task, _)| task.clone())
+        .collect::<Vec<_>>();
+    let blockers = crate::plan::task_dependency_blockers(depends_on, &recorded);
+    if !blockers.is_empty() {
+        return DependencyAdmission::BlockedByDependency { blockers };
+    }
+
+    let Some(attempt_base_sha) = attempt_base_sha else {
+        return DependencyAdmission::Admitted;
+    };
+    for dependency in depends_on {
+        if let Some((_, merge_sha)) = recorded_with_merge
+            .iter()
+            .find(|(task, _)| task == dependency)
+        {
+            if !base_contains(merge_sha) {
+                return DependencyAdmission::ForwardBaselineRequired {
+                    dependency: dependency.clone(),
+                    merge_sha: merge_sha.clone(),
+                    attempt_base_sha: attempt_base_sha.to_string(),
+                };
+            }
+        }
+    }
+
+    DependencyAdmission::Admitted
+}
+
 /// Exact identity of one review slot.  Review delivery is intentionally keyed
 /// by all four fields: task-only matching can release the other role's slot.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -188,6 +244,13 @@ pub fn agent_inflight_load_from_events(
 ) -> Result<BTreeMap<String, Vec<LoadItem>>, String> {
     let mut implementations = BTreeMap::<(String, String), (String, LoadItem)>::new();
     let mut reviews = BTreeMap::<(String, String), (String, LoadItem)>::new();
+    let mut panel_reviews =
+        BTreeMap::<(String, String, String, u32), (String, LoadItem)>::new();
+    let mut panel_wakes = BTreeMap::<
+        String,
+        ((String, String, String, u32), String),
+    >::new();
+    let mut managed_panel_terminals = BTreeSet::<String>::new();
 
     for event in events.iter().filter(|event| same_round(event, round)) {
         match event.kind.as_str() {
@@ -201,6 +264,14 @@ pub fn agent_inflight_load_from_events(
             "TaskRecorded" => {
                 let task_id = required_task_id(event)?;
                 implementations.retain(|(task, _), _| task != &task_id);
+                // A legacy formal channel can legitimately close through a
+                // signed nongate substitution and therefore never produce a
+                // ReviewDelivered for the failed reviewer; retaining that
+                // request after TaskRecorded would leak capacity forever.
+                // Panel routes are different: their managed process capacity
+                // is released only by the exact seat/wake terminal facts
+                // below, never by a task-level shortcut.
+                reviews.retain(|(task, _), _| task != &task_id);
             }
             "AttemptBlocked" | "AttemptCrashed" | "AttemptTimedOut" | "AttemptFailed" => {
                 let task_id = required_task_id(event)?;
@@ -222,6 +293,23 @@ pub fn agent_inflight_load_from_events(
             "ReportObserved" => {}
             "ReviewRequested" => {
                 let role = required_payload_string(event, "role")?;
+                let wake_id = event_payload_string(event, "wakeId");
+                let panel_reserved = wake_id.is_some_and(|wake_id| {
+                    panel_reviews.values().any(|(_, pending)| {
+                        events.iter().any(|candidate| {
+                            candidate.kind == "ReviewSeatRouted"
+                                && candidate.task_id.as_deref() == Some(pending.task_id.as_str())
+                                && event_payload_string(candidate, "attemptId")
+                                    == Some(pending.attempt_id.as_str())
+                                && event_payload_string(candidate, "agent")
+                                    == event_payload_string(event, "agent")
+                                && event_payload_string(candidate, "wakeId") == Some(wake_id)
+                        })
+                    })
+                });
+                if panel_reserved {
+                    continue;
+                }
                 let (agent, item) = load_item(event, LoadKind::Review, Some(role.clone()))?;
                 // B157 defines one current expectation per task/role. A new
                 // request supersedes that exact slot, including its old agent.
@@ -248,12 +336,88 @@ pub fn agent_inflight_load_from_events(
                     reviews.remove(&(task_id, role));
                 }
             }
+            "ReviewSeatRouted" => {
+                let decoded = crate::ledger::decode_runtime_event_v1(event)
+                    .map_err(|error| format!("ReviewSeatRouted decode failed: {error:#}"))?;
+                let Some(crate::ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route)) = decoded
+                else {
+                    return Err("ReviewSeatRouted kind/payload mismatch".to_string());
+                };
+                let wake_id = route.wake_id.clone();
+                let (agent, item) = load_item(event, LoadKind::Review, Some(route.role))?;
+                let key = (
+                    item.task_id.clone(),
+                    item.attempt_id.clone(),
+                    route.seat_id,
+                    route.generation,
+                );
+                if panel_reviews
+                    .insert(key.clone(), (agent.clone(), item))
+                    .is_some()
+                    || panel_wakes.insert(wake_id, (key, agent)).is_some()
+                {
+                    return Err("duplicate panel route capacity identity".to_string());
+                }
+            }
+            "ReviewSeatTerminated" => {
+                let decoded = crate::ledger::decode_runtime_event_v1(event)
+                    .map_err(|error| format!("ReviewSeatTerminated decode failed: {error:#}"))?;
+                let Some(crate::ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(terminal)) =
+                    decoded
+                else {
+                    return Err("ReviewSeatTerminated kind/payload mismatch".to_string());
+                };
+                let task_id = required_task_id(event)?;
+                let key = (
+                    task_id,
+                    terminal.attempt_id,
+                    terminal.seat_id,
+                    terminal.generation,
+                );
+                let Some((routed_key, routed_agent)) = panel_wakes.get(&terminal.wake_id) else {
+                    return Err("ReviewSeatTerminated lacks routed capacity identity".to_string());
+                };
+                if event.actor != "runtime:orch"
+                    || event.round.as_deref() != Some(round)
+                    || routed_key != &key
+                    || routed_agent != &terminal.agent
+                {
+                    return Err("ReviewSeatTerminated capacity authority is not exact".to_string());
+                }
+                panel_reviews.remove(&key);
+            }
+            "ManagedWakeTerminated" => {
+                let Some(wake_id) = event_payload_string(event, "wakeId") else {
+                    continue;
+                };
+                let Some((key, routed_agent)) = panel_wakes.get(wake_id) else {
+                    continue;
+                };
+                let exact = event.actor == "runtime:orch"
+                    && event.round.as_deref() == Some(round)
+                    && event.task_id.as_deref() == Some(key.0.as_str())
+                    && event_payload_string(event, "agent") == Some(routed_agent.as_str())
+                    && event
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("managedScopeTerminated"))
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true);
+                if !exact || !managed_panel_terminals.insert(wake_id.to_string()) {
+                    return Err("panel ManagedWakeTerminated authority is not exact".to_string());
+                }
+                panel_reviews.remove(key);
+            }
             _ => {}
         }
     }
 
     let mut load = BTreeMap::<String, Vec<LoadItem>>::new();
-    for (agent, item) in implementations.into_values().chain(reviews.into_values()) {
+    for (agent, item) in implementations
+        .into_values()
+        .chain(reviews.into_values())
+        .chain(panel_reviews.into_values())
+    {
         load.entry(agent).or_default().push(item);
     }
     for items in load.values_mut() {
@@ -1042,6 +1206,38 @@ quotaDomains:
 
         let exact = b262_review_delivery("B262", "B262-A0001", "primary", "executor-opencode", 1);
         assert!(b262_review_items(&[requested, exact]).is_empty());
+    }
+
+    #[test]
+    fn b310_task_recorded_releases_unanswered_substituted_formal_capacity() {
+        let failed_primary =
+            b246_review_request("B310", "B310-A0002", "primary", "executor-opencode");
+        let unrelated =
+            b246_review_request("B999", "B999-A0001", "primary", "executor-opencode");
+        let substituted = crate::ledger::event(
+            "ReviewSeatSubstituted",
+            "runtime:orch",
+            Some("B310"),
+            Some("rB246"),
+            serde_json::json!({
+                "attemptId": "B310-A0002",
+                "role": "primary",
+                "fromAgent": "executor-opencode",
+                "toAgent": "executor-dsh",
+            }),
+        );
+        let recorded = crate::ledger::event(
+            "TaskRecorded",
+            "runtime:orch",
+            Some("B310"),
+            Some("rB246"),
+            serde_json::json!({"postMergeGates": "all-green"}),
+        );
+
+        let remaining = b262_review_items(&[failed_primary, unrelated, substituted, recorded]);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].task_id, "B999");
+        assert_eq!(remaining[0].attempt_id, "B999-A0001");
     }
 
     #[test]

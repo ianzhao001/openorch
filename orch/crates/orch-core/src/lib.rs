@@ -68,11 +68,35 @@ pub fn event_schema_json() -> String {
 // ─────────────────────────── 事件目录（单一事实源） ───────────────────────────
 
 /// Review 槽位生命周期事件；它们是已知事实，但不改变 Task 状态投影。
-pub const REVIEW_LIFECYCLE_EVENT_KINDS: [&str; 2] =
-    ["ReviewRequested", "ReviewDelivered"];
+pub const REVIEW_LIFECYCLE_EVENT_KINDS: [&str; 2] = ["ReviewRequested", "ReviewDelivered"];
+
+// B303 quorum facts are kept separate so the frozen B202 lifecycle seam stays
+// byte- and meaning-stable while the aggregate event catalog remains complete.
+const REVIEW_QUORUM_EVENT_KINDS: [&str; 3] = [
+    "ReviewFallbackSelected",
+    "NongateReviewDelivered",
+    "ReviewSeatSubstituted",
+];
+
+// B310 freezes the event vocabulary consumed by the dynamic review pool and
+// the later gate-lane cards.  Keeping the set here makes projection, doctor,
+// archive replay, and every future producer share one catalog entry point.
+const RUNTIME_POLICY_EVENT_KINDS: [&str; 10] = [
+    "RuntimePolicyActivated",
+    "RuntimePolicyDeactivated",
+    "ReviewSpoolPromoted",
+    "ReviewPanelSelected",
+    "ReviewSeatRouted",
+    "ReviewSeatTerminated",
+    "ReviewPanelClosed",
+    "GateLaneEscalated",
+    "GateReused",
+    "GateReuseMiss",
+];
 
 /// 已知事件类型目录（单一事实源，design/02 §4 事件字典 + B105 durable action 闭合）。
 /// `fold` 必须消费本目录判定「已知但不改态」事件，不得维护第二份白名单。
+/// B303 的 quorum 事实在不扩张冻结 lifecycle seam 的前提下由此目录统一暴露。
 /// 顺序稳定（声明序）、无重复。
 pub fn known_event_kinds() -> Vec<&'static str> {
     [
@@ -96,6 +120,10 @@ pub fn known_event_kinds() -> Vec<&'static str> {
         "WorkspaceLeased",
         "WorkspaceReleased",
         "SiteRetired",
+        // B270: an authorized frozen-contract replacement is a durable audit
+        // fact.  It deliberately does not change the task projection: the
+        // adjacent canonical TaskRecorded remains the sole Recorded edge.
+        "FrozenContractSuperseded",
         "AgentEventReceived",
         "SeedRelocated",
         "RedProven",
@@ -153,6 +181,8 @@ pub fn known_event_kinds() -> Vec<&'static str> {
     ]
     .into_iter()
     .chain(REVIEW_LIFECYCLE_EVENT_KINDS)
+    .chain(REVIEW_QUORUM_EVENT_KINDS)
+    .chain(RUNTIME_POLICY_EVENT_KINDS)
     .collect()
 }
 
@@ -305,9 +335,17 @@ pub fn doctor(root: &Path) -> Vec<Check> {
 
     // 1. coordination/ 存在
     out.push(if coord.is_dir() {
-        Check { name: "coordination/ 目录", status: CheckStatus::Pass, detail: coord.display().to_string() }
+        Check {
+            name: "coordination/ 目录",
+            status: CheckStatus::Pass,
+            detail: coord.display().to_string(),
+        }
     } else {
-        Check { name: "coordination/ 目录", status: CheckStatus::Fail, detail: "不存在".into() }
+        Check {
+            name: "coordination/ 目录",
+            status: CheckStatus::Fail,
+            detail: "不存在".into(),
+        }
     });
 
     // 2. gitignore 三行（design/02 §3）
@@ -323,18 +361,34 @@ pub fn doctor(root: &Path) -> Vec<Check> {
         .filter(|l| !file_contains_line(&gi, l))
         .collect();
     out.push(if missing.is_empty() {
-        Check { name: "gitignore 三行", status: CheckStatus::Pass, detail: "齐".into() }
+        Check {
+            name: "gitignore 三行",
+            status: CheckStatus::Pass,
+            detail: "齐".into(),
+        }
     } else {
-        Check { name: "gitignore 三行", status: CheckStatus::Fail, detail: format!("缺: {}", missing.join(" | ")) }
+        Check {
+            name: "gitignore 三行",
+            status: CheckStatus::Fail,
+            detail: format!("缺: {}", missing.join(" | ")),
+        }
     });
 
     // 3. gitattributes union merge（errata 防账本冲突）
     let ga = root.join(".gitattributes");
     let union_ok = file_contains_line(&ga, "coordination/rounds/*/events.jsonl merge=union");
     out.push(if union_ok {
-        Check { name: "events union-merge", status: CheckStatus::Pass, detail: "齐".into() }
+        Check {
+            name: "events union-merge",
+            status: CheckStatus::Pass,
+            detail: "齐".into(),
+        }
     } else {
-        Check { name: "events union-merge", status: CheckStatus::Warn, detail: ".gitattributes 缺 union 规则".into() }
+        Check {
+            name: "events union-merge",
+            status: CheckStatus::Warn,
+            detail: ".gitattributes 缺 union 规则".into(),
+        }
     });
 
     // 4. wait-dispatch.sh 存在且可执行
@@ -353,19 +407,39 @@ pub fn doctor(root: &Path) -> Vec<Check> {
         }
     };
     out.push(if exec_ok {
-        Check { name: "wait-dispatch.sh", status: CheckStatus::Pass, detail: "存在且可执行".into() }
+        Check {
+            name: "wait-dispatch.sh",
+            status: CheckStatus::Pass,
+            detail: "存在且可执行".into(),
+        }
     } else if script.is_file() {
-        Check { name: "wait-dispatch.sh", status: CheckStatus::Fail, detail: "存在但不可执行".into() }
+        Check {
+            name: "wait-dispatch.sh",
+            status: CheckStatus::Fail,
+            detail: "存在但不可执行".into(),
+        }
     } else {
-        Check { name: "wait-dispatch.sh", status: CheckStatus::Fail, detail: "缺失".into() }
+        Check {
+            name: "wait-dispatch.sh",
+            status: CheckStatus::Fail,
+            detail: "缺失".into(),
+        }
     });
 
     // 5. BOARD.md
     let board = coord.join("BOARD.md");
     out.push(if board.is_file() {
-        Check { name: "BOARD.md", status: CheckStatus::Pass, detail: "存在".into() }
+        Check {
+            name: "BOARD.md",
+            status: CheckStatus::Pass,
+            detail: "存在".into(),
+        }
     } else {
-        Check { name: "BOARD.md", status: CheckStatus::Warn, detail: "缺失（人读账本）".into() }
+        Check {
+            name: "BOARD.md",
+            status: CheckStatus::Warn,
+            detail: "缺失（人读账本）".into(),
+        }
     });
 
     // 6. CURRENT-ROUND 与账本可解析性
@@ -383,7 +457,12 @@ pub fn doctor(root: &Path) -> Vec<Check> {
                 Ok(r) => out.push(Check {
                     name: "当前轮账本",
                     status: CheckStatus::Warn,
-                    detail: format!("round={round}，{} 事件，{} 坏行（首坏行 #{}）", r.events.len(), r.bad_lines.len(), r.bad_lines[0].0),
+                    detail: format!(
+                        "round={round}，{} 事件，{} 坏行（首坏行 #{}）",
+                        r.events.len(),
+                        r.bad_lines.len(),
+                        r.bad_lines[0].0
+                    ),
                 }),
                 Err(e) => out.push(Check {
                     name: "当前轮账本",
@@ -424,6 +503,25 @@ mod tests {
         let ev: EventRecord = serde_json::from_str(line).unwrap();
         let p = fold(&[ev]);
         assert_eq!(p.unknown_kinds, vec!["FutureEvent".to_string()]);
+    }
+
+    #[test]
+    fn frozen_contract_superseded_is_known_and_projection_inert() {
+        let event = |kind: &str| EventRecord {
+            event_id: format!("event-{kind}"),
+            ts: "t".into(),
+            actor: "runtime:orch".into(),
+            kind: kind.into(),
+            task_id: Some("B270".into()),
+            round: Some("r71".into()),
+            payload: Some(serde_json::json!({})),
+            extra: Default::default(),
+        };
+        let before = fold(&[event("DispatchIssued")]);
+        let after = fold(&[event("DispatchIssued"), event("FrozenContractSuperseded")]);
+        assert!(is_known_event_kind("FrozenContractSuperseded"));
+        assert!(after.unknown_kinds.is_empty());
+        assert_eq!(after.tasks["B270"].state, before.tasks["B270"].state);
     }
 
     /// B1 生命周期折叠：dispatched → approved → merged → recorded

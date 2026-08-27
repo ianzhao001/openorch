@@ -1,6 +1,8 @@
 use orch_host::card::RequiredReview;
 use orch_host::plan::{compile_ir, TaskInput};
 
+mod review_quorum_fallback_support;
+
 const MODE: &str = r#"
 agents:
   executor: {adapter: test, tier: none}
@@ -49,6 +51,8 @@ fn task() -> TaskInput {
 fn exact_required_review_and_evidence_sets_are_persisted_in_ir() {
     let ir = compile_ir("r1", MODE, BINDING, &[task()]).unwrap();
     assert_eq!(ir.tasks[0].required_reviews, task().required_reviews);
+    assert!(ir.tasks[0].nongate_seats.is_empty());
+    assert!(ir.tasks[0].review_quorum.is_none());
     assert_eq!(ir.tasks[0].required_evidence, vec!["fixed-head"]);
     assert_eq!(ir.tasks[0].bootstrap_pre_signoff_attempt, None);
 }

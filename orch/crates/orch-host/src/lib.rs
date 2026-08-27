@@ -19,6 +19,10 @@ pub mod cost;
 pub mod gate;
 pub mod failure;
 pub mod gitx;
+// H32 预置（r77，planner）：B293 的 writeSet 含 src/harness.rs 而 lib.rs 对执行者冻结，
+// 无声明则该模块永不被编译、卡内结构性无法实现（B18/B238/B247/B273 同型先例）。
+// 本行只保证可达性；实现属 B293，当前是可编译空壳。
+pub mod harness;
 pub mod hooks;
 pub mod judge;
 pub mod ledger;
@@ -55,6 +59,10 @@ pub mod sites;
 pub mod chanhealth;
 pub mod closed_round_audit;
 pub mod snapshot;
+// H32 预置（r72，planner）：B273 的 writeSet 含 src/srcshape.rs 而 lib.rs 对执行者冻结，
+// 无声明则该模块永不被编译、卡内结构性无法实现（B18/B238/B247 同型先例）。
+// 本行只保证可达性；实现属 B273，当前是可编译空壳。
+pub mod srcshape;
 pub mod staleness;
 pub mod storage;
 pub mod tierf;

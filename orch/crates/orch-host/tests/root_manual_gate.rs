@@ -287,9 +287,194 @@ git: {pushPolicy: forbidden, mergePolicy: ff-only-else-no-ff}
     }
 
     fn events(&self) -> Vec<orch_core::EventRecord> {
-        orch_core::read_ledger(&self.root.join("coordination/rounds/r48/events.jsonl"))
-            .unwrap()
-            .events
+        let round = fs::read_to_string(self.root.join("coordination/runtime/CURRENT-ROUND"))
+            .unwrap();
+        orch_core::read_ledger(
+            &self
+                .root
+                .join(format!("coordination/rounds/{}/events.jsonl", round.trim())),
+        )
+        .unwrap()
+        .events
+    }
+}
+
+fn production_replan_site(tag: &str) -> Site {
+    let root = orch_host::util::test_scratch_dir(&format!("b288-production-replan-{tag}"));
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "user.name", "orch test"]);
+    git(
+        &root,
+        &["config", "user.email", "orch-test@example.invalid"],
+    );
+    fs::write(root.join("README.md"), "base\n").unwrap();
+    fs::write(root.join(".gitignore"), ".worktrees/\n").unwrap();
+    git(&root, &["add", "README.md", ".gitignore"]);
+    git(&root, &["commit", "-q", "-m", "base"]);
+    git(&root, &["branch", "-M", "main"]);
+
+    for path in [
+        "coordination/runtime",
+        "coordination/modes",
+        "coordination/rounds/r75/tasks",
+        "coordination/rounds/r75/reviews",
+        "coordination/rounds/r75/evidence",
+    ] {
+        fs::create_dir_all(root.join(path)).unwrap();
+    }
+    fs::write(root.join("coordination/runtime/CURRENT-ROUND"), "r75\n").unwrap();
+    fs::write(
+        root.join("coordination/modes/test.yaml"),
+        r#"agents:
+  executor: {adapter: test, tier: none}
+  verifier: {adapter: root-manual, tier: none}
+hitl: {mergeGate: auto}
+verification: {mode: root-manual-fixed-head}
+liveness: {monitorSeconds: 15, workingStallMinutes: 10, confirmSamples: 2}
+scheduling:
+  allowedAgents: [executor-desktop, executor-claw]
+  capacities:
+    executor-desktop: {agent: 1, quota: 1, roles: [implement]}
+    executor-claw: {agent: 1, quota: 1, roles: [primary-review]}
+budgets: {round: {maxUsd: 1, wallMinutes: 60, maxModelWakes: 2}}
+git: {pushPolicy: forbidden, mergePolicy: ff-only-else-no-ff}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("coordination/PROJECT-BINDING.yaml"),
+        "project: {ecosystems: [test]}\nscope: {protectedPaths: [\"coordination/**\"]}\ngit: {pushPolicy: forbidden}\ncommands:\n  testFast: {argv: [\"sh\", \"-c\", \"exit 0\"], timeoutSeconds: 30}\n  check: {argv: [\"sh\", \"-c\", \"exit 0\"], timeoutSeconds: 30}\n",
+    )
+    .unwrap();
+    let card_path = root.join("coordination/rounds/r75/tasks/B130T.md");
+    let card = |permit: bool| {
+        let permit = permit
+            .then_some("bootstrapPreSignoffAttempt: B130T-A0001\n")
+            .unwrap_or_default();
+        format!(
+            "---\ntaskId: B130T\nround: r75\nagent: executor-desktop\nseedProtocol: pure-spec\nentryPoints: [feature.txt]\nwriteSet: [feature.txt]\nfrozenPaths: [coordination/**]\ngates: {{fast: [testFast, check]}}\nbudgets: {{wallMinutes: 30}}\nrequiredReviews:\n  - {{role: primary, agent: executor-claw}}\nrequiredEvidence: [fixed-head]\n{permit}---\n# production replan fixture\n"
+        )
+    };
+    fs::write(&card_path, card(false)).unwrap();
+
+    let old_plan = plan::run_plan(&root).unwrap();
+    assert_eq!(old_plan.revision, 1);
+    round::run_sign_off(&root, Some("old production contract")).unwrap();
+    git(&root, &["add", "coordination"]);
+    git(
+        &root,
+        &["commit", "-q", "-m", "old signed production contract"],
+    );
+    let dispatch_base = git_output(&root, &["rev-parse", "main"]);
+
+    git(&root, &["checkout", "-q", "-b", "task/B130T"]);
+    fs::write(root.join("feature.txt"), "feature\n").unwrap();
+    git(&root, &["add", "feature.txt"]);
+    git(&root, &["commit", "-q", "-m", "feature"]);
+    git(&root, &["checkout", "-q", "main"]);
+    fs::create_dir_all(root.join(".worktrees")).unwrap();
+    git(
+        &root,
+        &["worktree", "add", "-q", ".worktrees/B130T", "task/B130T"],
+    );
+    let task_head = git_output(&root, &["rev-parse", "task/B130T"]);
+
+    let dispatch = ledger::event(
+        "DispatchIssued",
+        "runtime:orch",
+        Some("B130T"),
+        Some("r75"),
+        serde_json::json!({
+            "agent": "executor-desktop",
+            "attemptId": "B130T-A0001",
+            "attemptNo": 1,
+            "goPath": "coordination/rounds/r75/dispatch/executor-desktop/GO-B130T-A0001.md",
+            "baseSha": dispatch_base,
+        }),
+    );
+    let blocked = ledger::event(
+        "AttemptBlocked",
+        "runtime:orch",
+        Some("B130T"),
+        Some("r75"),
+        serde_json::json!({
+            "agent": "executor-desktop",
+            "attemptId": "B130T-A0001",
+            "attemptNo": 1,
+            "reason": "signed scope required a production replan",
+        }),
+    );
+    let receipt = ledger::event(
+        "CollectGateSuccessReceipt",
+        "runtime:orch",
+        Some("B130T"),
+        Some("r75"),
+        serde_json::json!({
+            "actionId": "collect-B130T-A0001",
+            "attemptId": "B130T-A0001",
+            "attemptNo": 1,
+            "agent": "executor-desktop",
+            "baseSha": dispatch_base,
+            "goPath": "coordination/rounds/r75/dispatch/executor-desktop/GO-B130T-A0001.md",
+            "branchSha": task_head,
+        }),
+    );
+    let collect = ledger::event(
+        "ReportCollectCompleted",
+        "runtime:orch",
+        Some("B130T"),
+        Some("r75"),
+        serde_json::json!({
+            "actionId": "collect-B130T-A0001",
+            "attemptId": "B130T-A0001",
+            "attemptNo": 1,
+            "agent": "executor-desktop",
+            "baseSha": dispatch_base,
+            "goPath": "coordination/rounds/r75/dispatch/executor-desktop/GO-B130T-A0001.md",
+            "branchSha": task_head,
+            "gateReceipt": receipt.event_id,
+        }),
+    );
+    ledger::append(&root, "r75", &[dispatch, blocked, receipt, collect]).unwrap();
+
+    fs::write(&card_path, card(true)).unwrap();
+    let current_plan = plan::run_plan(&root).unwrap();
+    assert_eq!(current_plan.revision, 2);
+    ledger::append(
+        &root,
+        "r75",
+        &[ledger::event(
+            "SeedOracleVerified",
+            "planner",
+            Some("B130T"),
+            Some("r75"),
+            serde_json::json!({"irRevision": current_plan.revision}),
+        )],
+    )
+    .unwrap();
+    round::run_sign_off(&root, Some("ratify collected production attempt")).unwrap();
+
+    let production_review_rel =
+        "coordination/rounds/r75/reviews/B130T-A0001-primary-executor-claw.md";
+    let production_evidence_rel = "coordination/rounds/r75/evidence/B130T-fixed-head.json";
+    fs::write(
+        root.join(production_review_rel),
+        format!(
+            "---\ntaskId: B130T\nround: r75\nattemptId: B130T-A0001\nrole: primary\nreviewer: executor-claw\nverdict: PASS\nreviewedHead: {task_head}\n---\nreview\n"
+        ),
+    )
+    .unwrap();
+    fs::write(root.join(production_evidence_rel), "{\"ok\":true}\n").unwrap();
+    git(&root, &["add", "coordination"]);
+    git(
+        &root,
+        &["commit", "-q", "-m", "ratified production contract"],
+    );
+    let main_head = git_output(&root, &["rev-parse", "main"]);
+    Site {
+        root,
+        task_head,
+        main_head,
     }
 }
 
@@ -331,6 +516,20 @@ fn git_output(root: &Path, args: &[&str]) -> String {
         .unwrap();
     assert!(output.status.success());
     String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
+fn rewrite_events(root: &Path, round: &str, events: &[orch_core::EventRecord]) {
+    let mut text = events
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.push('\n');
+    fs::write(
+        root.join(format!("coordination/rounds/{round}/events.jsonl")),
+        text,
+    )
+    .unwrap();
 }
 
 fn with_preheld_transition_lease<T>(root: &Path, action: impl FnOnce() -> T) -> T {
@@ -736,12 +935,121 @@ fn normal_signoff_before_dispatch_and_exact_bootstrap_chain_are_both_authorized(
 }
 
 #[test]
+fn production_replan_ratification_is_exact_and_mutations_fail_closed() {
+    let positive = production_replan_site("positive");
+    assert!(positive.pass().unwrap().appended);
+
+    let mut base_drift = production_replan_site("base-drift");
+    let mut events = base_drift.events();
+    let old_signoff = events
+        .iter_mut()
+        .find(|event| event.kind == "PlanSignedOff")
+        .unwrap();
+    old_signoff.payload.as_mut().unwrap()["note"] = serde_json::json!("mutated old note");
+    rewrite_events(&base_drift.root, "r75", &events);
+    base_drift.commit_coordination("mutate dispatch-base ledger prefix");
+    let error = base_drift.pass().unwrap_err().to_string();
+    assert!(error.contains("dispatch-base ledger"), "{error}");
+
+    let mut missing_block = production_replan_site("missing-block");
+    let mut events = missing_block.events();
+    events.retain(|event| event.kind != "AttemptBlocked");
+    rewrite_events(&missing_block.root, "r75", &events);
+    missing_block.commit_coordination("remove production-replan block");
+    let error = missing_block.pass().unwrap_err().to_string();
+    assert!(error.contains("缺 exact runtime AttemptBlocked"), "{error}");
+
+    let mut early_signoff = production_replan_site("early-signoff");
+    let mut events = early_signoff.events();
+    let signoff_position = events
+        .iter()
+        .rposition(|event| event.kind == "PlanSignedOff")
+        .unwrap();
+    let current_signoff = events.remove(signoff_position);
+    let collect_position = events
+        .iter()
+        .position(|event| event.kind == "ReportCollectCompleted")
+        .unwrap();
+    events.insert(collect_position, current_signoff);
+    rewrite_events(&early_signoff.root, "r75", &events);
+    early_signoff.commit_coordination("move ratification signoff before collect");
+    let error = early_signoff.pass().unwrap_err().to_string();
+    assert!(
+        error.contains("ratification chain") || error.contains("尚未绑定 PlanSignedOff"),
+        "{error}"
+    );
+
+    let mut second_dispatch = production_replan_site("second-dispatch");
+    ledger::append(
+        &second_dispatch.root,
+        "r75",
+        &[ledger::event(
+            "DispatchIssued",
+            "runtime:orch",
+            Some("B130T"),
+            Some("r75"),
+            serde_json::json!({
+                "agent": "executor-desktop",
+                "attemptId": "B130T-A0002",
+                "attemptNo": 2,
+                "goPath": "coordination/rounds/r75/dispatch/executor-desktop/GO-B130T-A0002.md",
+                "baseSha": second_dispatch.main_head,
+            }),
+        )],
+    )
+    .unwrap();
+    second_dispatch.commit_coordination("append forbidden successor dispatch");
+    let error = second_dispatch.pass().unwrap_err().to_string();
+    assert!(
+        error.contains("当前 attempt") || error.contains("恰好一条"),
+        "{error}"
+    );
+
+    let mut higher_validation = production_replan_site("higher-validation");
+    ledger::append(
+        &higher_validation.root,
+        "r75",
+        &[ledger::event(
+            "TaskValidated",
+            "runtime:orch",
+            None,
+            Some("r75"),
+            plan::task_validated_payload(3, &"f".repeat(64)),
+        )],
+    )
+    .unwrap();
+    higher_validation.commit_coordination("append unsigned higher validation");
+    let error = higher_validation.pass().unwrap_err().to_string();
+    assert!(error.contains("最高 canonical production"), "{error}");
+
+    let mut prior_root = production_replan_site("prior-root");
+    ledger::append(
+        &prior_root.root,
+        "r75",
+        &[ledger::event(
+            "VerdictIssued",
+            "verifier:root",
+            Some("B130T"),
+            Some("r75"),
+            serde_json::json!({"verdict": "BLOCKED", "attemptId": "B130T-A0001"}),
+        )],
+    )
+    .unwrap();
+    prior_root.commit_coordination("append prior root terminal");
+    let error = prior_root.pass().unwrap_err().to_string();
+    assert!(
+        error.contains("prior root") || error.contains("pending root") || error.contains("payload"),
+        "{error}"
+    );
+}
+
+#[test]
 fn bootstrap_scope_and_legacy_order_fail_closed_before_gate_logs() {
     for (tag, setup, needle) in [
         (
             "missing-legacy",
             AuthorizationSetup::MissingLegacy,
-            "legacy",
+            "bootstrap authorization 缺 prior canonical-schema legacy TaskValidated",
         ),
         (
             "late-legacy",

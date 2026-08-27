@@ -17,7 +17,273 @@ use wait_timeout::ChildExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::harness::WRAPPER_EXIT_CODES;
 use crate::{budget, current_round, failure, ledger, liveness};
+
+mod resume_dispatch;
+
+/// Version anchor for the review-pool state machine and its durable routing
+/// identity.  Future revisions must use a new symbol instead of changing V1
+/// replay semantics in place.
+pub const REVIEW_PANEL_RUNTIME_CONTRACT_V1: u32 = 1;
+
+/// Closed policy inputs used by the V1 review-panel evaluator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewPanelPolicyV1 {
+    /// Minimum number of unique substantive PASS seats needed for success.
+    pub minimum_passes: usize,
+    /// Whether one PASS must come from a primary-lineage seat.
+    pub require_primary_pass: bool,
+    /// Maximum number of business-invalid generations the panel may consume.
+    pub maximum_business_retries: usize,
+    /// Whether a nongate PASS may close only a failed secondary seat.
+    pub nongate_substitutes_secondary_only: bool,
+}
+
+/// Terminal or pending state of one immutable V1 seat generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewPanelSeatStateV1 {
+    /// The routed generation has not produced a terminal fact yet.
+    Pending,
+    /// A substantive PASS artifact was delivered for the exact route.
+    Pass,
+    /// A substantive FAIL finding was delivered; only formal roles veto V1.
+    Fail,
+    /// A substantive BLOCKED finding was delivered; only formal roles veto V1.
+    Blocked,
+    /// The provider answered, but the artifact was absent or contract-invalid.
+    BusinessInvalid,
+    /// Admission, authentication, pin, managed-runtime setup, or Agy
+    /// canary/formal-answer validation failed without consuming a business retry.
+    #[serde(rename = "system-terminal-invalid")]
+    SystemInvalid,
+}
+
+/// Replay identity and state for one V1 review seat generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewPanelSeatV1 {
+    /// Stable logical seat identity retained across a business retry.
+    pub seat_id: String,
+    /// Monotonic generation; generation two is the only V1 business retry.
+    pub generation: u32,
+    /// Routed role (`primary`, `secondary`, or `nongate`).
+    pub role: String,
+    /// Exact registered agent selected for this generation.
+    pub agent: String,
+    /// Whether this seat can satisfy the required primary-lineage PASS.
+    pub primary_lineage: bool,
+    /// Whether a business-invalid generation may be retried.
+    pub retry_eligible: bool,
+    /// Current state reconstructed exclusively from durable events.
+    pub state: ReviewPanelSeatStateV1,
+}
+
+/// Deterministic next action for a fully replayed V1 panel snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewPanelDecisionV1 {
+    /// The supplied snapshot double-counts or contains a malformed identity.
+    Invalid,
+    /// Quorum and the primary-lineage requirement are both satisfied.
+    Pass,
+    /// A substantive FAIL or BLOCKED finding monotonically vetoes PASS.
+    Veto,
+    /// One exact business-invalid seat is eligible for its next generation.
+    Retry {
+        /// Stable seat identity that the retry command must name.
+        seat_id: String,
+    },
+    /// A routed seat is still pending, so final PASS/veto/exhaustion waits.
+    Awaiting,
+    /// No allowed retry/backfill can make the signed quorum reachable.
+    PoolExhausted,
+}
+
+/// Evaluate a V1 panel without consulting clocks, files, mutable registries,
+/// or list order.  System-invalid generations never consume the business
+/// retry budget; the caller supplies separately counted durable retries and
+/// remaining primary-capable backfills.
+pub fn evaluate_review_panel_v1(
+    policy: &ReviewPanelPolicyV1,
+    seats: &[ReviewPanelSeatV1],
+    business_retries_used: usize,
+    eligible_backfills: usize,
+) -> ReviewPanelDecisionV1 {
+    let unique_seats = seats
+        .iter()
+        .map(|seat| (seat.seat_id.as_str(), seat.generation))
+        .collect::<BTreeSet<_>>();
+    let unique_agents = seats
+        .iter()
+        .map(|seat| seat.agent.as_str())
+        .collect::<BTreeSet<_>>();
+    if policy.minimum_passes == 0
+        || policy.maximum_business_retries > 1
+        || unique_seats.len() != seats.len()
+        || unique_agents.len() != seats.len()
+        || seats.iter().any(|seat| {
+            seat.seat_id.trim().is_empty()
+                || seat.generation == 0
+                || seat.agent.trim().is_empty()
+                || !matches!(seat.role.as_str(), "primary" | "secondary" | "nongate")
+        })
+    {
+        return ReviewPanelDecisionV1::Invalid;
+    }
+
+    let pending = seats
+        .iter()
+        .filter(|seat| seat.state == ReviewPanelSeatStateV1::Pending)
+        .count();
+    if seats.iter().any(|seat| {
+        seat.role != "nongate"
+            && matches!(
+                seat.state,
+                ReviewPanelSeatStateV1::Fail | ReviewPanelSeatStateV1::Blocked
+            )
+    }) {
+        return if pending == 0 {
+            ReviewPanelDecisionV1::Veto
+        } else {
+            ReviewPanelDecisionV1::Awaiting
+        };
+    }
+
+    let primary_pass = seats
+        .iter()
+        .any(|seat| seat.state == ReviewPanelSeatStateV1::Pass && seat.primary_lineage);
+    let formal_passes = seats
+        .iter()
+        .filter(|seat| seat.state == ReviewPanelSeatStateV1::Pass && seat.role != "nongate")
+        .count();
+    let unavailable_secondary = seats.iter().any(|seat| {
+        seat.role == "secondary"
+            && matches!(
+                seat.state,
+                ReviewPanelSeatStateV1::BusinessInvalid | ReviewPanelSeatStateV1::SystemInvalid
+            )
+    });
+    let nongate_substitution = seats
+        .iter()
+        .any(|seat| seat.role == "nongate" && seat.state == ReviewPanelSeatStateV1::Pass)
+        && (!policy.nongate_substitutes_secondary_only || unavailable_secondary);
+    let pass_count = formal_passes + usize::from(nongate_substitution);
+    if pending == 0
+        && pass_count >= policy.minimum_passes
+        && (!policy.require_primary_pass || primary_pass)
+    {
+        return ReviewPanelDecisionV1::Pass;
+    }
+
+    if business_retries_used < policy.maximum_business_retries {
+        let mut retryable = seats
+            .iter()
+            .filter(|seat| {
+                seat.state == ReviewPanelSeatStateV1::BusinessInvalid && seat.retry_eligible
+            })
+            .map(|seat| seat.seat_id.as_str())
+            .collect::<Vec<_>>();
+        retryable.sort_unstable();
+        retryable.dedup();
+        if let Some(seat_id) = retryable.first() {
+            return ReviewPanelDecisionV1::Retry {
+                seat_id: (*seat_id).to_string(),
+            };
+        }
+    }
+
+    let retry_capacity = seats
+        .iter()
+        .filter(|seat| {
+            seat.retry_eligible
+                && seat.state == ReviewPanelSeatStateV1::BusinessInvalid
+                && business_retries_used < policy.maximum_business_retries
+        })
+        .count();
+    let primary_reachable = primary_pass
+        || seats.iter().any(|seat| {
+            seat.primary_lineage
+                && matches!(
+                    seat.state,
+                    ReviewPanelSeatStateV1::Pending | ReviewPanelSeatStateV1::BusinessInvalid
+                )
+        })
+        || eligible_backfills > 0;
+    let pass_reachable = pass_count
+        .saturating_add(pending)
+        .saturating_add(retry_capacity)
+        .saturating_add(eligible_backfills)
+        >= policy.minimum_passes;
+    if pass_reachable && (!policy.require_primary_pass || primary_reachable) && pending > 0 {
+        ReviewPanelDecisionV1::Awaiting
+    } else {
+        ReviewPanelDecisionV1::PoolExhausted
+    }
+}
+
+/// Durable identity returned for one selected/retried/backfilled route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewPanelRouteV1 {
+    /// Panel identity shared by the complete attempt review.
+    pub panel_id: String,
+    /// Stable logical seat identity.
+    pub seat_id: String,
+    /// Logical seat generation.
+    pub generation: u32,
+    /// Preallocated wake identity committed before spawn.
+    pub wake_id: String,
+    /// Routed role.
+    pub role: String,
+    /// Routed agent.
+    pub agent: String,
+    /// Immutable reviewed candidate commit.
+    pub reviewed_head: String,
+    /// Attempt base commit fixing policy semantics.
+    pub policy_base_sha: String,
+    /// Derived deadline committed with the route.
+    pub deadline_secs: u64,
+}
+
+/// Result of an idempotent panel route command and its post-commit wake pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewPanelRouteOutcomeV1 {
+    /// Exact panel identity selected for the attempt.
+    pub panel_id: String,
+    /// Routes created or replayed by the command.
+    pub routes: Vec<ReviewPanelRouteV1>,
+    /// Scoped accounting commit that made the routes visible before wake.
+    pub commit_sha: String,
+    /// Number of previously unspawned routes launched after commit.
+    pub spawned: usize,
+    /// True when the exact durable selection/route already existed.
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelRouteAuthorizationV1 {
+    task_id: String,
+    selected_event_id: String,
+    route_event_id: String,
+    route: ledger::ReviewSeatRoutedPayloadV1,
+}
+
+fn bind_panel_route_event_identity_v1(
+    payload: &mut serde_json::Value,
+    authorization: Option<&PanelRouteAuthorizationV1>,
+) {
+    let Some(authorization) = authorization else {
+        return;
+    };
+    payload["panelId"] = serde_json::json!(authorization.route.panel_id);
+    payload["seatId"] = serde_json::json!(authorization.route.seat_id);
+    payload["generation"] = serde_json::json!(authorization.route.generation);
+    payload["routeEventId"] = serde_json::json!(authorization.route_event_id);
+    payload["policyBaseSha"] = serde_json::json!(authorization.route.policy_base_sha);
+    payload["reviewedHead"] = serde_json::json!(authorization.route.reviewed_head);
+}
 
 #[cfg(unix)]
 extern "C" {
@@ -38,6 +304,12 @@ pub enum DurableIdentityKind {
     /// A socket bridge whose backend is not a descendant of the spawned wrapper.
     /// Progress in the exact per-attempt wake log is the only honest proxy.
     WakeLogProxy,
+}
+
+impl DurableIdentityKind {
+    fn is_managed_pid_group(self) -> bool {
+        matches!(self, Self::ManagedPidGroup)
+    }
 }
 
 #[doc(hidden)]
@@ -96,17 +368,14 @@ pub enum ManagedTerminal {
 /// owns line framing so an unterminated tail can never become terminal.
 #[doc(hidden)]
 pub fn classify_managed_terminal(program: &str, complete_json_line: &str) -> ManagedTerminal {
-    if Path::new(program)
-        .file_name()
-        .and_then(|name| name.to_str())
-        != Some("opencode")
-    {
-        return ManagedTerminal::Continue;
-    }
     let Ok(value) = serde_json::from_str::<serde_json::Value>(complete_json_line) else {
         return ManagedTerminal::Continue;
     };
-    let exact = value.get("type").and_then(|v| v.as_str()) == Some("step_finish")
+    let basename = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str());
+    let opencode_stop = basename == Some("opencode")
+        && value.get("type").and_then(|v| v.as_str()) == Some("step_finish")
         && value
             .get("part")
             .and_then(|v| v.get("type"))
@@ -117,7 +386,16 @@ pub fn classify_managed_terminal(program: &str, complete_json_line: &str) -> Man
             .and_then(|v| v.get("reason"))
             .and_then(|v| v.as_str())
             == Some("stop");
-    if exact {
+    let codex_stop = basename == Some("codex")
+        && value.get("type").and_then(|v| v.as_str()) == Some("turn.completed");
+    let managed_wrapper_stop = matches!(
+        value.get("type").and_then(|v| v.as_str()),
+        Some("pi.terminal" | "zcode.terminal" | "dsh.terminal")
+    ) && value
+        .get("sessionId")
+        .and_then(|session| session.as_str())
+        .is_some_and(|session| !session.trim().is_empty());
+    if opencode_stop || codex_stop || managed_wrapper_stop {
         ManagedTerminal::OpenCodeStop
     } else {
         ManagedTerminal::Continue
@@ -194,6 +472,7 @@ pub fn default_review_deadline_secs(root: &Path, task_id: &str, role: &str) -> R
 
 pub const ZCODE_STREAM_SCRIPT_REL: &str = "orch/scripts/wake-zcode-stream.sh";
 pub const PI_STREAM_SCRIPT_REL: &str = "orch/scripts/wake-pi-stream.sh";
+const DSH_STREAM_SCRIPT_REL: &str = "orch/scripts/wake-dsh-stream.sh";
 /// Signed ROUND-IR role which authorizes a nongate review wake.
 ///
 /// Keep this vocabulary centralized: the request role remains `nongate`, while
@@ -1691,6 +1970,356 @@ struct WakeSupervisorStatus {
     elapsed_secs: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ManagedTerminalFrameFacts {
+    exact_reason: Option<String>,
+    final_text_sha256: Option<String>,
+    usage: Option<serde_json::Value>,
+    usage_absent_reason: Option<String>,
+}
+
+fn read_managed_terminal_frame(log_path: &Path) -> Result<Option<ManagedTerminalFrameFacts>> {
+    if !log_path.exists() {
+        return Ok(None);
+    }
+    let file = File::open(log_path)
+        .with_context(|| format!("open managed wake log failed: {}", log_path.display()))?;
+    let mut observed = None;
+    for line in BufReader::new(file).lines() {
+        let line = line.with_context(|| {
+            format!(
+                "read managed wake terminal frame failed: {}",
+                log_path.display()
+            )
+        })?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if !matches!(
+            value.get("type").and_then(serde_json::Value::as_str),
+            Some("pi.terminal" | "zcode.terminal" | "dsh.terminal")
+        ) {
+            continue;
+        }
+        if observed.is_some() {
+            bail!(
+                "managed wake log contains more than one terminal frame: {}",
+                log_path.display()
+            );
+        }
+        let usage = value
+            .get("usage")
+            .filter(|usage| usage.is_object())
+            .cloned();
+        observed = Some(ManagedTerminalFrameFacts {
+            exact_reason: value
+                .get("exactReason")
+                .and_then(serde_json::Value::as_str)
+                .filter(|reason| !reason.trim().is_empty())
+                .map(str::to_string),
+            final_text_sha256: value
+                .get("finalTextSha256")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            usage,
+            usage_absent_reason: value
+                .get("usageAbsentReason")
+                .and_then(serde_json::Value::as_str)
+                .filter(|reason| !reason.trim().is_empty())
+                .map(str::to_string),
+        });
+    }
+    Ok(observed)
+}
+
+fn terminal_output_artifact(
+    root: &Path,
+    wake: &orch_core::EventRecord,
+) -> Result<(Option<String>, Option<String>)> {
+    let Some(path_text) = payload_string(wake, "reviewOutputPath") else {
+        return Ok((None, None));
+    };
+    let path = PathBuf::from(path_text);
+    if !path.is_absolute() || !path.starts_with(root) {
+        bail!("WakeIssued reviewOutputPath must remain inside the repository root");
+    }
+    if !path.exists() {
+        return Ok((None, None));
+    }
+    let metadata = fs::symlink_metadata(&path).with_context(|| {
+        format!(
+            "inspect terminal output artifact failed: {}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        bail!("terminal output artifact must be a regular non-symlink file");
+    }
+    let bytes = fs::read(&path)
+        .with_context(|| format!("read terminal output artifact failed: {}", path.display()))?;
+    if bytes.is_empty() {
+        return Ok((None, None));
+    }
+    Ok((Some(path_text.to_string()), Some(sha256_hex(&bytes))))
+}
+
+fn capture_agy_plain_text_review_artifact(
+    root: &Path,
+    wake: &orch_core::EventRecord,
+) -> Result<Option<String>> {
+    if payload_string(wake, "providerKind") != Some("agy") {
+        return Ok(None);
+    }
+    let (Some(round), Some(task_id), Some(route_event_id), Some(output_path), Some(log_path)) = (
+        wake.round.as_deref(),
+        wake.task_id.as_deref(),
+        payload_string(wake, "routeEventId"),
+        payload_string(wake, "reviewOutputPath"),
+        payload_string(wake, "logPath"),
+    ) else {
+        return Ok(None);
+    };
+    let output = PathBuf::from(output_path);
+    if !output.is_absolute() || !output.starts_with(root) {
+        bail!("Agy review output path escaped repository root");
+    }
+    let events = read_round_ledger_events(root, round)?;
+    let routes = events
+        .iter()
+        .filter(|event| event.event_id == route_event_id)
+        .filter_map(|event| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            Some(route)
+        })
+        .collect::<Vec<_>>();
+    let [route] = routes.as_slice() else {
+        bail!("Agy final-text capture 缺唯一 panel route");
+    };
+    if route.agent != "executor-antigravity"
+        || route.wake_id != payload_string(wake, "wakeId").unwrap_or_default()
+        || route.reviewed_head != payload_string(wake, "reviewedHead").unwrap_or_default()
+    {
+        bail!("Agy final-text capture route/wake/head 漂移");
+    }
+    let expectation = panel_expectation_from_route_v1(round, task_id, route)?;
+    let text = fs::read_to_string(log_path).context("Agy final-text log 非 UTF-8")?;
+    let path_line = format!("REVIEW_OUTPUT_PATH={output_path}");
+    let path_position = text
+        .lines()
+        .position(|line| line.trim_end_matches('\r') == path_line);
+    let Some(path_position) = path_position else {
+        return Ok(None);
+    };
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut frontmatter = None::<String>;
+    let mut index = path_position + 1;
+    while index < lines.len() {
+        if lines[index].trim_end_matches('\r') != "```yaml" {
+            index += 1;
+            continue;
+        }
+        let mut yaml = String::new();
+        index += 1;
+        while index < lines.len() && lines[index].trim_end_matches('\r') != "```" {
+            yaml.push_str(lines[index]);
+            yaml.push('\n');
+            index += 1;
+        }
+        if index < lines.len()
+            && crate::verify::check_review_artifact_contract(yaml.as_bytes(), &expectation)
+                .is_ok_and(|checked| checked.is_some())
+        {
+            frontmatter = Some(yaml);
+        }
+        index += 1;
+    }
+    let Some(mut artifact) = frontmatter else {
+        return Ok(None);
+    };
+    let body = lines[..path_position]
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| serde_json::from_str::<serde_json::Value>(line).is_err())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if body.trim().is_empty() {
+        return Ok(None);
+    }
+    artifact.push_str(&body);
+    artifact.push('\n');
+    let checked = crate::verify::check_review_artifact_contract(artifact.as_bytes(), &expectation)?
+        .context("captured Agy review artifact incomplete")?;
+    if checked.substantive_body_len() == 0 {
+        return Ok(None);
+    }
+    let rel = output
+        .strip_prefix(root)?
+        .to_str()
+        .context("Agy captured review path 非 UTF-8")?;
+    install_review_no_clobber(root, rel, artifact.as_bytes())?;
+    Ok(Some(sha256_hex(body.as_bytes())))
+}
+
+fn terminal_record_from_status(
+    root: &Path,
+    wake: &orch_core::EventRecord,
+    status: &WakeSupervisorStatus,
+    capability: crate::harness::CapabilitySource,
+) -> Result<crate::harness::TerminalRecord> {
+    let log_path = payload_string(wake, "logPath")
+        .map(PathBuf::from)
+        .context("WakeIssued missing logPath for terminal reconciliation")?;
+    let mut frame = read_managed_terminal_frame(&log_path)?.unwrap_or_default();
+    if let Some(final_text_sha256) = capture_agy_plain_text_review_artifact(root, wake)? {
+        frame.final_text_sha256 = Some(final_text_sha256);
+    }
+    let (output_path, output_sha256) = terminal_output_artifact(root, wake)?;
+    let reserved_exit = status
+        .exit_status
+        .and_then(|code| WRAPPER_EXIT_CODES.iter().find(|entry| entry.code == code));
+    let exact_reason = frame
+        .exact_reason
+        .clone()
+        .or_else(|| status.error.clone())
+        .or_else(|| {
+            status
+                .cancel_reason
+                .clone()
+                .filter(|reason| !reason.trim().is_empty())
+        })
+        .unwrap_or_else(|| status.completion_reason.ledger_name().to_string());
+    let usage_present = frame.usage.is_some();
+    let usage_absent_reason = frame.usage_absent_reason.or_else(|| {
+        if usage_present {
+            None
+        } else {
+            Some(format!(
+                "provider usage unavailable after {}",
+                reserved_exit
+                    .map(|entry| entry.reason)
+                    .unwrap_or("provider-native-exit")
+            ))
+        }
+    });
+    let exit_code = if status.error.is_some() {
+        Some(3)
+    } else if status.hard_deadline_reached {
+        Some(72)
+    } else {
+        status.exit_status
+    };
+    let agy_natural_turn_end = payload_string(wake, "providerKind") == Some("agy")
+        && status.exited_naturally
+        && status.exit_status == Some(0);
+    crate::harness::classify_terminal_observation(crate::harness::TerminalObservation {
+        capability,
+        exit_code,
+        exact_reason,
+        turn_ended: status.terminal_seen || agy_natural_turn_end,
+        final_text: None,
+        final_text_sha256: frame.final_text_sha256,
+        output_path,
+        output_sha256,
+        usage: frame.usage,
+        usage_absent_reason,
+        managed_scope_terminated: status.managed_scope_terminated,
+        activity_seen: status.log_bytes_read > 0,
+        authenticated_cancel: status
+            .cancel_request_id
+            .as_deref()
+            .is_some_and(|request_id| !request_id.trim().is_empty()),
+    })
+}
+
+fn terminal_capability_from_wake(
+    wake: &orch_core::EventRecord,
+) -> Result<Option<crate::harness::CapabilitySource>> {
+    let value = wake
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("terminalCapability"))
+        .cloned();
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value)
+            .map(Some)
+            .context("WakeIssued terminalCapability is invalid"),
+    }
+}
+
+fn managed_wake_terminated_event_with_record(
+    round: &str,
+    task_id: Option<&str>,
+    status: &WakeSupervisorStatus,
+    record: crate::harness::TerminalRecord,
+) -> orch_core::EventRecord {
+    let mut event = managed_wake_terminated_event(round, task_id, status);
+    if let Some(payload) = event.payload.as_mut() {
+        payload["state"] = serde_json::json!(record.state.as_str());
+        payload["exactReason"] = serde_json::json!(record.exact_reason);
+        payload["turnEnded"] = serde_json::json!(record.turn_ended);
+        payload["finalTextSha256"] = serde_json::json!(record.final_text_sha256);
+        payload["outputPath"] = serde_json::json!(record.output_path);
+        payload["outputSha256"] = serde_json::json!(record.output_sha256);
+        payload["usage"] = record.usage.unwrap_or(serde_json::Value::Null);
+        payload["usageAbsentReason"] = serde_json::json!(record.usage_absent_reason);
+        payload["managedScopeTerminated"] = serde_json::json!(record.managed_scope_terminated);
+        payload["mechanicalTerminalAbsent"] = serde_json::json!(record.mechanical_terminal_absent);
+    }
+    event
+}
+
+fn managed_wake_terminal_absent_event(
+    round: &str,
+    task_id: Option<&str>,
+    wake_id: &str,
+    agent: &str,
+) -> Result<orch_core::EventRecord> {
+    let record =
+        crate::harness::classify_terminal_observation(crate::harness::TerminalObservation {
+            capability: crate::harness::CapabilitySource::Absent,
+            exit_code: None,
+            exact_reason: "harness descriptor declares terminal capability absent".to_string(),
+            turn_ended: false,
+            final_text: None,
+            final_text_sha256: None,
+            output_path: None,
+            output_sha256: None,
+            usage: None,
+            usage_absent_reason: Some(
+                "harness descriptor exposes no mechanical usage source".to_string(),
+            ),
+            managed_scope_terminated: false,
+            activity_seen: false,
+            authenticated_cancel: false,
+        })?;
+    Ok(ledger::event(
+        "ManagedWakeTerminalAbsent",
+        "runtime:orch",
+        task_id,
+        Some(round),
+        serde_json::json!({
+            "wakeId": wake_id,
+            "agent": agent,
+            "state": record.state.as_str(),
+            "exactReason": record.exact_reason,
+            "turnEnded": record.turn_ended,
+            "finalTextSha256": record.final_text_sha256,
+            "outputPath": record.output_path,
+            "outputSha256": record.output_sha256,
+            "usage": record.usage,
+            "usageAbsentReason": record.usage_absent_reason,
+            "managedScopeTerminated": record.managed_scope_terminated,
+            "mechanicalTerminalAbsent": record.mechanical_terminal_absent,
+        }),
+    ))
+}
+
 fn managed_wake_terminated_event(
     round: &str,
     task_id: Option<&str>,
@@ -1785,9 +2414,43 @@ fn reconcile_managed_wake_termination_locked(
             );
         }
         let wake = wakes[0];
+        let terminal_capability = terminal_capability_from_wake(wake)?;
         let Some(control_wake_id) = payload_string(wake, "controlWakeId") else {
-            // Socket/proxy providers have no authenticated managed status.
-            return Ok(Vec::new());
+            return match terminal_capability {
+                None => Ok(Vec::new()),
+                Some(crate::harness::CapabilitySource::Absent) => {
+                    let absent = events
+                        .iter()
+                        .filter(|event| {
+                            event.kind == "ManagedWakeTerminalAbsent"
+                                && payload_string(event, "wakeId") == Some(wake_id)
+                        })
+                        .count();
+                    if absent > 1 {
+                        bail!(
+                            "managed wake contains {absent} terminal-absence facts for wakeId={wake_id}"
+                        );
+                    }
+                    if absent == 1 {
+                        Ok(Vec::new())
+                    } else {
+                        let agent = payload_string(wake, "agent")
+                            .context("WakeIssued missing agent")?;
+                        Ok(vec![managed_wake_terminal_absent_event(
+                            round,
+                            wake.task_id.as_deref(),
+                            wake_id,
+                            agent,
+                        )?])
+                    }
+                }
+                Some(
+                    crate::harness::CapabilitySource::Native
+                    | crate::harness::CapabilitySource::Derived,
+                ) => bail!(
+                    "terminal-capable harness lacks a managed control descriptor for wakeId={wake_id}"
+                ),
+            };
         };
         if control_wake_id != wake_id {
             bail!("managed wake termination controlWakeId does not match wakeId");
@@ -1833,7 +2496,22 @@ fn reconcile_managed_wake_termination_locked(
             bail!("immutable managed wake terminal status differs from WakeIssued runtimeLimit");
         }
 
-        let terminated = managed_wake_terminated_event(round, wake.task_id.as_deref(), &status);
+        let terminated = if let Some(capability) = terminal_capability {
+            if capability == crate::harness::CapabilitySource::Absent {
+                bail!("terminal-absent harness unexpectedly produced a managed status descriptor");
+            }
+            let terminal_record = terminal_record_from_status(root, wake, &status, capability)?;
+            managed_wake_terminated_event_with_record(
+                round,
+                wake.task_id.as_deref(),
+                &status,
+                terminal_record,
+            )
+        } else {
+            // Legacy WakeIssued facts predate harness capability binding and
+            // retain their byte-compatible terminal event shape.
+            managed_wake_terminated_event(round, wake.task_id.as_deref(), &status)
+        };
         let released = crate::sites::workspace_release_for_termination(events, round, &terminated)?;
         let mut facts = vec![terminated];
         if let Some(released) = released {
@@ -1842,6 +2520,46 @@ fn reconcile_managed_wake_termination_locked(
         Ok(facts)
     })?;
     Ok(appended > 0)
+}
+
+fn panel_route_awaits_spool_transition_v1(
+    events: &[orch_core::EventRecord],
+    wake_id: &str,
+) -> Result<bool> {
+    let routes = events
+        .iter()
+        .filter_map(|event| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            (route.wake_id == wake_id).then_some(route)
+        })
+        .collect::<Vec<_>>();
+    let [route] = routes.as_slice() else {
+        if routes.is_empty() {
+            return Ok(false);
+        }
+        bail!("managed wakeId 命中重复 panel routes");
+    };
+    let terminals = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                ledger::decode_runtime_event_v1(event),
+                Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(ref terminal)))
+                    if terminal.panel_id == route.panel_id
+                        && terminal.seat_id == route.seat_id
+                        && terminal.generation == route.generation
+                        && terminal.wake_id == route.wake_id
+            )
+        })
+        .count();
+    if terminals > 1 {
+        bail!("panel route 命中重复 ReviewSeatTerminated");
+    }
+    Ok(terminals == 0)
 }
 
 fn reconcile_managed_wake_termination(root: &Path, round: &str, wake_id: &str) -> Result<bool> {
@@ -1856,7 +2574,13 @@ fn reconcile_managed_wake_termination(root: &Path, round: &str, wake_id: &str) -
     let appended = with_wake_identity_lock_wait(root, agent, || {
         reconcile_managed_wake_termination_locked(root, round, wake_id)
     })?;
-    if appended {
+    let defer_panel_reap = if appended {
+        let fresh = read_round_ledger_events(root, round)?;
+        panel_route_awaits_spool_transition_v1(&fresh, wake_id)?
+    } else {
+        false
+    };
+    if appended && !defer_panel_reap {
         if let Err(error) = crate::sites::reap_released_sites(root, round) {
             eprintln!(
                 "[orch] site GC after managed termination retained all uncertain sites: {error:#}"
@@ -2438,24 +3162,54 @@ pub fn parse_wake_supervisor_launch_spec(
         {
             bail!("wake supervisor argv is empty, contains NUL, or exceeds bounds");
         }
+        let canonical_root = fs::canonicalize(root).context("canonicalize root failed")?;
         let program = Path::new(&spec.argv[0]);
         let canonical_program =
             fs::canonicalize(program).context("canonicalize wake supervisor program failed")?;
         let program_metadata =
             fs::symlink_metadata(program).context("stat raw wake supervisor program failed")?;
+        // D-25 (r78 planner direct fix): custody admission is a *topology* question
+        // ("is argv[1] one of the registered stream wrappers whose child process tree
+        // the supervisor owns?"), not a *receipt-grammar* question ("what shape of
+        // backend receipt does this provider emit?").  Using the receipt classifier
+        // here silently excluded DSH — which has a registered wrapper and
+        // `receipt: absent` — so a real DSH review was leased and then refused
+        // immediately before spawn (r77 event 01M0MJMYY94WCSZR0QXYC3B45D).
+        let registered_wrapper = managed_stream_harness(&spec.argv).is_some_and(|_| {
+            let wrapper = Path::new(&spec.argv[1]);
+            let wrapper = if wrapper.is_absolute() {
+                wrapper.to_path_buf()
+            } else {
+                canonical_root.join(wrapper)
+            };
+            let expected = canonical_root.join("orch/scripts").join(
+                Path::new(&spec.argv[1])
+                    .file_name()
+                    .expect("managed wrapper classifier supplied a basename"),
+            );
+            fs::canonicalize(&wrapper).ok().as_deref() == Some(expected.as_path())
+                && fs::symlink_metadata(&wrapper).ok().is_some_and(|metadata| {
+                    metadata.file_type().is_file() && !metadata.file_type().is_symlink()
+                })
+        });
+        let direct_provider = matches!(
+            program.file_name().and_then(|name| name.to_str()),
+            Some("codex" | "opencode" | "agy")
+        );
+        let wrapper_shell = registered_wrapper
+            && matches!(
+                program.file_name().and_then(|name| name.to_str()),
+                Some("sh" | "bash")
+            );
         if !program.is_absolute()
             || !program_metadata.file_type().is_file()
             || program_metadata.file_type().is_symlink()
             || program_metadata.mode() & 0o111 == 0
-            || !matches!(
-                program.file_name().and_then(|name| name.to_str()),
-                Some("codex" | "opencode")
-            )
+            || (!direct_provider && !wrapper_shell)
         {
-            bail!("wake supervisor program must be an absolute regular codex/opencode executable");
+            bail!("wake supervisor program must be an absolute regular codex/opencode/agy executable or the shell of a wrapper registered in the managed stream harness topology");
         }
         spec.argv[0] = canonical_program.to_string_lossy().into_owned();
-        let canonical_root = fs::canonicalize(root).context("canonicalize root failed")?;
         let cwd_metadata = fs::symlink_metadata(&spec.cwd).context("stat raw cwd failed")?;
         if cwd_metadata.file_type().is_symlink()
             || !cwd_metadata.file_type().is_dir()
@@ -2798,6 +3552,12 @@ enum DarwinFullReadDisposition {
 enum DarwinPidPathDisposition {
     Missing,
     Exact(usize),
+    /// Zero length with `ENOENT` rather than `ESRCH`: Darwin can report this for
+    /// a process that is still very much alive (r77 observed it while a live
+    /// OpenCode reviewer was being walked across 458 helper processes).  It is
+    /// therefore *not* a death signal and *not* an operational error on its own
+    /// — the caller must re-read the topology and decide.  See D-26.
+    EmptyWithoutEsrch,
 }
 
 #[cfg(target_os = "macos")]
@@ -2890,6 +3650,14 @@ fn classify_darwin_pidpath_read(
         if raw_os_error == Some(3) {
             return Ok(DarwinPidPathDisposition::Missing);
         }
+        if raw_os_error == Some(2) {
+            // D-26: ENOENT here is ambiguous, not terminal.  Treating it as an
+            // operational error killed a working primary reviewer mid-review
+            // (r77 wake 01a02924-4b7e-4962-8e3e-816576bb4406); treating it as
+            // "alive" would let a dead process pass.  Hand the ambiguity back
+            // to the caller, which resolves it against the process topology.
+            return Ok(DarwinPidPathDisposition::EmptyWithoutEsrch);
+        }
         bail!("proc_pidpath returned zero length without ESRCH: errno={raw_os_error:?}");
     }
     if raw_os_error.unwrap_or_default() != 0 {
@@ -2909,6 +3677,55 @@ fn classify_darwin_pidpath_read(
         bail!("proc_pidpath positive-length body lacks a trailing NUL");
     }
     Ok(DarwinPidPathDisposition::Exact(length))
+}
+
+/// What a `proc_pidpath` "zero length + ENOENT" means once the topology has been
+/// re-read for the same pid (D-26).
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum DarwinPidPathRecheck {
+    /// The process is gone, or the pid now belongs to a different epoch.  Either
+    /// way the process we were asked about is absent — that is an ordinary
+    /// observation, not a supervisor failure.
+    Vanished,
+    /// Same pid, same birth identity, same uid: still the very same live process,
+    /// so the ambiguous read earns exactly one retry.
+    SameEpochRetry,
+}
+
+/// Decide whether an ambiguous pidpath read may be retried.
+///
+/// Retrying is only safe while the observed process is provably the *same* one:
+/// pid alone is not an identity on a system that recycles pids, so birth identity
+/// and uid must both still match.  Anything else — vanished, re-used pid, new
+/// owner — is reported as absent rather than retried, so a dead process can never
+/// be resurrected by a second read.
+#[cfg(target_os = "macos")]
+fn darwin_pidpath_recheck_disposition(
+    before: &ManagedProcessTopology,
+    after: Option<&ManagedProcessTopology>,
+) -> DarwinPidPathRecheck {
+    match after {
+        Some(after)
+            if after.pid == before.pid
+                && after.birth_identity == before.birth_identity
+                && after.uid == before.uid =>
+        {
+            DarwinPidPathRecheck::SameEpochRetry
+        }
+        _ => DarwinPidPathRecheck::Vanished,
+    }
+}
+
+/// One raw `proc_pidpath` read, classified.  Factored out so the D-26 recheck
+/// performs the identical syscall rather than an approximation of it.
+#[cfg(target_os = "macos")]
+fn read_darwin_pidpath(pid_i32: i32, path: &mut [u8]) -> Result<DarwinPidPathDisposition> {
+    // SAFETY: proc_pidpath is given a writable buffer with its exact capacity.
+    clear_darwin_errno();
+    let path_len = unsafe { proc_pidpath(pid_i32, path.as_mut_ptr().cast(), path.len() as u32) };
+    let raw_os_error = darwin_errno();
+    classify_darwin_pidpath_read(path_len, raw_os_error, path)
 }
 
 #[cfg(target_os = "macos")]
@@ -3287,13 +4104,30 @@ fn inspect_process(pid: u32) -> Result<Option<ManagedProcessCredential>> {
         return Ok(None);
     };
     let mut path = vec![0u8; 4096];
-    // SAFETY: proc_pidpath is given a writable vector with its exact capacity.
-    clear_darwin_errno();
-    let path_len = unsafe { proc_pidpath(pid_i32, path.as_mut_ptr().cast(), path.len() as u32) };
-    let raw_os_error = darwin_errno();
-    let path_len = match classify_darwin_pidpath_read(path_len, raw_os_error, &path)? {
+    let path_len = match read_darwin_pidpath(pid_i32, &mut path)? {
         DarwinPidPathDisposition::Missing => return Ok(None),
         DarwinPidPathDisposition::Exact(length) => length,
+        // D-26: exactly one bounded recheck, and only inside the same epoch.
+        // The previous code raised an operational error here, which the wake
+        // supervisor turned into a TERM — killing a primary reviewer that was
+        // still working (r77/B296).  Silently treating it as "alive" would be
+        // the opposite failure, so the topology decides.
+        DarwinPidPathDisposition::EmptyWithoutEsrch => {
+            match darwin_pidpath_recheck_disposition(&topology, inspect_topology(pid)?.as_ref()) {
+                DarwinPidPathRecheck::Vanished => return Ok(None),
+                DarwinPidPathRecheck::SameEpochRetry => {
+                    match read_darwin_pidpath(pid_i32, &mut path)? {
+                        DarwinPidPathDisposition::Missing => return Ok(None),
+                        DarwinPidPathDisposition::Exact(length) => length,
+                        // Still ambiguous for a process we just proved is the
+                        // same live one: fail closed rather than guess.
+                        DarwinPidPathDisposition::EmptyWithoutEsrch => bail!(
+                            "proc_pidpath returned zero length with ENOENT twice for live pid {pid} in one epoch"
+                        ),
+                    }
+                }
+            }
+        }
     };
     path.truncate(path_len);
     let executable = PathBuf::from(std::ffi::OsString::from_vec(path));
@@ -7096,7 +7930,12 @@ fn supervise_managed_child_with_control(
     })
 }
 
-#[doc(hidden)]
+/// Supervise a synthetic direct child with a bounded one-second deadline.
+///
+/// Production managed wakes always use `supervise_managed_child_with_runtime_limit`
+/// with their immutable descriptor deadline. This convenience entry is kept
+/// for local process-tree probes so a provider that never emits a terminal
+/// cannot leave a test-owned child tree running for the production maximum.
 pub fn supervise_managed_child(
     child: Child,
     program: &str,
@@ -7108,7 +7947,7 @@ pub fn supervise_managed_child(
         program,
         log_path,
         policy,
-        managed_wake_runtime_limit(None),
+        managed_wake_runtime_limit(Some(1)),
     )
 }
 
@@ -7244,9 +8083,9 @@ where
 
 /// Classify a registered wake command by provider topology.
 ///
-/// Unknown providers, including agy, are deliberately rejected: agy's topology
-/// is undefined and must receive a planner decision before it can re-enter the
-/// pool.
+/// Unknown providers are rejected. Agy is admitted only through its distinct
+/// managed-pid-group variant, whose caller must complete the canary preflight
+/// before the formal supervisor is spawned.
 pub fn durable_identity_kind(argv: &[String]) -> Result<DurableIdentityKind> {
     let program = argv.first().context(
         "durable provider topology undefined: empty argv; topology decision required before pool admission",
@@ -7258,13 +8097,19 @@ pub fn durable_identity_kind(argv: &[String]) -> Result<DurableIdentityKind> {
     if matches!(basename, "codex" | "opencode") {
         return Ok(DurableIdentityKind::ManagedPidGroup);
     }
+    if managed_stream_harness(argv).is_some() {
+        return Ok(DurableIdentityKind::ManagedPidGroup);
+    }
+    if is_exact_agy_provider_argv(argv) {
+        return Ok(DurableIdentityKind::ManagedPidGroup);
+    }
     if argv.iter().any(|arg| {
         Path::new(arg).file_name().and_then(|name| name.to_str()) == Some("wake-multica.sh")
     }) {
         return Ok(DurableIdentityKind::WakeLogProxy);
     }
     bail!(
-        "durable provider topology undefined for {basename:?}; agy topology is undefined and requires a planner decision before pool admission"
+        "durable provider topology undefined for {basename:?}; explicit topology is required before pool admission"
     )
 }
 
@@ -7283,6 +8128,8 @@ pub fn backend_receipt_kind_from_argv(
     match basename {
         "codex" => Ok(BackendReceiptKind::Codex),
         "opencode" => Ok(BackendReceiptKind::OpenCode),
+        "agy" if is_exact_agy_provider_argv(argv) => Ok(BackendReceiptKind::Agy),
+        _ if let Some(kind) = managed_legacy_wrapper_kind(argv) => Ok(kind),
         _ if argv.iter().any(|arg| {
             Path::new(arg).file_name().and_then(|name| name.to_str()) == Some("wake-multica.sh")
         }) =>
@@ -7295,13 +8142,272 @@ pub fn backend_receipt_kind_from_argv(
     }
 }
 
+/// Resolve the **receipt grammar** of the two legacy wrappers that emit one.
+///
+/// This answers "what shape of backend receipt may this provider produce?", so a
+/// wrapper whose descriptor declares `receipt: absent` (DSH) is deliberately not
+/// listed here — inventing a receipt kind for it would let a fabricated receipt
+/// pass as a provider fact.  Callers that need "does the runtime own this child
+/// process tree?" must use [`managed_stream_harness`] instead; conflating the two
+/// is exactly what refused every real DSH review before spawn (D-25).
+fn managed_legacy_wrapper_kind(argv: &[String]) -> Option<BackendReceiptKind> {
+    match argv.get(1).map(String::as_str) {
+        Some(PI_STREAM_SCRIPT_REL) => Some(BackendReceiptKind::Pi),
+        Some(ZCODE_STREAM_SCRIPT_REL) => Some(BackendReceiptKind::ZCode),
+        _ => None,
+    }
+}
+
+/// Resolve the **process topology** of a registered stream wrapper: which harness
+/// owns the direct child tree the supervisor will reap.
+///
+/// Only the wrappers' declared registry paths in script position are accepted, so
+/// an arbitrary basename or an injected message can never change topology.  This
+/// is the classifier every custody/admission decision must use, independent of
+/// whether that harness also emits a backend receipt.
+fn managed_stream_harness(argv: &[String]) -> Option<crate::harness::HarnessId> {
+    match argv.get(1).map(String::as_str) {
+        Some(PI_STREAM_SCRIPT_REL) => Some(crate::harness::HarnessId::Pi),
+        Some(ZCODE_STREAM_SCRIPT_REL) => Some(crate::harness::HarnessId::ZCode),
+        Some(DSH_STREAM_SCRIPT_REL) => Some(crate::harness::HarnessId::Dsh),
+        _ => None,
+    }
+}
+
 fn is_exact_agy_provider_argv(argv: &[String]) -> bool {
+    argv.len() == 8
+        && is_agy_program(argv)
+        && argv[1] == "-p"
+        && !argv[2].is_empty()
+        && argv[3] == "--model"
+        && !argv[4].is_empty()
+        && argv[5] == "--effort"
+        && !argv[6].is_empty()
+        && argv[7] == "--dangerously-skip-permissions"
+}
+
+fn is_agy_program(argv: &[String]) -> bool {
     argv.first().is_some_and(|program| {
         Path::new(program)
             .file_name()
             .and_then(|name| name.to_str())
             == Some("agy")
     })
+}
+
+struct AgyCanaryTempGuard(Vec<PathBuf>);
+
+impl Drop for AgyCanaryTempGuard {
+    fn drop(&mut self) {
+        for path in self.0.drain(..) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn agy_canary_output_is_exact(bytes: &[u8], canary: &str) -> bool {
+    bytes == canary.as_bytes()
+        || bytes == format!("{canary}\n").as_bytes()
+        || bytes == format!("{canary}\r\n").as_bytes()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_agy_managed_preflight(
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    log_path: &Path,
+    wake_id: &str,
+    formal_message: &str,
+    provider: &str,
+    model: &str,
+    effort: &str,
+) -> Result<()> {
+    if !is_exact_agy_provider_argv(argv) {
+        bail!("Agy preflight requires exact agy argv");
+    }
+    if argv[4] != model || argv[6] != effort || provider.trim().is_empty() {
+        bail!("Agy preflight signed provider/model/effort drift");
+    }
+    let prompt_positions = argv
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == "-p").then_some(index))
+        .collect::<Vec<_>>();
+    let [prompt_index] = prompt_positions.as_slice() else {
+        bail!("Agy preflight requires exactly one -p argument");
+    };
+    let message_index = prompt_index
+        .checked_add(1)
+        .context("Agy preflight message index overflow")?;
+    if argv.get(message_index).map(String::as_str) != Some(formal_message) {
+        bail!("Agy preflight formal message is not the exact -p value");
+    }
+    let canary = format!("ORCH-AGY-CANARY-{}", fresh_uuid());
+    let mut canary_argv = argv.to_vec();
+    canary_argv[message_index] = format!(
+        "Authentication canary. Return exactly this token and nothing else: {canary}"
+    );
+    let program = resolve_managed_program(&canary_argv[0], &canary_argv)?;
+    canary_argv[0] = program.display().to_string();
+    let nonce = fresh_uuid();
+    let stdout_path = log_path.with_extension(format!("agy-canary-{nonce}.stdout"));
+    let stderr_path = log_path.with_extension(format!("agy-canary-{nonce}.stderr"));
+    let _guard = AgyCanaryTempGuard(vec![stdout_path.clone(), stderr_path.clone()]);
+    let stdout = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&stdout_path)?;
+    let stderr = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&stderr_path)?;
+    let mut command = Command::new(&canary_argv[0]);
+    command
+        .args(&canary_argv[1..])
+        .envs(env)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .process_group(0);
+    let mut child = command.spawn().context("spawn Agy authentication canary failed")?;
+    let pid = child.id();
+    let status = match child
+        .wait_timeout(Duration::from_secs(60))
+        .context("wait Agy authentication canary failed")?
+    {
+        Some(status) => status,
+        None => {
+            let _ = unsafe { libc_kill(-(pid as i32), 9) };
+            let _ = child.wait();
+            bail!("Agy authentication canary timed out before formal request");
+        }
+    };
+    let output = fs::read(&stdout_path).context("read Agy canary stdout failed")?;
+    if !status.success() || !agy_canary_output_is_exact(&output, &canary) {
+        bail!(
+            "Agy authentication canary failed exact echo: exit={:?} bytes={}",
+            status.code(),
+            output.len()
+        );
+    }
+    let canary_sha256 = sha256_hex(canary.as_bytes());
+    std::thread::sleep(Duration::from_secs(5));
+    let mut log = fs::OpenOptions::new()
+        .append(true)
+        .open(log_path)
+        .context("open Agy formal log for preflight receipt failed")?;
+    serde_json::to_writer(
+        &mut log,
+        &serde_json::json!({
+            "type": "agy.preflight",
+            "wakeId": wake_id,
+            "provider": provider,
+            "model": model,
+            "effort": effort,
+            "canarySha256": canary_sha256,
+            "stabilityWindowMs": 5_000,
+        }),
+    )?;
+    writeln!(log)?;
+    log.sync_all()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn with_agy_managed_preflight<T>(
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    log_path: &Path,
+    wake_id: &str,
+    formal_message: &str,
+    provider: &str,
+    model: &str,
+    effort: &str,
+    formal: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    run_agy_managed_preflight(
+        argv,
+        env,
+        cwd,
+        log_path,
+        wake_id,
+        formal_message,
+        provider,
+        model,
+        effort,
+    )?;
+    formal()
+}
+
+/// Integration-test seam for the real Agy canary/stability implementation.
+/// It refuses every root outside this crate's `orch/target/test-tmp` tree, so
+/// production callers cannot use it to execute arbitrary repository commands.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn run_agy_managed_preflight_for_test(
+    root: &Path,
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    log_path: &Path,
+    wake_id: &str,
+    formal_message: &str,
+    provider: &str,
+    model: &str,
+    effort: &str,
+) -> Result<()> {
+    let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .context("orch-host manifest layout missing workspace root")?
+        .join("target/test-tmp");
+    let canonical_root = fs::canonicalize(root)?;
+    let canonical_scratch = fs::canonicalize(&scratch)?;
+    if canonical_root == canonical_scratch || !canonical_root.starts_with(&canonical_scratch) {
+        bail!("Agy preflight test seam only accepts a test-tmp child root");
+    }
+    if !log_path.starts_with(&canonical_root) {
+        bail!("Agy preflight test log must remain inside its scratch root");
+    }
+    with_agy_managed_preflight(
+        argv,
+        env,
+        &canonical_root,
+        log_path,
+        wake_id,
+        formal_message,
+        provider,
+        model,
+        effort,
+        || {
+            let formal_output_path =
+                canonical_root.join(format!("agy-formal-{}.stdout", fresh_uuid()));
+            let _guard = AgyCanaryTempGuard(vec![formal_output_path.clone()]);
+            let formal_output = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&formal_output_path)?;
+            let status = Command::new(&argv[0])
+                .args(&argv[1..])
+                .envs(env)
+                .current_dir(&canonical_root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(formal_output))
+                .stderr(Stdio::null())
+                .status()
+                .context("spawn Agy formal test request failed")?;
+            if !status.success() {
+                bail!("Agy formal test request failed: {status}");
+            }
+            let output = fs::read(&formal_output_path)?;
+            if String::from_utf8_lossy(&output).trim().is_empty() {
+                bail!("Agy formal test request returned an empty final answer");
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Derive the only legal termination plan from the durable provider topology.
@@ -7386,6 +8492,83 @@ fn validate_wake_permit(
     required_role: Option<&str>,
 ) -> Result<()> {
     validate_wake_permit_with_replacement(root, round, agent, required_role, None)
+}
+
+fn validate_panel_route_wake_permit(
+    root: &Path,
+    round: &str,
+    agent: &str,
+    required_role: &str,
+    authorization: &PanelRouteAuthorizationV1,
+) -> Result<()> {
+    if authorization.route.agent != agent
+        || format!("{}-review", authorization.route.role) != required_role
+    {
+        bail!("panel route wake permit role/agent 漂移");
+    }
+    let events = read_round_ledger_events(root, round)?;
+    ledger::validate_runtime_event_history_v1_at_root(root, &events, round)?;
+    let routes = events
+        .iter()
+        .filter(|event| {
+            event.event_id == authorization.route_event_id
+                && event.task_id.as_deref() == Some(authorization.task_id.as_str())
+                && matches!(
+                    ledger::decode_runtime_event_v1(event),
+                    Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(ref route)))
+                        if route == &authorization.route
+                )
+        })
+        .count();
+    if routes != 1 {
+        bail!("panel route wake permit 缺唯一 committed reservation");
+    }
+    if events.iter().filter(|event| {
+        event.event_id == authorization.selected_event_id
+            && matches!(
+                ledger::decode_runtime_event_v1(event),
+                Ok(Some(ledger::RuntimeEventPayloadV1::ReviewPanelSelected(ref selected)))
+                    if selected.panel_id == authorization.route.panel_id
+                        && event.task_id.as_deref() == Some(authorization.task_id.as_str())
+            )
+    }).count() != 1
+        || events.iter().any(|event| {
+            matches!(
+                ledger::decode_runtime_event_v1(event),
+                Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(ref terminal)))
+                    if terminal.panel_id == authorization.route.panel_id
+                        && terminal.seat_id == authorization.route.seat_id
+                        && terminal.generation == authorization.route.generation
+            ) || matches!(
+                ledger::decode_runtime_event_v1(event),
+                Ok(Some(ledger::RuntimeEventPayloadV1::ReviewPanelClosed(ref closed)))
+                    if closed.panel_id == authorization.route.panel_id
+            )
+        })
+    {
+        bail!("panel route reservation 已终结或 selected binding 漂移");
+    }
+    let active = crate::plan::require_active_round_ir(root, round, &events)?;
+    if !active
+        .candidate
+        .scheduling
+        .allowed_agents
+        .iter()
+        .any(|allowed| allowed == agent)
+    {
+        bail!("panel route agent 未获 active ROUND-IR 授权");
+    }
+    let capacity = active
+        .candidate
+        .scheduling
+        .capacities
+        .get(agent)
+        .with_context(|| format!("panel route agent {agent} 缺 signed capacity"))?;
+    crate::scheduler::role_admits(&capacity.roles, required_role).map_err(anyhow::Error::msg)?;
+    if capacity.agent == 0 || capacity.quota == 0 {
+        bail!("panel route agent capacity 为 0");
+    }
+    Ok(())
 }
 
 fn validate_wake_permit_with_replacement(
@@ -7624,6 +8807,8 @@ struct RegisteredWakeLaunch {
     /// not have one even though they still have an action wake id.
     wake_id: Option<String>,
     provider_kind: Option<BackendReceiptKind>,
+    harness_id: Option<crate::harness::HarnessId>,
+    terminal_capability: Option<crate::harness::CapabilitySource>,
     plain_text_review_channel: bool,
     request_session_id: Option<String>,
     runtime_limit: Option<ManagedWakeRuntimeLimit>,
@@ -7634,9 +8819,50 @@ struct RegisteredWakeLaunch {
     /// 已 fail-closed 置空/缺席，绝不保留历史咬合标记）。
     legacy_probe: LegacyProbeState,
     tool: Option<String>,
+    requested_provider: Option<String>,
     requested_model: Option<String>,
     requested_effort: Option<String>,
     quota_domain: Option<String>,
+    harness_registry_digest: String,
+    review_output_path: Option<String>,
+}
+
+fn bind_registered_wake_harness_identity(
+    payload: &mut serde_json::Value,
+    harness_id: Option<crate::harness::HarnessId>,
+    terminal_capability: Option<crate::harness::CapabilitySource>,
+    harness_registry_digest: &str,
+) -> Result<()> {
+    let object = payload
+        .as_object_mut()
+        .context("WakeIssued payload must be a JSON object")?;
+    object.insert(
+        "harnessId".to_string(),
+        serde_json::json!(harness_id.map(|harness| harness.as_str())),
+    );
+    object.insert(
+        "terminalCapability".to_string(),
+        serde_json::json!(terminal_capability.map(|capability| capability.as_str())),
+    );
+    object.insert(
+        "harnessRegistryDigest".to_string(),
+        serde_json::Value::String(harness_registry_digest.to_string()),
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct HarnessInvocationContext {
+    action_id: String,
+    wake_id: String,
+    round: String,
+    task_id: String,
+    attempt_id: String,
+    role: String,
+    cwd: PathBuf,
+    fixed_head: String,
+    review_output_path: String,
+    deadline_secs: u64,
 }
 
 /// legacy 探活路径（wake-<agent>.log）的轮换结果（B100 修复轮 D1/D2）。
@@ -7717,22 +8943,36 @@ pub enum BackendReceiptKind {
     Codex,
     OpenCode,
     SmartClaw,
+    /// The managed Pi streaming wrapper and its directly supervised child tree.
+    Pi,
+    /// The managed ZCode streaming wrapper, which verifies its external pin.
+    ZCode,
+    /// Agy direct CLI after the runtime-derived canary acceptance frame.
+    Agy,
 }
 
 impl BackendReceiptKind {
+    /// Return the stable harness identifier stored in durable wake receipts.
+    /// The value is derived from the closed harness catalog, never provider text.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Codex => "codex",
-            Self::OpenCode => "opencode",
-            Self::SmartClaw => "smartclaw",
+            Self::Codex => crate::harness::HarnessId::Codex.as_str(),
+            Self::OpenCode => crate::harness::HarnessId::OpenCode.as_str(),
+            Self::SmartClaw => crate::harness::HarnessId::SmartClaw.as_str(),
+            Self::Pi => crate::harness::HarnessId::Pi.as_str(),
+            Self::ZCode => crate::harness::HarnessId::ZCode.as_str(),
+            Self::Agy => crate::harness::HarnessId::Agy.as_str(),
         }
     }
 
     fn parse(value: &str) -> std::result::Result<Self, String> {
-        match value {
-            "codex" => Ok(Self::Codex),
-            "opencode" => Ok(Self::OpenCode),
-            "smartclaw" => Ok(Self::SmartClaw),
+        match crate::harness::HarnessId::parse(value) {
+            Ok(crate::harness::HarnessId::Codex) => Ok(Self::Codex),
+            Ok(crate::harness::HarnessId::OpenCode) => Ok(Self::OpenCode),
+            Ok(crate::harness::HarnessId::SmartClaw) => Ok(Self::SmartClaw),
+            Ok(crate::harness::HarnessId::Pi) => Ok(Self::Pi),
+            Ok(crate::harness::HarnessId::ZCode) => Ok(Self::ZCode),
+            Ok(crate::harness::HarnessId::Agy) => Ok(Self::Agy),
             _ => Err(format!("unknown backend receipt provider {value:?}")),
         }
     }
@@ -7751,6 +8991,14 @@ pub struct BackendReceiptExpectation {
     pub continuation_id: String,
     pub request_message_sha256: String,
     pub request_session_id: Option<String>,
+    signed_pin: Option<SignedBackendPin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignedBackendPin {
+    provider: String,
+    model: String,
+    effort: String,
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -7811,8 +9059,59 @@ impl BackendReceiptExpectation {
             continuation_id: continuation_id.to_string(),
             request_message_sha256: request_message_sha256.to_string(),
             request_session_id,
+            signed_pin: None,
         })
     }
+
+    fn with_signed_pin(
+        mut self,
+        provider: &str,
+        model: &str,
+        effort: &str,
+    ) -> std::result::Result<Self, String> {
+        for (label, value) in [("provider", provider), ("model", model), ("effort", effort)] {
+            required_identity(label, value)?;
+        }
+        self.signed_pin = Some(SignedBackendPin {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            effort: effort.to_string(),
+        });
+        Ok(self)
+    }
+}
+
+fn requires_signed_pin(kind: BackendReceiptKind) -> bool {
+    matches!(
+        kind,
+        BackendReceiptKind::Pi | BackendReceiptKind::ZCode | BackendReceiptKind::Agy
+    )
+}
+
+fn verify_signed_pin(
+    expectation: &BackendReceiptExpectation,
+    value: &serde_json::Value,
+) -> std::result::Result<(), String> {
+    let expected = expectation.signed_pin.as_ref().ok_or_else(|| {
+        format!(
+            "{} backend receipt requires a signed provider/model/effort pin",
+            expectation.expected_kind
+        )
+    })?;
+    for (key, wanted) in [
+        ("provider", expected.provider.as_str()),
+        ("model", expected.model.as_str()),
+        ("effort", expected.effort.as_str()),
+    ] {
+        let observed = nonempty_json_string(value, key)?;
+        if observed != wanted {
+            return Err(format!(
+                "{} backend signed {key} drift: expected={wanted:?} observed={observed:?}",
+                expectation.expected_kind
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7825,6 +9124,7 @@ pub struct BackendReceipt {
     pub observed_session_id: Option<String>,
     pub probe_offset: u64,
     pub probe_end: u64,
+    signed_pin: Option<SignedBackendPin>,
 }
 
 fn nonempty_json_string<'a>(
@@ -7869,6 +9169,9 @@ pub fn backend_receipt_from_log(
             "text" | "tool_use" | "tool_result" if value.get("sessionId").is_some() => {
                 Some(BackendReceiptKind::SmartClaw)
             }
+            "pi.session" => Some(BackendReceiptKind::Pi),
+            "zcode.pin-verified" => Some(BackendReceiptKind::ZCode),
+            "agy.preflight" => Some(BackendReceiptKind::Agy),
             _ => None,
         };
         if observed_frame_kind.is_some_and(|kind| kind != expectation.expected_kind) {
@@ -7877,14 +9180,18 @@ pub fn backend_receipt_from_log(
                 expectation.expected_kind
             ));
         }
-        let observed_session_id = match expectation.expected_kind {
-            BackendReceiptKind::Codex if frame_type == "thread.started" => {
-                Some(nonempty_json_string(&value, "thread_id")?.to_string())
-            }
+        let (matched, observed_session_id) = match expectation.expected_kind {
+            BackendReceiptKind::Codex if frame_type == "thread.started" => (
+                true,
+                Some(nonempty_json_string(&value, "thread_id")?.to_string()),
+            ),
             BackendReceiptKind::OpenCode
                 if matches!(frame_type, "step_start" | "step_finish" | "tool_use") =>
             {
-                Some(nonempty_json_string(&value, "sessionID")?.to_string())
+                (
+                    true,
+                    Some(nonempty_json_string(&value, "sessionID")?.to_string()),
+                )
             }
             BackendReceiptKind::SmartClaw
                 if matches!(frame_type, "text" | "tool_use" | "tool_result") =>
@@ -7899,20 +9206,43 @@ pub fn backend_receipt_from_log(
                         "SmartClaw backend session mismatch: expected={requested:?} observed={observed:?}"
                     ));
                 }
-                Some(observed.to_string())
+                (true, Some(observed.to_string()))
             }
-            _ => None,
+            BackendReceiptKind::Pi if frame_type == "pi.session" => {
+                verify_signed_pin(expectation, &value)?;
+                (
+                    true,
+                    Some(nonempty_json_string(&value, "sessionId")?.to_string()),
+                )
+            }
+            BackendReceiptKind::ZCode if frame_type == "zcode.pin-verified" => {
+                verify_signed_pin(expectation, &value)?;
+                (true, None)
+            }
+            BackendReceiptKind::Agy if frame_type == "agy.preflight" => {
+                verify_signed_pin(expectation, &value)?;
+                if nonempty_json_string(&value, "wakeId")? != expectation.wake_id {
+                    return Err("Agy preflight wakeId mismatch".to_string());
+                }
+                let digest = nonempty_json_string(&value, "canarySha256")?;
+                if !valid_sha256(digest) {
+                    return Err("Agy preflight canarySha256 is invalid".to_string());
+                }
+                (true, None)
+            }
+            _ => (false, None),
         };
-        if let Some(observed_session_id) = observed_session_id {
+        if matched {
             return Ok(Some(BackendReceipt {
                 kind: expectation.expected_kind,
                 wake_id: expectation.wake_id.clone(),
                 continuation_id: expectation.continuation_id.clone(),
                 message_sha256: expectation.request_message_sha256.clone(),
                 request_session_id: expectation.request_session_id.clone(),
-                observed_session_id: Some(observed_session_id),
+                observed_session_id,
                 probe_offset: 0,
                 probe_end: bytes.len() as u64,
+                signed_pin: expectation.signed_pin.clone(),
             }));
         }
     }
@@ -7951,7 +9281,7 @@ impl BackendReceiptLedgerState {
     ) -> std::result::Result<Self, String> {
         required_identity("wakeId", wake_id)?;
         required_identity("continuationId", continuation_id)?;
-        parse_continuation_identity(continuation_id)?;
+        let continuation = parse_continuation_identity(continuation_id)?;
         if !valid_sha256(request_message_sha256) {
             return Err("requestMessageSha256 must be 64 lowercase hex characters".to_string());
         }
@@ -7960,7 +9290,14 @@ impl BackendReceiptLedgerState {
                 "backend receipt reconcile requires exactly one WakeIssued, found {wake_issued_count}"
             ));
         }
-        let expected_reviews = usize::from(continuation_id.starts_with("review:"));
+        // `ReviewRequested` is the durable lifecycle fact for formal seats
+        // only. Nongate panel seats deliberately use their committed
+        // ReviewSeatRouted identity instead and must not manufacture a formal
+        // request merely to satisfy backend-receipt accounting.
+        let expected_reviews = usize::from(matches!(
+            continuation.role.as_deref(),
+            Some("primary" | "secondary")
+        ));
         if review_requested_count != expected_reviews {
             return Err(format!(
                 "backend receipt reconcile requires {expected_reviews} matching ReviewRequested, found {review_requested_count}"
@@ -8075,6 +9412,28 @@ pub enum WakeFenceDecision {
         wake_id: String,
         backend_accepted: bool,
     },
+}
+
+fn new_wake_fence_decision(
+    active: &[ActiveWake],
+    agent: &str,
+    intent: &WakeIntent,
+    request_message_sha256: &str,
+    capacity: usize,
+    provider_bound: bool,
+    committed_panel_route: bool,
+) -> std::result::Result<WakeFenceDecision, String> {
+    if committed_panel_route || !provider_bound {
+        return Ok(WakeFenceDecision::Spawn);
+    }
+    wake_fence_decision(
+        active,
+        agent,
+        intent,
+        request_message_sha256,
+        capacity,
+    )
+    .map(WakeFenceDecision::from)
 }
 
 #[doc(hidden)]
@@ -8719,9 +10078,9 @@ fn exact_accepted_backend_receipt_if_present<'a>(
     }
 
     for event in events {
-        if degraded_backend_receipt_matches(event, source).context(
-            "ordinary replacement source degraded backend receipt identity is malformed",
-        )? {
+        if degraded_backend_receipt_matches(event, source)
+            .context("ordinary replacement source degraded backend receipt identity is malformed")?
+        {
             bail!(
                 "receiptless ordinary replacement source must not carry a degraded backend receipt for wakeId={}",
                 source.wake_id
@@ -8801,8 +10160,7 @@ fn wake_supersession_projection(
         {
             bail!("WakeIssued supersession source/successor identity mismatch");
         }
-        let source_receipt =
-            exact_accepted_backend_receipt_if_present(events, &source_facts)?;
+        let source_receipt = exact_accepted_backend_receipt_if_present(events, &source_facts)?;
         let source_request = exact_review_request_for_wake(events, round, source_wake_id)?;
         let successor_request =
             exact_review_request_for_wake(events, round, &successor_facts.wake_id)?;
@@ -8976,6 +10334,7 @@ fn active_wakes_from_events_projected(
             )
         };
     let supersession = wake_supersession_projection(events, round)?;
+    let resume_replacements = resume_dispatch::project(events, round)?;
     let load = crate::scheduler::agent_inflight_load_from_events(events, round)
         .map_err(anyhow::Error::msg)?;
     let mut active = Vec::new();
@@ -9028,7 +10387,7 @@ fn active_wakes_from_events_projected(
         }
         for (wake_index, wake) in wakes {
             let wake_id = payload_string(wake, "wakeId").unwrap_or("legacy-unknown-wake");
-            if supersession.superseded.contains(wake_id) {
+            if supersession.superseded.contains(wake_id) || resume_replacements.replaces(wake_id) {
                 continue;
             }
             if declared_dead(wake_id, wake_index, item) {
@@ -9155,6 +10514,9 @@ fn backend_receipt_event(
             "attemptId": attempt_id,
             "agent": agent,
             "providerKind": receipt.kind.as_str(),
+            "requestedProvider": receipt.signed_pin.as_ref().map(|pin| pin.provider.as_str()),
+            "requestedModel": receipt.signed_pin.as_ref().map(|pin| pin.model.as_str()),
+            "requestedEffort": receipt.signed_pin.as_ref().map(|pin| pin.effort.as_str()),
             "requestMessageSha256": receipt.message_sha256,
             "renderedMessageSha256": rendered_message_sha256,
             "receiptKind": receipt.kind.as_str(),
@@ -9176,6 +10538,9 @@ struct DurableReceiptFacts {
     identity: ContinuationIdentity,
     agent: String,
     provider_kind: BackendReceiptKind,
+    requested_provider: Option<String>,
+    requested_model: Option<String>,
+    requested_effort: Option<String>,
     request_message_sha256: String,
     rendered_message_sha256: String,
     request_session_id: Option<String>,
@@ -9229,6 +10594,23 @@ fn durable_receipt_facts(event: &orch_core::EventRecord) -> Result<DurableReceip
     }
     let provider_kind =
         BackendReceiptKind::parse(&string("providerKind")?).map_err(anyhow::Error::msg)?;
+    let optional_pin = |key: &str| -> Result<Option<String>> {
+        match event.payload.as_ref().and_then(|payload| payload.get(key)) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+                Ok(Some(value.clone()))
+            }
+            _ => bail!("WakeIssued payload.{key} must be null or a non-empty string"),
+        }
+    };
+    let requested_provider = optional_pin("requestedProvider")?;
+    let requested_model = optional_pin("requestedModel")?;
+    let requested_effort = optional_pin("requestedEffort")?;
+    if requires_signed_pin(provider_kind)
+        && (requested_provider.is_none() || requested_model.is_none() || requested_effort.is_none())
+    {
+        bail!("Pi/ZCode/Agy WakeIssued requires requested provider/model/effort pins");
+    }
     let request_message_sha256 = string("requestMessageSha256")?;
     let rendered_message_sha256 = string("renderedMessageSha256")?;
     if !valid_sha256(&request_message_sha256) || !valid_sha256(&rendered_message_sha256) {
@@ -9254,11 +10636,86 @@ fn durable_receipt_facts(event: &orch_core::EventRecord) -> Result<DurableReceip
         identity,
         agent,
         provider_kind,
+        requested_provider,
+        requested_model,
+        requested_effort,
         request_message_sha256,
         rendered_message_sha256,
         request_session_id,
         log_path: string("logPath")?,
     })
+}
+
+fn backend_receipt_expectation_with_pin(
+    kind: BackendReceiptKind,
+    wake_id: &str,
+    continuation_id: &str,
+    request_message_sha256: &str,
+    request_session_id: Option<&str>,
+    provider: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<BackendReceiptExpectation> {
+    let expectation = BackendReceiptExpectation::new(
+        kind,
+        wake_id,
+        continuation_id,
+        request_message_sha256,
+        request_session_id,
+    )
+    .map_err(anyhow::Error::msg)?;
+    if !requires_signed_pin(kind) {
+        return Ok(expectation);
+    }
+    expectation
+        .with_signed_pin(
+            provider.context("managed Pi/ZCode wake is missing requestedProvider")?,
+            model.context("managed Pi/ZCode wake is missing requestedModel")?,
+            effort.context("managed Pi/ZCode wake is missing requestedEffort")?,
+        )
+        .map_err(anyhow::Error::msg)
+}
+
+fn backend_receipt_expectation_from_facts(
+    facts: &DurableReceiptFacts,
+) -> Result<BackendReceiptExpectation> {
+    backend_receipt_expectation_with_pin(
+        facts.provider_kind,
+        &facts.wake_id,
+        &facts.continuation_id,
+        &facts.request_message_sha256,
+        facts.request_session_id.as_deref(),
+        facts.requested_provider.as_deref(),
+        facts.requested_model.as_deref(),
+        facts.requested_effort.as_deref(),
+    )
+}
+
+/// Rebuild the provider receipt grammar from one exact durable `WakeIssued`.
+///
+/// Handshake and late reconciliation must consume the same signed provider,
+/// model, effort, continuation and session identity that the runtime actually
+/// published. Reconstructing a second expectation in the CLI would silently
+/// drop Pi/ZCode pins and reject their otherwise valid native receipt.
+pub fn backend_receipt_expectation_for_wake(
+    root: &Path,
+    round: &str,
+    wake_id: &str,
+) -> Result<BackendReceiptExpectation> {
+    let events = read_round_ledger_events(root, round)?;
+    let wakes = events
+        .iter()
+        .filter(|event| {
+            event.kind == "WakeIssued" && payload_string(event, "wakeId") == Some(wake_id)
+        })
+        .collect::<Vec<_>>();
+    if wakes.len() != 1 {
+        bail!(
+            "backend receipt expectation requires one WakeIssued for wakeId={wake_id}, found {}",
+            wakes.len()
+        );
+    }
+    backend_receipt_expectation_from_facts(&durable_receipt_facts(wakes[0])?)
 }
 
 fn existing_receipt_matches(
@@ -9287,6 +10744,31 @@ fn existing_receipt_matches(
         Some(serde_json::Value::String(value)) => Some(value.as_str()) == expected_session,
         _ => false,
     };
+    let observed_session_matches = if matches!(
+        facts.provider_kind,
+        BackendReceiptKind::ZCode | BackendReceiptKind::Agy
+    ) {
+        event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("observedSessionId"))
+            .is_some_and(serde_json::Value::is_null)
+    } else {
+        payload_string(event, "observedSessionId").is_some_and(|value| !value.is_empty())
+    };
+    let pin_matches = !requires_signed_pin(facts.provider_kind)
+        || (facts
+            .requested_provider
+            .as_deref()
+            .is_some_and(|expected| exact_string("requestedProvider", expected))
+            && facts
+                .requested_model
+                .as_deref()
+                .is_some_and(|expected| exact_string("requestedModel", expected))
+            && facts
+                .requested_effort
+                .as_deref()
+                .is_some_and(|expected| exact_string("requestedEffort", expected)));
     let valid = event.actor == "runtime:orch"
         && event.round.as_deref() == Some(facts.identity.round.as_str())
         && event.task_id.as_deref() == facts.identity.task_id.as_deref()
@@ -9309,7 +10791,8 @@ fn existing_receipt_matches(
         && exact_string("logPath", &facts.log_path)
         && exact_string("backendState", "accepted")
         && session_matches
-        && payload_string(event, "observedSessionId").is_some_and(|value| !value.is_empty())
+        && observed_session_matches
+        && pin_matches
         && event
             .payload
             .as_ref()
@@ -9690,14 +11173,7 @@ fn reconcile_backend_receipt_locked(root: &Path, round: &str, wake_id: &str) -> 
     let captured =
         capture_probe_window(Path::new(&facts.log_path), 0).map_err(anyhow::Error::msg)?;
     let bytes = read_captured_probe_bytes(captured)?;
-    let expectation = BackendReceiptExpectation::new(
-        facts.provider_kind,
-        &facts.wake_id,
-        &facts.continuation_id,
-        &facts.request_message_sha256,
-        facts.request_session_id.as_deref(),
-    )
-    .map_err(anyhow::Error::msg)?;
+    let expectation = backend_receipt_expectation_from_facts(&facts)?;
     let Some(receipt) =
         backend_receipt_from_log(&expectation, &bytes, false).map_err(anyhow::Error::msg)?
     else {
@@ -9769,6 +11245,27 @@ pub fn reconcile_backend_receipt(root: &Path, round: &str, wake_id: &str) -> Res
 pub fn reconcile_pending_backend_receipts(root: &Path, round: &str) -> Result<usize> {
     let events = read_round_ledger_events(root, round)?;
     let mut pending = BTreeSet::new();
+    let mut terminal_pending = BTreeSet::new();
+    for wake in events.iter().filter(|event| {
+        event.kind == "WakeIssued"
+            && event.round.as_deref() == Some(round)
+            && payload_string(event, "controlWakeId").is_some()
+    }) {
+        let Some(capability) = terminal_capability_from_wake(wake)? else {
+            continue;
+        };
+        if capability == crate::harness::CapabilitySource::Absent {
+            continue;
+        }
+        let wake_id = payload_string(wake, "wakeId").context("WakeIssued missing wakeId")?;
+        let already_terminal = events.iter().any(|event| {
+            event.kind == "ManagedWakeTerminated"
+                && payload_string(event, "wakeId") == Some(wake_id)
+        });
+        if !already_terminal {
+            terminal_pending.insert(wake_id.to_string());
+        }
+    }
     for wake in events.iter().filter(|event| {
         event.kind == "WakeIssued"
             && event.round.as_deref() == Some(round)
@@ -9801,6 +11298,9 @@ pub fn reconcile_pending_backend_receipts(root: &Path, round: &str) -> Result<us
         if reconcile_backend_receipt(root, round, &wake_id)? {
             accepted += 1;
         }
+        terminal_pending.insert(wake_id);
+    }
+    for wake_id in terminal_pending {
         reconcile_managed_wake_termination(root, round, &wake_id)?;
     }
     Ok(accepted)
@@ -10728,8 +12228,10 @@ pub fn managed_wake_status(root: &Path, wake_id: &str) -> Result<ManagedWakeStat
         .filter(|value| !value.trim().is_empty())
         .context("WakeIssued missing agent")?;
     let provider_kind = payload_string(wake, "providerKind")
-        .filter(|value| matches!(*value, "opencode" | "codex"))
-        .context("unsupported-or-not-managed: status supports managed opencode/codex wakes")?;
+        .filter(|value| matches!(*value, "opencode" | "codex" | "pi" | "zcode"))
+        .context(
+            "unsupported-or-not-managed: status supports managed opencode/codex/Pi/ZCode wakes",
+        )?;
     let (dir, descriptor) = read_managed_wake_control_descriptor(root, wake_id)
         .context("untrusted-runtime-artifact: managed wake descriptor rejected")?;
     let status = read_authenticated_terminal_status(&dir, &descriptor)
@@ -11133,7 +12635,7 @@ fn opencode_attach_argv(
     session_id: &str,
     mode: AttachMode,
 ) -> Result<Vec<String>> {
-    let program = resolve_managed_program("opencode")?;
+    let program = resolve_managed_program("opencode", &["opencode".to_string()])?;
     let canonical_root = fs::canonicalize(root)?;
     Ok(build_opencode_attach_argv(
         &program,
@@ -11492,6 +12994,7 @@ fn run_managed_wake_attach_inner(
     )?;
     let prompt = attach_continuation_prompt(&round, &binding);
     let argv = opencode_attach_argv(root, &prompt, &source_session.session_id, mode)?;
+    let harness_registry_digest = harness_registry_digest_for_wake(root)?;
     let log_dir = root.join("coordination/runtime/logs");
     fs::create_dir_all(&log_dir)?;
     let log_path = log_dir.join(format!("wake-attach-{action_id}.jsonl"));
@@ -11656,6 +13159,7 @@ fn run_managed_wake_attach_inner(
                 "logPath": log_path.display().to_string(),
                 "method": "managed-attach",
                 "mode": mode.as_str(),
+                "harnessRegistryDigest": harness_registry_digest,
             }),
         );
         if let Some(reservation_id) = reservation_id.as_deref() {
@@ -12275,19 +13779,304 @@ fn render_registered_invocation(
     let definition = definitions
         .get(agent)
         .with_context(|| format!("AgentRegistry 未注册 agent: {agent}"))?;
+    let declares_pin =
+        definition.provider.is_some() || definition.model.is_some() || definition.effort.is_some();
+    let descriptor_exists = root
+        .join(crate::harness::HARNESS_REGISTRY_RELPATH)
+        .try_exists()
+        .context("检查 HarnessRegistry 是否存在失败")?;
+    // Headerless legacy fixtures predate the descriptor file and carry no
+    // signed pin to police. Any declared pin, or any installed descriptor
+    // registry, enters the strict path: missing/invalid bytes and key drift
+    // all reject before either renderer can construct an invocation.
+    if declares_pin || descriptor_exists {
+        let harness_registry = crate::harness::load_harness_registry(root)?;
+        crate::harness::assert_pin_is_transportable(&harness_registry, agent, definition)?;
+    }
     if let Some(wake) = definition.legacy_wake.as_ref() {
-        return Ok(crate::registry::RenderedInvocation {
-            tool: None,
-            argv: render_wake_argv_for_mode(wake, message, mode).map_err(anyhow::Error::msg)?,
-            env: BTreeMap::new(),
-            requested_model: None,
-            requested_effort: None,
-        });
+        return Ok(crate::registry::render_legacy_invocation(
+            definition,
+            render_wake_argv_for_mode(wake, message, mode).map_err(anyhow::Error::msg)?,
+        ));
     }
     crate::registry::render_invocation(definition, root, &definition.session_id, message)
 }
 
-fn resolve_managed_program(program: &str) -> Result<PathBuf> {
+fn invocation_envelope_harness(argv: &[String]) -> Option<crate::harness::HarnessId> {
+    managed_stream_harness(argv)
+}
+
+fn resolve_bare_provider_from_path(program: &str) -> Result<PathBuf> {
+    if Path::new(program).components().count() != 1 {
+        bail!("provider PATH lookup accepts only one bare executable name");
+    }
+    let path = std::env::var_os("PATH").context("PATH is unavailable for provider resolution")?;
+    for component in std::env::split_paths(&path) {
+        if !component.is_absolute() {
+            bail!("provider PATH contains a non-absolute component");
+        }
+        let candidate = component.join(program);
+        if candidate.is_file() && fs::metadata(&candidate)?.permissions().mode() & 0o111 != 0 {
+            return fs::canonicalize(&candidate).with_context(|| {
+                format!(
+                    "canonicalize provider executable failed: {}",
+                    candidate.display()
+                )
+            });
+        }
+    }
+    bail!("provider executable {program:?} was not found in an absolute-component PATH")
+}
+
+fn provider_binary_for_envelope(
+    definition: &crate::registry::AgentDefinition,
+    harness: crate::harness::HarnessId,
+) -> Result<PathBuf> {
+    if let Some(configured) = definition.provider_bin.as_deref() {
+        return Ok(PathBuf::from(configured));
+    }
+    let (legacy_key, legacy_default) = match harness {
+        crate::harness::HarnessId::Pi => ("ORCH_PI_BIN", None),
+        crate::harness::HarnessId::ZCode => (
+            "ORCH_ZCODE_BIN",
+            Some("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs"),
+        ),
+        crate::harness::HarnessId::Dsh => ("ORCH_DSH_BIN", None),
+        _ => bail!("invocation envelope provider binary requested for unmanaged harness"),
+    };
+    if let Some(value) = std::env::var_os(legacy_key) {
+        return Ok(PathBuf::from(value));
+    }
+    if let Some(default) = legacy_default {
+        return Ok(PathBuf::from(default));
+    }
+    if harness == crate::harness::HarnessId::Pi {
+        return resolve_bare_provider_from_path("pi");
+    }
+    bail!(
+        "managed harness {} has no providerBin and {legacy_key} is absent; refusing PATH fallback",
+        harness.as_str()
+    )
+}
+
+fn orch_binary_for_envelope(root: &Path) -> Result<PathBuf> {
+    let current = std::env::current_exe().context("resolve running orch executable failed")?;
+    let current_is_orch = current
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "orch");
+    if current_is_orch {
+        return Ok(current);
+    }
+    let built = root.join("orch/target/debug/orch");
+    if built.is_file() && fs::metadata(&built)?.permissions().mode() & 0o111 != 0 {
+        return fs::canonicalize(&built)
+            .with_context(|| format!("canonicalize built orch failed: {}", built.display()));
+    }
+    bail!(
+        "reviewer orch binary is not built or executable: {}",
+        built.display()
+    )
+}
+
+fn harness_registry_digest_for_wake(root: &Path) -> Result<String> {
+    let path = root.join(crate::harness::HARNESS_REGISTRY_RELPATH);
+    if path.exists() {
+        return crate::harness::registry_digest(root);
+    }
+    // Headerless synthetic fixtures predate HarnessRegistry. They retain an
+    // explicit, stable absence digest instead of gaining a field-less event;
+    // every real repository has the descriptor file and takes the branch above.
+    Ok(sha256_hex(b"legacy-fixture-without-harness-registry"))
+}
+
+fn implementation_fixed_head(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    attempt_id: &str,
+) -> Result<String> {
+    let events = read_round_ledger_events(root, round)?;
+    events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.kind == "DispatchIssued"
+                && event.task_id.as_deref() == Some(task_id)
+                && payload_string(event, "attemptId") == Some(attempt_id)
+        })
+        .and_then(|event| payload_string(event, "baseSha"))
+        .map(str::to_string)
+        .with_context(|| {
+            format!(
+                "implementation invocation lacks DispatchIssued baseSha for {task_id}/{attempt_id}"
+            )
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn harness_invocation_context(
+    root: &Path,
+    round: &str,
+    wake_id: &str,
+    continuation: Option<&ContinuationIdentity>,
+    provisioned: Option<&ProvisionedReviewSite>,
+    review_output_path: Option<&str>,
+    deadline_secs: u64,
+) -> Result<HarnessInvocationContext> {
+    let scoped_continuation = continuation
+        .is_some_and(|identity| identity.task_id.is_some() && identity.attempt_id.is_some());
+    let (task_id, attempt_id, role) = match continuation {
+        Some(identity) => match (&identity.task_id, &identity.attempt_id) {
+            (Some(task_id), Some(attempt_id)) => (
+                task_id.clone(),
+                attempt_id.clone(),
+                identity
+                    .role
+                    .clone()
+                    .unwrap_or_else(|| "implement".to_string()),
+            ),
+            (None, None) if identity.manual_wake_id.is_some() && identity.role.is_none() => (
+                "MANUAL".to_string(),
+                "MANUAL-A0000".to_string(),
+                "implement".to_string(),
+            ),
+            _ => bail!("managed continuation has incomplete task/attempt identity"),
+        },
+        None => (
+            "MANUAL".to_string(),
+            "MANUAL-A0000".to_string(),
+            "implement".to_string(),
+        ),
+    };
+    let (cwd, fixed_head, review_output_path) = match (provisioned, review_output_path) {
+        (Some(site), Some(output)) => (
+            fs::canonicalize(&site.site.worktree).with_context(|| {
+                format!(
+                    "canonicalize invocation review cwd failed: {}",
+                    site.site.worktree
+                )
+            })?,
+            site.reviewed_head.clone(),
+            output.to_string(),
+        ),
+        (None, None) => {
+            let fixed_head = if scoped_continuation {
+                implementation_fixed_head(root, round, &task_id, &attempt_id)?
+            } else {
+                crate::gitx::rev_parse(root, "HEAD")?
+            };
+            (
+                fs::canonicalize(root).context("canonicalize invocation root cwd failed")?,
+                fixed_head,
+                crate::harness::NO_REVIEW_OUTPUT.to_string(),
+            )
+        }
+        _ => bail!("review invocation cwd and output path must be supplied together"),
+    };
+    Ok(HarnessInvocationContext {
+        action_id: wake_id.to_string(),
+        wake_id: wake_id.to_string(),
+        round: round.to_string(),
+        task_id,
+        attempt_id,
+        role,
+        cwd,
+        fixed_head,
+        review_output_path,
+        deadline_secs,
+    })
+}
+
+fn invocation_envelope_map(
+    root: &Path,
+    agent: &str,
+    definition: &crate::registry::AgentDefinition,
+    rendered: &crate::registry::RenderedInvocation,
+    harness: crate::harness::HarnessId,
+    context: &HarnessInvocationContext,
+) -> Result<BTreeMap<String, String>> {
+    let registry = crate::harness::load_harness_registry(root)?;
+    let described = registry
+        .get(agent)
+        .with_context(|| format!("HarnessRegistry lacks agent {agent}"))?;
+    if described.harness != harness {
+        bail!(
+            "registered wrapper/harness identity mismatch for {agent}: argv={} descriptor={}",
+            harness.as_str(),
+            described.harness.as_str()
+        );
+    }
+    let legacy_prefix = match harness {
+        crate::harness::HarnessId::Pi => "ORCH_PI",
+        crate::harness::HarnessId::ZCode => "ORCH_ZCODE",
+        crate::harness::HarnessId::Dsh => "ORCH_DSH",
+        _ => bail!(
+            "unsupported invocation-envelope harness {}",
+            harness.as_str()
+        ),
+    };
+    let requested = |field: Option<&String>, suffix: &str| -> Result<String> {
+        field
+            .cloned()
+            .or_else(|| std::env::var(format!("{legacy_prefix}_{suffix}")).ok())
+            .with_context(|| {
+                format!(
+                    "managed harness {} lacks required {suffix} pin",
+                    harness.as_str()
+                )
+            })
+    };
+    let provider = requested(rendered.requested_provider.as_ref(), "PROVIDER")?;
+    let model = requested(rendered.requested_model.as_ref(), "MODEL")?;
+    let effort = requested(rendered.requested_effort.as_ref(), "EFFORT")?;
+    let provider_bin = provider_binary_for_envelope(definition, harness)?;
+    let orch_bin = orch_binary_for_envelope(root)?;
+    Ok(BTreeMap::from([
+        ("ORCH_HARNESS_ID".to_string(), harness.as_str().to_string()),
+        (
+            "ORCH_HARNESS_ACTION_ID".to_string(),
+            context.action_id.clone(),
+        ),
+        ("ORCH_HARNESS_WAKE_ID".to_string(), context.wake_id.clone()),
+        ("ORCH_HARNESS_ROUND".to_string(), context.round.clone()),
+        ("ORCH_HARNESS_TASK_ID".to_string(), context.task_id.clone()),
+        (
+            "ORCH_HARNESS_ATTEMPT_ID".to_string(),
+            context.attempt_id.clone(),
+        ),
+        ("ORCH_HARNESS_ROLE".to_string(), context.role.clone()),
+        (
+            "ORCH_HARNESS_CWD".to_string(),
+            context.cwd.display().to_string(),
+        ),
+        (
+            "ORCH_HARNESS_FIXED_HEAD".to_string(),
+            context.fixed_head.clone(),
+        ),
+        ("ORCH_HARNESS_PROVIDER".to_string(), provider),
+        ("ORCH_HARNESS_MODEL".to_string(), model),
+        ("ORCH_HARNESS_EFFORT".to_string(), effort),
+        (
+            "ORCH_HARNESS_PROVIDER_BIN".to_string(),
+            provider_bin.display().to_string(),
+        ),
+        (
+            "ORCH_HARNESS_REVIEW_OUTPUT_PATH".to_string(),
+            context.review_output_path.clone(),
+        ),
+        (
+            "ORCH_HARNESS_ORCH_BIN".to_string(),
+            orch_bin.display().to_string(),
+        ),
+        (
+            "ORCH_HARNESS_DEADLINE_SECS".to_string(),
+            context.deadline_secs.to_string(),
+        ),
+    ]))
+}
+
+fn resolve_managed_program(program: &str, argv: &[String]) -> Result<PathBuf> {
     let requested = Path::new(program);
     let resolved = if requested.is_absolute() {
         requested.to_path_buf()
@@ -12319,11 +14108,23 @@ fn resolve_managed_program(program: &str) -> Result<PathBuf> {
     if !metadata.file_type().is_file() || metadata.mode() & 0o111 == 0 {
         bail!("managed provider must resolve to a regular executable");
     }
-    if !matches!(
+    let direct_provider = matches!(
         canonical.file_name().and_then(|name| name.to_str()),
-        Some("codex" | "opencode")
-    ) {
-        bail!("managed provider basename must be codex or opencode");
+        Some("codex" | "opencode" | "agy")
+    );
+    // D-25 (r78 planner direct fix): same topology-vs-receipt confusion as the
+    // supervisor spec validator above.  The question here is whether the resolved
+    // binary is the shell of a wrapper the runtime owns, which is decided by the
+    // stream-harness topology and never by the backend receipt grammar.
+    let managed_wrapper = managed_stream_harness(argv).is_some()
+        && matches!(
+            canonical.file_name().and_then(|name| name.to_str()),
+            Some("sh" | "bash")
+        );
+    if !direct_provider && !managed_wrapper {
+        bail!(
+            "managed provider must be codex/opencode/agy or the shell of a wrapper registered in the managed stream harness topology"
+        );
     }
     Ok(canonical)
 }
@@ -13292,29 +15093,8 @@ fn b177_maybe_forge_parent_ack_bytes(phase: B177ForgedAckPhase, bytes: Vec<u8>) 
     serde_json::to_vec(&value).context("serialize forged test ACK")
 }
 
-fn spawn_managed_wake_supervisor(
-    root: &Path,
-    agent: &str,
-    argv: &[String],
-    log_path: &Path,
-    wake_id: &str,
-    runtime_limit: ManagedWakeRuntimeLimit,
-    env: &BTreeMap<String, String>,
-) -> Result<u32> {
-    spawn_managed_wake_supervisor_with_binding(
-        root,
-        agent,
-        argv,
-        log_path,
-        wake_id,
-        runtime_limit,
-        env,
-        None,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
-fn spawn_managed_wake_supervisor_with_binding(
+fn spawn_managed_wake_supervisor(
     root: &Path,
     agent: &str,
     argv: &[String],
@@ -13324,12 +15104,22 @@ fn spawn_managed_wake_supervisor_with_binding(
     env: &BTreeMap<String, String>,
     attach_binding: Option<ManagedWakeAttachDescriptorBinding<'_>>,
 ) -> Result<u32> {
+    let envelope_map = env
+        .iter()
+        .filter(|(key, _)| crate::harness::ENVELOPE_KEYS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if !envelope_map.is_empty() {
+        // Complete-or-refuse validation is deliberately before Command::spawn:
+        // once the supervisor exists it may immediately start the provider.
+        crate::harness::InvocationEnvelope::from_map(envelope_map)?;
+    }
     let lifecycle = wake_owner_lifecycle_plan(WakeOwnerKind::ManagedSupervisor);
     if lifecycle.handoff != WakeOwnerHandoff::AfterSupervisorAck {
         bail!("managed wake supervisor lifecycle requires post-ack handoff");
     }
     let (program, rest) = argv.split_first().context("wake.argv 不能为空")?;
-    let program = resolve_managed_program(program)?;
+    let program = resolve_managed_program(program, argv)?;
     if !is_strict_uuid(wake_id) {
         bail!("managed wake supervisor requires a strict parent-generated wakeId");
     }
@@ -13537,6 +15327,29 @@ fn spawn_managed_wake_supervisor_with_binding(
     bail!("wake supervisor ack timed out after 5s")
 }
 
+#[allow(clippy::too_many_arguments)]
+fn spawn_managed_wake_supervisor_with_binding(
+    root: &Path,
+    agent: &str,
+    argv: &[String],
+    log_path: &Path,
+    wake_id: &str,
+    runtime_limit: ManagedWakeRuntimeLimit,
+    env: &BTreeMap<String, String>,
+    attach_binding: Option<ManagedWakeAttachDescriptorBinding<'_>>,
+) -> Result<u32> {
+    spawn_managed_wake_supervisor(
+        root,
+        agent,
+        argv,
+        log_path,
+        wake_id,
+        runtime_limit,
+        env,
+        attach_binding,
+    )
+}
+
 fn spawn_registered_wake(
     root: &Path,
     round: &str,
@@ -13544,6 +15357,9 @@ fn spawn_registered_wake(
     message: &str,
     managed_wake_id: Option<&str>,
     review_deadline_secs: Option<u64>,
+    continuation: Option<&ContinuationIdentity>,
+    provisioned: Option<&ProvisionedReviewSite>,
+    review_output_path: Option<&str>,
 ) -> Result<RegisteredWakeLaunch> {
     let definitions = crate::registry::load_agent_definitions(root)?;
     let definition = definitions
@@ -13561,23 +15377,44 @@ fn spawn_registered_wake(
         bail!("agent {agent} 不支持注入唤醒；请走 POKE 备用信道");
     }
     let resolved = reconcile_session_overlay(root, round, agent, session.configured)?;
-    let rendered = render_registered_invocation(root, agent, message, resolved.effective)?;
+    let mut rendered = render_registered_invocation(root, agent, message, resolved.effective)?;
     let argv = rendered.argv.clone();
     let provider_kind = backend_receipt_kind_from_argv(&argv).ok();
-    let plain_text_review_channel = is_exact_agy_provider_argv(&argv);
-    let action_wake_id = provider_kind.map(|_| {
-        managed_wake_id
-            .map(str::to_string)
-            .unwrap_or_else(fresh_managed_wake_id)
-    });
+    let envelope_harness = invocation_envelope_harness(&argv);
+    let descriptor_exists = root
+        .join(crate::harness::HARNESS_REGISTRY_RELPATH)
+        .try_exists()
+        .context("check HarnessRegistry before terminal capability binding failed")?;
+    let harness_descriptor = if descriptor_exists {
+        let harness_registry = crate::harness::load_harness_registry(root)?;
+        Some(
+            harness_registry
+                .get(agent)
+                .with_context(|| format!("HarnessRegistry missing descriptor for {agent}"))?
+                .clone(),
+        )
+    } else {
+        None
+    };
+    let plain_text_review_channel = is_exact_agy_provider_argv(&argv)
+        || (!descriptor_exists && is_agy_program(&argv));
+    let action_wake_id =
+        (provider_kind.is_some() || envelope_harness.is_some() || harness_descriptor.is_some())
+            .then(|| {
+                managed_wake_id
+                    .map(str::to_string)
+                    .unwrap_or_else(fresh_managed_wake_id)
+            });
     // Registry test adapters may intentionally use small local commands such as
     // `echo`. The public classifier remains fail-closed, while the generic wake
     // harness preserves its legacy ability to spawn such adapters. Only a
     // positively identified direct CLI receives managed-process-group semantics.
     let identity_kind = durable_identity_kind(&argv).ok();
-    let runtime_limit = (identity_kind == Some(DurableIdentityKind::ManagedPidGroup))
+    let runtime_limit = identity_kind
+        .is_some_and(DurableIdentityKind::is_managed_pid_group)
         .then(|| managed_wake_runtime_limit(review_deadline_secs));
-    let control_wake_id = if identity_kind == Some(DurableIdentityKind::ManagedPidGroup) {
+    let envelope_deadline_secs = managed_wake_runtime_limit(review_deadline_secs).effective_secs;
+    let control_wake_id = if identity_kind.is_some_and(DurableIdentityKind::is_managed_pid_group) {
         let wake_id = action_wake_id
             .clone()
             .context("managed provider action wake identity missing")?;
@@ -13596,6 +15433,33 @@ fn spawn_registered_wake(
                 .expect("SmartClaw provider has an action wake id")
         )
     });
+    if let (Some(harness), true) = (envelope_harness, descriptor_exists) {
+        if harness_descriptor
+            .as_ref()
+            .is_some_and(|descriptor| descriptor.harness != harness)
+        {
+            bail!("resolved wrapper harness differs from its registered descriptor");
+        }
+        let envelope_wake_id = action_wake_id
+            .as_deref()
+            .context("managed wrapper invocation lacks an action wake identity")?;
+        let context = harness_invocation_context(
+            root,
+            round,
+            envelope_wake_id,
+            continuation,
+            provisioned,
+            review_output_path,
+            envelope_deadline_secs,
+        )?;
+        let envelope =
+            invocation_envelope_map(root, agent, definition, &rendered, harness, &context)?;
+        // Validate before either direct Command::spawn or supervisor spawn and
+        // use RenderedInvocation.env as the sole runtime-to-wrapper exit.
+        crate::harness::InvocationEnvelope::from_map(envelope.clone())?;
+        rendered.env.extend(envelope);
+    }
+    let harness_registry_digest = harness_registry_digest_for_wake(root)?;
     let (program, args) = argv.split_first().context("wake.argv 不能为空")?;
 
     let log_dir = root.join("coordination/runtime/logs");
@@ -13635,19 +15499,56 @@ fn spawn_registered_wake(
     // 后台 spawn 不等待（r19 实弹实测:注入 turn=对方完整工作 turn,可达十几分钟——
     // 同步等待会把 dispatch 阻塞成执行者时长;成败凭日志与后续收取链判定）。
     let pid = with_tool_startup_gate(root, definition, || {
-        if identity_kind == Some(DurableIdentityKind::ManagedPidGroup) {
+        if identity_kind.is_some_and(DurableIdentityKind::is_managed_pid_group) {
             drop(stdout);
             drop(stderr);
+            let control_id = control_wake_id
+                .as_deref()
+                .context("managed wake control identity missing")?;
+            let managed_limit = runtime_limit.context("managed wake runtime limit missing")?;
+            if is_exact_agy_provider_argv(&argv) {
+                return with_agy_managed_preflight(
+                    &argv,
+                    &rendered.env,
+                    root,
+                    &log_path,
+                    control_id,
+                    message,
+                    rendered
+                        .requested_provider
+                        .as_deref()
+                        .context("Agy signed provider pin missing")?,
+                    rendered
+                        .requested_model
+                        .as_deref()
+                        .context("Agy signed model pin missing")?,
+                    rendered
+                        .requested_effort
+                        .as_deref()
+                        .context("Agy signed effort pin missing")?,
+                    || {
+                        spawn_managed_wake_supervisor(
+                            root,
+                            agent,
+                            &argv,
+                            &log_path,
+                            control_id,
+                            managed_limit,
+                            &rendered.env,
+                            None,
+                        )
+                    },
+                );
+            }
             Ok(spawn_managed_wake_supervisor(
                 root,
                 agent,
                 &argv,
                 &log_path,
-                control_wake_id
-                    .as_deref()
-                    .context("managed wake control identity missing")?,
-                runtime_limit.context("managed wake runtime limit missing")?,
+                control_id,
+                managed_limit,
                 &rendered.env,
+                None,
             )?)
         } else {
             let proxy_lifecycle = (identity_kind == Some(DurableIdentityKind::WakeLogProxy))
@@ -13708,15 +15609,24 @@ fn spawn_registered_wake(
         action_wake_id,
         wake_id: control_wake_id,
         provider_kind,
+        harness_id: harness_descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.harness),
+        terminal_capability: harness_descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.terminal),
         plain_text_review_channel,
         request_session_id,
         runtime_limit,
         legacy_offset,
         legacy_probe,
         tool: rendered.tool,
+        requested_provider: rendered.requested_provider,
         requested_model: rendered.requested_model,
         requested_effort: rendered.requested_effort,
         quota_domain: Some(definition.profile.quota_domain.clone()),
+        harness_registry_digest,
+        review_output_path: review_output_path.map(str::to_string),
     })
 }
 
@@ -14384,21 +16294,44 @@ struct PreparedReviewProbe {
     expectation: crate::verify::ReviewContractExpectation,
 }
 
-/// Render the runtime-owned seven-field review identity. Planner prose may
-/// precede this block, but can never replace any of these fixed values.
+/// Render the runtime-owned review identity: seven base fields for legacy
+/// delivery plus four mandatory seat fields for a panel-routed artifact.
+/// Planner prose may precede this block but can never replace a fixed value.
 pub fn render_review_frontmatter_template(
     expected: &crate::verify::ReviewContractExpectation,
 ) -> Result<String> {
     // Reconstructing through `exact` keeps this public renderer fail-closed if
     // a future internal caller ever bypasses the expectation constructor.
-    crate::verify::ReviewContractExpectation::exact(
-        expected.task_id(),
-        expected.round(),
-        expected.attempt_id(),
-        expected.role(),
-        expected.reviewer(),
-        expected.reviewed_head(),
-    )?;
+    let panel = expected.panel_identity();
+    if let Some(panel) = panel {
+        crate::verify::ReviewContractExpectation::panel_exact(
+            expected.task_id(),
+            expected.round(),
+            expected.attempt_id(),
+            expected.role(),
+            expected.reviewer(),
+            expected.reviewed_head(),
+            &panel.seat_id,
+            panel.generation,
+            &panel.wake_id,
+            &panel.policy_base_sha,
+        )?;
+    } else {
+        crate::verify::ReviewContractExpectation::exact(
+            expected.task_id(),
+            expected.round(),
+            expected.attempt_id(),
+            expected.role(),
+            expected.reviewer(),
+            expected.reviewed_head(),
+        )?;
+    }
+    let panel_lines = panel.map_or_else(String::new, |panel| {
+        format!(
+            "seatId: {}\ngeneration: {}\nwakeId: {}\npolicyBaseSha: {}\n",
+            panel.seat_id, panel.generation, panel.wake_id, panel.policy_base_sha
+        )
+    });
     Ok(format!(
         "---\n\
          taskId: {}\n\
@@ -14408,13 +16341,14 @@ pub fn render_review_frontmatter_template(
          reviewer: {}\n\
          verdict: __VERDICT__\n\
          reviewedHead: {}\n\
-         ---\n",
+         {}---\n",
         expected.task_id(),
         expected.round(),
         expected.attempt_id(),
         expected.role(),
         expected.reviewer(),
         expected.reviewed_head(),
+        panel_lines,
     ))
 }
 
@@ -14427,6 +16361,9 @@ pub const REVIEW_SCRATCH_POLICY: &str = concat!(
     "inverse edit, then prove restoration with git diff --exit-code."
 );
 
+/// Build the neutral, runtime-owned review-site handoff around planner prose.
+/// Callers append the exact frontmatter template separately; this text makes
+/// the seven base fields and panel-only four-field extension non-substitutable.
 #[allow(clippy::too_many_arguments)]
 pub fn review_probe_message_body(
     worktree: &str,
@@ -14447,12 +16384,13 @@ pub fn review_probe_message_body(
          ORCH_REVIEW_SITE_WORKTREE_GIT={worktree}/.git\n\
          ORCH_REVIEW_SITE_SENTINEL={sentinel_path}\n\
          REVIEW OUTPUT CONTRACT: write the review only to the absolute REVIEW_OUTPUT_PATH \
-         appended by the runtime below. It is a gitignored review inbox path under the main \
-         repository. \
-         Do not write it into your worktree and do not commit it in the worktree.\n\
-         REVIEW FRONTMATTER requires all seven fields: taskId / round / attemptId / role / \
-         reviewer / verdict / reviewedHead. Extra fields are ignored but reported loudly; they \
-         never replace a required field. In particular, verifier: cannot replace reviewer:.\n\
+         appended by the runtime below. The runtime chooses either a legacy inbox or a \
+         lease-scoped spool inside this review worktree. Do not relocate or commit it.\n\
+         REVIEW FRONTMATTER requires every field in the runtime template: taskId / round / \
+         attemptId / role / reviewer / verdict / reviewedHead, plus seatId / generation / wakeId / \
+         policyBaseSha for a panel route. Extra fields are ignored but reported loudly; fields \
+         outside that selected contract never replace a required field. In particular, verifier: cannot \
+         replace reviewer:.\n\
          Reachability evidence: before reviewing, read both ORCH_REVIEW_SITE_WORKTREE_GIT and \
          ORCH_REVIEW_SITE_SENTINEL. The provider harness records the tool output; no \
          acknowledgement, nonce echo, or self-attestation is requested. If either read fails, \
@@ -14498,24 +16436,68 @@ fn prepare_review_probe_message(
     if expectation.round() != round {
         bail!("review prompt expectation round 漂移");
     }
-    let output_rel = review_inbox_relpath(
-        round,
-        expectation.attempt_id(),
-        expectation.role(),
-        expectation.reviewer(),
-    )?;
-    ensure_review_inbox_parent(root, &output_rel)?;
-    let output_path = root.join(output_rel);
+    let (output_path, destination_note) = if let Some(panel) = expectation.panel_identity() {
+        let worktree = PathBuf::from(&provisioned.site.worktree);
+        if !worktree.starts_with(root) {
+            bail!("panel review worktree escaped repository root");
+        }
+        let spool = worktree.join(".cowork-temp/review-spool");
+        let mut cursor = worktree.clone();
+        for component in [".cowork-temp", "review-spool"] {
+            cursor.push(component);
+            match fs::symlink_metadata(&cursor) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    bail!("panel review spool parent 必须是 real directory")
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    fs::create_dir(&cursor).with_context(|| {
+                        format!("create panel review spool parent failed: {}", cursor.display())
+                    })?;
+                }
+                Err(error) => return Err(error).context("stat panel review spool parent failed"),
+            }
+        }
+        let name = format!(
+            "{}-{}-g{}-{}.md",
+            expectation.attempt_id(),
+            panel.seat_id,
+            panel.generation,
+            panel.wake_id,
+        );
+        (
+            spool.join(name),
+            "This is the lease-scoped panel spool inside the review worktree; do not write the main repository directly.",
+        )
+    } else {
+        let output_rel = review_inbox_relpath(
+            round,
+            expectation.attempt_id(),
+            expectation.role(),
+            expectation.reviewer(),
+        )?;
+        ensure_review_inbox_parent(root, &output_rel)?;
+        (
+            root.join(output_rel),
+            "This is the legacy main-repository review inbox path.",
+        )
+    };
     let output_path_text = output_path.display().to_string();
     let template = render_review_frontmatter_template(expectation)?;
+    let panel_final_check = if expectation.panel_identity().is_some() {
+        "PANEL FINAL CHECK: before exiting, read REVIEW_OUTPUT_PATH back and prove the header contains all eleven required fields: taskId, round, attemptId, role, reviewer, verdict, reviewedHead, seatId, generation, wakeId, policyBaseSha. A legacy seven-field header is invalid and cannot be repaired after terminal; never write or copy the legacy main-inbox artifact.\n"
+    } else {
+        ""
+    };
     text.push_str(&format!(
         "REVIEW_OUTPUT_PATH={}\n\
          The line above and the runtime block below are authoritative and were appended after all \
-         custom planner prose. Write only that main-repository path; do not commit it in the review \
-         worktree. Replace only __VERDICT__ with PASS, FAIL, or BLOCKED.\n\
+         custom planner prose. {destination_note} Write only that exact path and do not commit it in the worktree. \
+         Replace only __VERDICT__ with PASS, FAIL, or BLOCKED.\n\
+         {panel_final_check}\
          ```yaml\n{template}```\n\
          In the final response, emit the exact REVIEW_OUTPUT_PATH line and a closed yaml fence with \
-         the same seven final fields so plain-text review channels can prove exact consumption.\n",
+         every final field shown above so plain-text review channels can prove exact consumption.\n",
         output_path_text
     ));
     let enriched = ResolvedMessage {
@@ -14801,6 +16783,20 @@ pub fn review_probe_timeout() -> Duration {
     }
 }
 
+fn plain_text_review_consumption_timeout(request: &ReviewRequest) -> Duration {
+    #[cfg(test)]
+    {
+        let _ = request;
+        review_probe_timeout()
+    }
+    #[cfg(not(test))]
+    {
+        Duration::from_secs(
+            managed_wake_runtime_limit(Some(request.deadline_secs)).effective_secs,
+        )
+    }
+}
+
 /// Contract probe used by the immutable seeded test. Production-path tests in
 /// this module additionally prove the ordering through observable ledger state.
 pub const fn review_append_precedes_probe() -> bool {
@@ -14819,6 +16815,14 @@ pub struct ReviewRequest {
     pub role: String,
     pub agent: String,
     pub deadline_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewFallbackContext {
+    from_agent: String,
+    source_wake_id: String,
+    terminal_event_id: String,
+    reviewed_head: String,
 }
 
 #[derive(Debug, Clone)]
@@ -14898,7 +16902,10 @@ fn is_full_review_head(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn immutable_collect_head_before(
+/// Recover the one immutable collect head for an exact attempt before `end`.
+/// Conflicting or missing `ReportCollectCompleted.branchSha` facts are rejected
+/// so live selection and historical replay bind the same candidate.
+pub(crate) fn immutable_collect_head_before(
     events: &[orch_core::EventRecord],
     end: usize,
     round: &str,
@@ -14925,7 +16932,7 @@ fn immutable_collect_head_before(
     }
     recovered.with_context(|| {
         format!(
-            "legacy ReviewRequested 缺可恢复的 immutable collect fact: task={task_id} attempt={attempt_id}"
+            "review authority 缺可恢复的 immutable collect fact: task={task_id} attempt={attempt_id}"
         )
     })
 }
@@ -14993,6 +17000,8 @@ fn new_review_expectation(
     round: &str,
     events: &[orch_core::EventRecord],
     request: &ReviewRequest,
+    fallback: Option<&ReviewFallbackContext>,
+    panel_authorization: Option<&PanelRouteAuthorizationV1>,
 ) -> Result<crate::verify::ReviewContractExpectation> {
     let active = crate::plan::require_active_round_ir(root, round, events)?;
     let task = active
@@ -15002,11 +17011,32 @@ fn new_review_expectation(
         .find(|task| task.id == request.task_id)
         .with_context(|| format!("review task {} 不在 signed ROUND-IR", request.task_id))?;
     let role = crate::sites::SiteRole::parse(&request.role).map_err(anyhow::Error::msg)?;
-    if role.satisfies_formal_review_slot()
-        && !task
-            .required_reviews
+    let signed_formal = task.required_reviews.iter().any(|required| {
+        required.role == request.role
+            && (required.agent == request.agent
+                || fallback.is_some_and(|context| {
+                    required.agent == context.from_agent
+                        && signed_review_fallback(task, &request.role)
+                            == Some(request.agent.as_str())
+                }))
+    });
+    let signed_nongate = task.review_quorum.is_none()
+        || task
+            .nongate_seats
             .iter()
-            .any(|required| required.role == request.role && required.agent == request.agent)
+            .any(|seat| seat.agent == request.agent);
+    let signed_panel = panel_authorization.is_some_and(|authorization| {
+        authorization.task_id == request.task_id
+            && authorization.route.attempt_id == request.attempt_id
+            && authorization.route.role == request.role
+            && authorization.route.agent == request.agent
+    });
+    if panel_authorization.is_some() && !signed_panel {
+        bail!("panel route lexical authorization 与 ReviewRequest tuple 漂移");
+    }
+    if !signed_panel
+        && ((role.satisfies_formal_review_slot() && !signed_formal)
+            || (role == crate::sites::SiteRole::Nongate && !signed_nongate))
     {
         bail!(
             "review identity 未获 signed ROUND-IR 授权: task={} role={} reviewer={}",
@@ -15031,14 +17061,263 @@ fn new_review_expectation(
         &request.task_id,
         &request.attempt_id,
     )?;
-    crate::verify::ReviewContractExpectation::exact(
-        &request.task_id,
+    if fallback.is_some_and(|context| context.reviewed_head != head) {
+        bail!("fallback reviewedHead 与 immutable collect head 不匹配");
+    }
+    if let Some(authorization) = panel_authorization {
+        if authorization.route.reviewed_head != head {
+            bail!("panel route reviewedHead 与 immutable collect head 不匹配");
+        }
+        let resolved = crate::plan::resolve_attempt_runtime_policy(
+            root,
+            round,
+            events,
+            &request.task_id,
+            &request.attempt_id,
+            "review-pool-v1",
+        )?;
+        if resolved.state != crate::plan::RuntimePolicyStateV1::Active
+            || resolved.policy_base_sha != authorization.route.policy_base_sha
+        {
+            bail!("panel route policy-as-of 未激活或 base 漂移");
+        }
+    }
+    if let Some(authorization) = panel_authorization {
+        crate::verify::ReviewContractExpectation::panel_exact(
+            &request.task_id,
+            round,
+            &request.attempt_id,
+            &request.role,
+            &request.agent,
+            head,
+            authorization.route.seat_id.clone(),
+            authorization.route.generation,
+            authorization.route.wake_id.clone(),
+            authorization.route.policy_base_sha.clone(),
+        )
+    } else {
+        crate::verify::ReviewContractExpectation::exact(
+            &request.task_id,
+            round,
+            &request.attempt_id,
+            &request.role,
+            &request.agent,
+            head,
+        )
+    }
+}
+
+fn signed_review_fallback<'a>(task: &'a crate::plan::IrTask, role: &str) -> Option<&'a str> {
+    task.review_fallbacks
+        .iter()
+        .find(|fallback| fallback.role == role)
+        .map(|fallback| fallback.fallback_agent.as_str())
+}
+
+fn fallback_artifact_absent(
+    root: &Path,
+    round: &str,
+    expectation: &crate::verify::ReviewContractExpectation,
+) -> Result<()> {
+    let canonical_rel = expectation.artifact_relpath();
+    let inbox_rel = review_inbox_relpath(
         round,
-        &request.attempt_id,
-        &request.role,
-        &request.agent,
-        head,
-    )
+        expectation.attempt_id(),
+        expectation.role(),
+        expectation.reviewer(),
+    )?;
+    for (rel, label) in [
+        (canonical_rel, "verdict-bound canonical review"),
+        (inbox_rel, "staged review inbox artifact"),
+    ] {
+        let Some(bytes) =
+            crate::verify::optional_review_artifact_bytes(root, &root.join(&rel), label)?
+        else {
+            continue;
+        };
+        let checked = crate::verify::check_review_artifact_contract(&bytes, expectation)
+            .with_context(|| format!("fallback artifact-first check failed: {rel}"))?;
+        let Some(checked) = checked else {
+            bail!("fallback source artifact is partial and must be reconciled manually: {rel}");
+        };
+        if checked.substantive_body_len() == 0 {
+            bail!("fallback source artifact has no substantive body: {rel}");
+        }
+        bail!("fallback forbidden while a valid source artifact awaits reconciliation: {rel}");
+    }
+    Ok(())
+}
+
+fn validate_review_fallback_transition(
+    root: &Path,
+    events: &[orch_core::EventRecord],
+    round: &str,
+    request: &ReviewRequest,
+    fallback: &ReviewFallbackContext,
+) -> Result<Option<String>> {
+    let active = crate::plan::require_active_round_ir(root, round, events)?;
+    let task = active
+        .candidate
+        .tasks
+        .iter()
+        .find(|task| task.id == request.task_id)
+        .with_context(|| format!("fallback task {} 不在 signed ROUND-IR", request.task_id))?;
+    let signed = task
+        .required_reviews
+        .iter()
+        .filter(|required| {
+            required.role == request.role
+                && required.agent == fallback.from_agent
+                && signed_review_fallback(task, &request.role) == Some(request.agent.as_str())
+        })
+        .collect::<Vec<_>>();
+    if signed.len() != 1 || request.agent == fallback.from_agent {
+        bail!("fallback from/to/role 未精确匹配唯一 signed fallbackAgent");
+    }
+    let current = crate::attempt::current_attempt(events, &request.task_id)?
+        .context("fallback task 缺 current attempt")?;
+    if current.attempt_id != request.attempt_id {
+        bail!("fallback attempt 不是 current canonical attempt");
+    }
+
+    let source_requests = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event.kind == "ReviewRequested"
+                && event.actor == "runtime:orch"
+                && event.round.as_deref() == Some(round)
+                && event.task_id.as_deref() == Some(request.task_id.as_str())
+                && payload_string(event, "attemptId") == Some(request.attempt_id.as_str())
+                && payload_string(event, "role") == Some(request.role.as_str())
+                && payload_string(event, "agent") == Some(fallback.from_agent.as_str())
+                && payload_string(event, "wakeId") == Some(fallback.source_wake_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let [(source_position, source_request)] = source_requests.as_slice() else {
+        bail!("fallback source 必须有唯一 runtime ReviewRequested 与 wake binding");
+    };
+    let source_expectation = review_expectation_from_request_event(events, round, source_request)?;
+    if source_expectation.reviewed_head() != fallback.reviewed_head {
+        bail!("fallback source reviewedHead 与 signed transition 不一致");
+    }
+    fallback_artifact_absent(root, round, &source_expectation)?;
+    if events.iter().any(|event| {
+        event.kind == "ReviewDelivered"
+            && event.round.as_deref() == Some(round)
+            && event.task_id.as_deref() == Some(request.task_id.as_str())
+            && payload_string(event, "attemptId") == Some(request.attempt_id.as_str())
+            && payload_string(event, "role") == Some(request.role.as_str())
+            && payload_string(event, "agent") == Some(fallback.from_agent.as_str())
+            && event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("bodyLen"))
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|len| len > 0)
+    }) {
+        bail!("fallback source 已有 substantive ReviewDelivered");
+    }
+
+    let terminals = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.event_id == fallback.terminal_event_id)
+        .collect::<Vec<_>>();
+    let [(terminal_position, terminal)] = terminals.as_slice() else {
+        bail!("fallback terminalEventId 必须唯一存在");
+    };
+    let terminal_payload = terminal
+        .payload
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .context("fallback ManagedWakeTerminated payload 缺失")?;
+    let outcome = terminal_payload
+        .get("outcomeClass")
+        .and_then(serde_json::Value::as_str)
+        .context("fallback terminal outcomeClass 缺失")?;
+    if terminal.kind != "ManagedWakeTerminated"
+        || terminal.actor != "runtime:orch"
+        || terminal.round.as_deref() != Some(round)
+        || terminal.task_id.as_deref() != Some(request.task_id.as_str())
+        || *terminal_position <= *source_position
+        || payload_string(terminal, "wakeId") != Some(fallback.source_wake_id.as_str())
+        || payload_string(terminal, "agent") != Some(fallback.from_agent.as_str())
+        || terminal_payload
+            .get("managedScopeTerminated")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || matches!(outcome, "OperationalError" | "StoppedByAuthenticatedCancel")
+    {
+        bail!("fallback source terminal fact 未证明可替换的 managed scope");
+    }
+    if events[*source_position + 1..].iter().any(|event| {
+        (event.kind == "VerdictIssued"
+            && event.task_id.as_deref() == Some(request.task_id.as_str()))
+            || crate::attempt::event_terminates_attempt(event, &request.attempt_id)
+    }) {
+        bail!("fallback source 之后已有 root verdict 或 attempt terminal");
+    }
+
+    let selections = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event.kind == "ReviewFallbackSelected"
+                && event.round.as_deref() == Some(round)
+                && event.task_id.as_deref() == Some(request.task_id.as_str())
+                && payload_string(event, "attemptId") == Some(request.attempt_id.as_str())
+                && payload_string(event, "role") == Some(request.role.as_str())
+        })
+        .collect::<Vec<_>>();
+    if selections.len() > 1 {
+        bail!("fallback selection 重复，拒绝第三个 reviewer wake");
+    }
+    let Some((selection_position, selection)) = selections.first().copied() else {
+        return Ok(None);
+    };
+    let target_wake_id = payload_string(selection, "targetWakeId")
+        .filter(|value| !value.is_empty())
+        .context("ReviewFallbackSelected 缺 targetWakeId")?;
+    if selection.actor != "runtime:orch"
+        || payload_string(selection, "fromAgent") != Some(fallback.from_agent.as_str())
+        || payload_string(selection, "toAgent") != Some(request.agent.as_str())
+        || payload_string(selection, "reviewedHead") != Some(fallback.reviewed_head.as_str())
+        || payload_string(selection, "sourceWakeId") != Some(fallback.source_wake_id.as_str())
+        || payload_string(selection, "terminalEventId") != Some(fallback.terminal_event_id.as_str())
+    {
+        bail!("existing ReviewFallbackSelected 与 signed exact tuple 漂移");
+    }
+    let target_wakes = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event.kind == "WakeIssued"
+                && payload_string(event, "wakeId") == Some(target_wake_id)
+                && payload_string(event, "agent") == Some(request.agent.as_str())
+        })
+        .collect::<Vec<_>>();
+    let target_requests = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event.kind == "ReviewRequested"
+                && event.task_id.as_deref() == Some(request.task_id.as_str())
+                && payload_string(event, "attemptId") == Some(request.attempt_id.as_str())
+                && payload_string(event, "role") == Some(request.role.as_str())
+                && payload_string(event, "agent") == Some(request.agent.as_str())
+                && payload_string(event, "wakeId") == Some(target_wake_id)
+        })
+        .collect::<Vec<_>>();
+    let ([(wake_position, _)], [(request_position, _)]) =
+        (target_wakes.as_slice(), target_requests.as_slice())
+    else {
+        bail!("ReviewFallbackSelected 缺唯一 target WakeIssued/ReviewRequested");
+    };
+    if selection_position >= *wake_position || *wake_position >= *request_position {
+        bail!("fallback durable facts 顺序不是 selected → wake → requested");
+    }
+    Ok(Some(target_wake_id.to_string()))
 }
 
 fn review_key_from_event(
@@ -15557,6 +17836,34 @@ fn install_review_no_clobber(root: &Path, rel: &str, bytes: &[u8]) -> Result<()>
         bail!("review no-clobber conflict at {rel}");
     }
     Ok(())
+}
+
+/// Integration-test seam for the production no-clobber publisher.  It is
+/// restricted to an `orch/target/test-tmp` child and a canonical round review
+/// path, so it cannot mutate a production review or arbitrary repository file.
+#[doc(hidden)]
+pub fn install_review_no_clobber_for_test(
+    root: &Path,
+    rel: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .context("orch-host manifest layout missing workspace root")?
+        .join("target/test-tmp");
+    let canonical_root = fs::canonicalize(root)?;
+    let canonical_scratch = fs::canonicalize(&scratch)?;
+    if canonical_root == canonical_scratch || !canonical_root.starts_with(&canonical_scratch) {
+        bail!("review no-clobber test seam only accepts a test-tmp child root");
+    }
+    if !rel.starts_with("coordination/rounds/")
+        || !rel.contains("/reviews/")
+        || !rel.ends_with(".md")
+    {
+        bail!("review no-clobber test seam path is not canonical");
+    }
+    install_review_no_clobber(&canonical_root, rel, bytes)
 }
 
 #[derive(Debug, Clone)]
@@ -16323,6 +18630,3519 @@ fn reconcile_review_delivery_slots(root: &Path, round: &str) -> Result<()> {
     Ok(())
 }
 
+fn reconcile_nongate_review_delivery_slots_filtered(
+    root: &Path,
+    round: &str,
+    task_filter: Option<(&str, &str)>,
+) -> Result<usize> {
+    let appended = ledger::append_checked(root, round, |events| {
+        let active = crate::plan::require_active_round_ir(root, round, events)?;
+        let mut deliveries = Vec::new();
+        for task in active
+            .candidate
+            .tasks
+            .iter()
+            .filter(|task| task.review_quorum.is_some())
+        {
+            let Some(current) = crate::attempt::current_attempt(events, &task.id)? else {
+                continue;
+            };
+            if task_filter.is_some_and(|(wanted_task, wanted_attempt)| {
+                task.id != wanted_task || current.attempt_id != wanted_attempt
+            }) {
+                continue;
+            }
+            if events.iter().any(|event| {
+                (event.kind == "VerdictIssued"
+                    && event.task_id.as_deref() == Some(task.id.as_str())
+                    && payload_string(event, "attemptId")
+                        == Some(current.attempt_id.as_str()))
+                    || crate::attempt::event_terminates_attempt(event, &current.attempt_id)
+            }) {
+                continue;
+            }
+            let fixed_head = immutable_collect_head_before(
+                events,
+                events.len(),
+                round,
+                &task.id,
+                &current.attempt_id,
+            )?;
+            for seat in &task.nongate_seats {
+                let existing = events
+                    .iter()
+                    .filter(|event| {
+                        event.kind == "NongateReviewDelivered"
+                            && event.actor == "runtime:orch"
+                            && event.round.as_deref() == Some(round)
+                            && event.task_id.as_deref() == Some(task.id.as_str())
+                            && payload_string(event, "attemptId")
+                                == Some(current.attempt_id.as_str())
+                            && payload_string(event, "agent") == Some(seat.agent.as_str())
+                    })
+                    .count();
+                if existing > 1 {
+                    bail!(
+                        "NongateReviewDelivered 重复: task={} agent={}",
+                        task.id,
+                        seat.agent
+                    );
+                }
+                if existing == 1 {
+                    continue;
+                }
+                let receipt = match crate::verify::validate_nongate_attempt_receipt_binding(
+                    root,
+                    &current.attempt_id,
+                    round,
+                    &task.id,
+                    &fixed_head,
+                    &seat.agent,
+                    events,
+                ) {
+                    Ok(receipt) => receipt,
+                    Err(error) if error.starts_with("receipt is absent or unreadable:") => continue,
+                    Err(error) => bail!(
+                        "signed nongate receipt invalid: task={} agent={}: {error}",
+                        task.id,
+                        seat.agent
+                    ),
+                };
+                if receipt.preset != seat.preset {
+                    bail!(
+                        "signed nongate preset mismatch: task={} agent={} signed={} observed={}",
+                        task.id,
+                        seat.agent,
+                        seat.preset,
+                        receipt.preset
+                    );
+                }
+                let expectation = crate::verify::ReviewContractExpectation::exact(
+                    &task.id,
+                    round,
+                    &current.attempt_id,
+                    "nongate",
+                    &seat.agent,
+                    &fixed_head,
+                )?;
+                let inbox_rel =
+                    review_inbox_relpath(round, &current.attempt_id, "nongate", &seat.agent)?;
+                let Some(bytes) = crate::verify::optional_review_artifact_bytes(
+                    root,
+                    &root.join(&inbox_rel),
+                    "staged review inbox artifact",
+                )?
+                else {
+                    continue;
+                };
+                let checked = crate::verify::check_review_artifact_contract(&bytes, &expectation)
+                    .with_context(|| format!("nongate staged review contract failed: {inbox_rel}"))?
+                    .with_context(|| {
+                        format!("nongate staged review frontmatter incomplete: {inbox_rel}")
+                    })?;
+                let body_len = checked.substantive_body_len();
+                if body_len == 0 {
+                    bail!("nongate staged review lacks substantive body: {inbox_rel}");
+                }
+                if checked.verdict() == "PASS" && receipt.state != "answered" {
+                    bail!(
+                        "positive nongate review requires receipt=answered: task={} agent={} state={}",
+                        task.id,
+                        seat.agent,
+                        receipt.state
+                    );
+                }
+                crate::verify::report_ignored_review_fields(&inbox_rel, checked.ignored_fields());
+                let canonical_rel = expectation.artifact_relpath();
+                install_review_no_clobber(root, &canonical_rel, &bytes)?;
+                let (sha256, byte_len) = review_bytes_binding(&bytes);
+                deliveries.push(ledger::event(
+                    "NongateReviewDelivered",
+                    "runtime:orch",
+                    Some(&task.id),
+                    Some(round),
+                    serde_json::json!({
+                        "attemptId": current.attempt_id,
+                        "role": "nongate",
+                        "agent": seat.agent,
+                        "reviewedHead": fixed_head,
+                        "path": canonical_rel,
+                        "sha256": sha256,
+                        "bytes": byte_len,
+                        "bodyLen": body_len as u64,
+                        "verdict": checked.verdict(),
+                        "receiptState": receipt.state,
+                        "wakeId": receipt.wake_id,
+                        "wakeIssuedEventId": receipt.wake_issued_event_id,
+                        "workspaceLeasedEventId": receipt.workspace_leased_event_id,
+                    }),
+                ));
+            }
+        }
+        Ok(deliveries)
+    })?;
+    if appended > 0 {
+        if let Err(error) = crate::sites::reap_released_sites(root, round) {
+            eprintln!("[orch] NongateReviewDelivered 触发 site GC 后保守留场: {error:#}");
+        }
+    }
+    Ok(appended)
+}
+
+fn reconcile_nongate_review_delivery_slots(root: &Path, round: &str) -> Result<usize> {
+    reconcile_nongate_review_delivery_slots_filtered(root, round, None)
+}
+
+/// Reconcile formal and signed nongate artifacts before any fallback or root
+/// quorum decision. Historical tasks with no new review policy are left on
+/// their existing strict delivery path.
+fn parse_panel_seat_spec(value: &str) -> Result<(String, String)> {
+    let (role, agent) = value
+        .split_once(':')
+        .with_context(|| format!("panel seat 必须为 <role>:<agent>: {value:?}"))?;
+    if !matches!(role, "primary" | "secondary" | "nongate")
+        || agent.is_empty()
+        || !agent
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("panel seat role/agent 非 canonical: {value:?}");
+    }
+    Ok((role.to_string(), agent.to_string()))
+}
+
+fn panel_route_view(payload: &ledger::ReviewSeatRoutedPayloadV1) -> ReviewPanelRouteV1 {
+    ReviewPanelRouteV1 {
+        panel_id: payload.panel_id.clone(),
+        seat_id: payload.seat_id.clone(),
+        generation: payload.generation,
+        wake_id: payload.wake_id.clone(),
+        role: payload.role.clone(),
+        agent: payload.agent.clone(),
+        reviewed_head: payload.reviewed_head.clone(),
+        policy_base_sha: payload.policy_base_sha.clone(),
+        deadline_secs: payload.deadline_secs,
+    }
+}
+
+fn selected_panel_for_attempt(
+    events: &[orch_core::EventRecord],
+    task_id: &str,
+    attempt_id: &str,
+) -> Result<Option<(orch_core::EventRecord, ledger::ReviewPanelSelectedPayloadV1)>> {
+    let matching = events
+        .iter()
+        .filter_map(|event| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::ReviewPanelSelected(payload))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            (event.task_id.as_deref() == Some(task_id) && payload.attempt_id == attempt_id)
+                .then_some((event.clone(), payload))
+        })
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [] => Ok(None),
+        [selected] => Ok(Some(selected.clone())),
+        _ => bail!("attempt 含重复 ReviewPanelSelected"),
+    }
+}
+
+fn panel_routes_for_selected(
+    events: &[orch_core::EventRecord],
+    selected: &ledger::ReviewPanelSelectedPayloadV1,
+) -> Result<Vec<(orch_core::EventRecord, ledger::ReviewSeatRoutedPayloadV1)>> {
+    let routes = events
+        .iter()
+        .filter_map(|event| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(payload))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            (payload.panel_id == selected.panel_id).then_some((event.clone(), payload))
+        })
+        .collect::<Vec<_>>();
+    if routes.iter().any(|(_, route)| {
+        route.attempt_id != selected.attempt_id
+            || route.reviewed_head != selected.reviewed_head
+            || route.policy_base_sha != selected.policy_base_sha
+    }) {
+        bail!("panel route immutable tuple 漂移");
+    }
+    Ok(routes)
+}
+
+fn validate_panel_route_capacity(
+    root: &Path,
+    round: &str,
+    events: &[orch_core::EventRecord],
+    routes: &[orch_core::EventRecord],
+) -> Result<()> {
+    let active = crate::plan::require_active_round_ir(root, round, events)?;
+    let mut simulated = events.to_vec();
+    for event in routes {
+        let Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route)) =
+            ledger::decode_runtime_event_v1(event)?
+        else {
+            bail!("panel capacity input 不是 ReviewSeatRouted");
+        };
+        let required_role = format!("{}-review", route.role);
+        crate::scheduler::scheduling_admits(
+            &simulated,
+            round,
+            &active.candidate.scheduling,
+            &route.agent,
+            &required_role,
+        )
+        .map_err(anyhow::Error::msg)?;
+        simulated.push(event.clone());
+    }
+    Ok(())
+}
+
+fn select_review_panel_locked_v1(
+    root: &Path,
+    task_id: &str,
+    attempt_id: &str,
+    seat_specs: &[String],
+) -> Result<ReviewPanelRouteOutcomeV1> {
+    validate_review_reconcile_attempt(task_id, attempt_id)?;
+    if seat_specs.len() != 3 {
+        bail!("review panel select 必须恰好提供三次 --seat");
+    }
+    let seats = seat_specs
+        .iter()
+        .map(|seat| parse_panel_seat_spec(seat))
+        .collect::<Result<Vec<_>>>()?;
+    if seats
+        .iter()
+        .map(|(_, agent)| agent.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+        != 3
+        || seats.iter().filter(|(role, _)| role != "nongate").count() < 2
+        || !seats.iter().any(|(role, _)| role == "primary")
+    {
+        bail!("review panel initial seats 要求三 agent、至少两 formal、至少一 primary");
+    }
+    let round = current_round(root)?;
+    let events = read_round_ledger_events(root, &round)?;
+    ledger::validate_runtime_event_history_v1_at_root(root, &events, &round)?;
+    let dispatch = crate::attempt::resolve_current_dispatch(&events, task_id, &round)?;
+    if dispatch.attempt_id.as_deref() != Some(attempt_id) {
+        bail!("review panel attempt 不是 current canonical attempt");
+    }
+    if events.iter().any(|event| {
+        (event.kind == "VerdictIssued"
+            && event.task_id.as_deref() == Some(task_id)
+            && payload_string(event, "attemptId") == Some(attempt_id))
+            || crate::attempt::event_terminates_attempt(event, attempt_id)
+    }) {
+        bail!("review panel select 拒绝已 terminal/verdict 的 exact attempt");
+    }
+    let attempt_no = dispatch.attempt_no.context("review panel current dispatch 缺 attemptNo")?;
+    let implementer = dispatch.agent.context("review panel current dispatch 缺 agent")?;
+    let policy_base_sha = dispatch
+        .base_sha
+        .context("review panel current dispatch 缺 policy baseSha")?;
+    let resolution = crate::plan::resolve_attempt_runtime_policy(
+        root,
+        &round,
+        &events,
+        task_id,
+        attempt_id,
+        "review-pool-v1",
+    )?;
+    if resolution.state != crate::plan::RuntimePolicyStateV1::Active {
+        bail!("review-pool-v1 在该 attempt policy base 尚未激活");
+    }
+    let policy = resolution
+        .review_pool
+        .as_ref()
+        .context("review-pool-v1 resolution 缺 typed descriptor")?;
+    for (role, agent) in &seats {
+        if agent == &implementer {
+            bail!("review panel reviewer 与 implementer 重叠: {agent}");
+        }
+        let candidate = policy
+            .candidates
+            .iter()
+            .find(|candidate| candidate.agent == *agent)
+            .with_context(|| format!("review panel agent 不在 signed candidate union: {agent}"))?;
+        if candidate.role != *role || candidate.lineage != *role {
+            bail!("review panel seat 超出 signed candidate role/lineage: {role}:{agent}");
+        }
+    }
+    let reviewed_head = immutable_collect_head_before(
+        &events,
+        events.len(),
+        &round,
+        task_id,
+        attempt_id,
+    )?;
+    if let Some((_selected_event, selected)) =
+        selected_panel_for_attempt(&events, task_id, attempt_id)?
+    {
+        let routes = panel_routes_for_selected(&events, &selected)?;
+        let initial = routes
+            .iter()
+            .filter(|(_, route)| route.route_kind == "initial")
+            .collect::<Vec<_>>();
+        if initial.len() != 3
+            || initial.iter().zip(&seats).any(|((_, route), (role, agent))| {
+                route.role != *role || route.agent != *agent
+            })
+        {
+            bail!("existing panel selection 与重复命令的 --seat 顺序/身份冲突");
+        }
+        let rel = format!("coordination/rounds/{round}/events.jsonl");
+        let commit_sha = ledger::commit_scoped_accounting_paths(
+            root,
+            &round,
+            &[rel],
+            &format!("state({round}): route review panel {task_id}/{attempt_id}"),
+        )?;
+        return Ok(ReviewPanelRouteOutcomeV1 {
+            panel_id: selected.panel_id,
+            routes: initial
+                .into_iter()
+                .map(|(_, route)| panel_route_view(route))
+                .collect(),
+            commit_sha,
+            spawned: 0,
+            replayed: true,
+        });
+    }
+    let evidence_count = crate::plan::required_evidence_count_at_policy_base(
+        root,
+        &round,
+        task_id,
+        &policy_base_sha,
+    )?;
+    let panel_id = format!("panel-{}", fresh_uuid());
+    let seat_ids = [
+        format!("seat-{}", fresh_uuid()),
+        format!("seat-{}", fresh_uuid()),
+        format!("seat-{}", fresh_uuid()),
+    ];
+    let selected_payload = ledger::ReviewPanelSelectedPayloadV1 {
+        schema_version: ledger::RUNTIME_EVENT_SCHEMA_V1,
+        panel_id: panel_id.clone(),
+        attempt_id: attempt_id.to_string(),
+        attempt_no,
+        reviewed_head: reviewed_head.clone(),
+        policy_base_sha: policy_base_sha.clone(),
+        policy: "review-pool-v1".to_string(),
+        policy_sha256: resolution.policy_sha256.clone(),
+        seat_count: 3,
+        seat_ids: seat_ids.clone(),
+    };
+    let selected_event = ledger::runtime_event_v1(
+        &round,
+        Some(task_id),
+        ledger::RuntimeEventPayloadV1::ReviewPanelSelected(selected_payload.clone()),
+    )?;
+    let mut route_events = Vec::new();
+    for ((role, agent), seat_id) in seats.iter().zip(seat_ids.iter()) {
+        let candidate = policy
+            .candidates
+            .iter()
+            .find(|candidate| candidate.agent == *agent)
+            .expect("candidate union checked above");
+        let route = ledger::ReviewSeatRoutedPayloadV1 {
+            schema_version: ledger::RUNTIME_EVENT_SCHEMA_V1,
+            panel_id: panel_id.clone(),
+            seat_id: seat_id.clone(),
+            generation: 1,
+            wake_id: fresh_managed_wake_id(),
+            attempt_id: attempt_id.to_string(),
+            attempt_no,
+            role: role.clone(),
+            agent: agent.clone(),
+            lineage: candidate.lineage.clone(),
+            reviewed_head: reviewed_head.clone(),
+            policy_base_sha: policy_base_sha.clone(),
+            deadline_secs: review_deadline_secs(role, evidence_count),
+            retry_eligible: candidate.retry_eligible,
+            route_kind: "initial".to_string(),
+            selected_event_id: selected_event.event_id.clone(),
+            source_seat_id: None,
+            source_generation: None,
+            source_terminal_event_id: None,
+        };
+        route_events.push(ledger::runtime_event_v1(
+            &round,
+            Some(task_id),
+            ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route),
+        )?);
+    }
+    crate::scheduler::with_capacity_lock(root, || {
+        let mut batch = Vec::with_capacity(4);
+        batch.push(selected_event.clone());
+        batch.extend(route_events.iter().cloned());
+        ledger::append_checked(root, &round, |fresh| {
+            ledger::validate_runtime_event_history_v1_at_root(root, fresh, &round)?;
+            if selected_panel_for_attempt(fresh, task_id, attempt_id)?.is_some() {
+                bail!("review panel selection raced with another selector");
+            }
+            let current = crate::attempt::resolve_current_dispatch(fresh, task_id, &round)?;
+            if current.attempt_id.as_deref() != Some(attempt_id)
+                || fresh.iter().any(|event| {
+                    (event.kind == "VerdictIssued"
+                        && event.task_id.as_deref() == Some(task_id)
+                        && payload_string(event, "attemptId") == Some(attempt_id))
+                        || crate::attempt::event_terminates_attempt(event, attempt_id)
+                })
+            {
+                bail!("review panel selection lost current-attempt authority");
+            }
+            validate_panel_route_capacity(root, &round, fresh, &route_events)?;
+            Ok(batch)
+        })?;
+        Ok(())
+    })?;
+    let rel = format!("coordination/rounds/{round}/events.jsonl");
+    let commit_sha = ledger::commit_scoped_accounting_paths(
+        root,
+        &round,
+        &[rel],
+        &format!("state({round}): route review panel {task_id}/{attempt_id}"),
+    )?;
+    Ok(ReviewPanelRouteOutcomeV1 {
+        panel_id,
+        routes: route_events
+            .iter()
+            .map(|event| {
+                let Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route)) =
+                    ledger::decode_runtime_event_v1(event)?
+                else {
+                    bail!("constructed route disappeared");
+                };
+                Ok(panel_route_view(&route))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        commit_sha,
+        spawned: 0,
+        replayed: false,
+    })
+}
+
+fn append_panel_followup_route_v1(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    event: orch_core::EventRecord,
+    message: &str,
+) -> Result<(ReviewPanelRouteV1, String)> {
+    crate::scheduler::with_capacity_lock(root, || {
+        let events = read_round_ledger_events(root, round)?;
+        validate_panel_route_capacity(root, round, &events, std::slice::from_ref(&event))?;
+        ledger::append_checked(root, round, |fresh| {
+            let route = match ledger::decode_runtime_event_v1(&event)? {
+                Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route)) => route,
+                _ => bail!("followup route constructor kind 漂移"),
+            };
+            if fresh.iter().any(|candidate| {
+                matches!(
+                    ledger::decode_runtime_event_v1(candidate),
+                    Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(ref existing)))
+                        if existing.panel_id == route.panel_id
+                            && existing.seat_id == route.seat_id
+                            && existing.generation == route.generation
+                )
+            }) {
+                bail!("panel followup route raced with an existing generation");
+            }
+            Ok(vec![event.clone()])
+        })?;
+        Ok(())
+    })?;
+    let rel = format!("coordination/rounds/{round}/events.jsonl");
+    let commit = ledger::commit_scoped_accounting_paths(
+        root,
+        round,
+        &[rel],
+        message,
+    )?;
+    let Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route)) =
+        ledger::decode_runtime_event_v1(&event)?
+    else {
+        bail!("committed followup route disappeared");
+    };
+    if event.task_id.as_deref() != Some(task_id) {
+        bail!("followup route task envelope 漂移");
+    }
+    Ok((panel_route_view(&route), commit))
+}
+
+fn retry_review_panel_locked_v1(
+    root: &Path,
+    task_id: &str,
+    attempt_id: &str,
+    seat_id: &str,
+) -> Result<ReviewPanelRouteOutcomeV1> {
+    validate_review_reconcile_attempt(task_id, attempt_id)?;
+    if seat_id.is_empty()
+        || !seat_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("--seat-id 非安全 component");
+    }
+    let round = current_round(root)?;
+    let events = read_round_ledger_events(root, &round)?;
+    ledger::validate_runtime_event_history_v1_at_root(root, &events, &round)?;
+    let (selected_event, selected) = selected_panel_for_attempt(&events, task_id, attempt_id)?
+        .context("review panel retry 缺 selected panel")?;
+    if events.iter().any(|event| {
+        matches!(
+            ledger::decode_runtime_event_v1(event),
+            Ok(Some(ledger::RuntimeEventPayloadV1::ReviewPanelClosed(ref closed)))
+                if closed.panel_id == selected.panel_id
+        )
+    }) {
+        bail!("closed review panel 不得 retry");
+    }
+    let routes = panel_routes_for_selected(&events, &selected)?;
+    if let Some((_, replay)) = routes.iter().find(|(_, route)| {
+        route.seat_id == seat_id && route.route_kind == "retry"
+    }) {
+        let rel = format!("coordination/rounds/{round}/events.jsonl");
+        let commit = ledger::commit_scoped_accounting_paths(
+            root,
+            &round,
+            &[rel],
+            &format!("state({round}): retry review panel {task_id}/{attempt_id}"),
+        )?;
+        return Ok(ReviewPanelRouteOutcomeV1 {
+            panel_id: selected.panel_id,
+            routes: vec![panel_route_view(replay)],
+            commit_sha: commit,
+            spawned: 0,
+            replayed: true,
+        });
+    }
+    if routes.iter().any(|(_, route)| route.route_kind == "retry") {
+        bail!("review panel 已消耗全局唯一 business retry");
+    }
+    let sources = routes
+        .iter()
+        .filter(|(_, route)| route.seat_id == seat_id)
+        .collect::<Vec<_>>();
+    let [(_, source)] = sources.as_slice() else {
+        bail!("retry seatId 缺唯一 generation-1 route");
+    };
+    if source.generation != 1 || !source.retry_eligible {
+        bail!("retry source seat 不具 gen2 资格");
+    }
+    let terminals = events
+        .iter()
+        .filter_map(|event| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(terminal))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            (terminal.panel_id == selected.panel_id
+                && terminal.seat_id == seat_id
+                && terminal.generation == 1)
+                .then_some((event, terminal))
+        })
+        .collect::<Vec<_>>();
+    let [(source_terminal_event, source_terminal)] = terminals.as_slice() else {
+        bail!("retry source 缺唯一 terminal");
+    };
+    if source_terminal.state != "business-invalid" {
+        bail!("只有 business-invalid seat 可消耗 gen2");
+    }
+    let resolution = crate::plan::resolve_attempt_runtime_policy(
+        root,
+        &round,
+        &events,
+        task_id,
+        attempt_id,
+        "review-pool-v1",
+    )?;
+    if resolution.state != crate::plan::RuntimePolicyStateV1::Active {
+        bail!("retry attempt policy base 未激活 review-pool-v1");
+    }
+    let evidence_count = crate::plan::required_evidence_count_at_policy_base(
+        root,
+        &round,
+        task_id,
+        &selected.policy_base_sha,
+    )?;
+    let route = ledger::ReviewSeatRoutedPayloadV1 {
+        schema_version: ledger::RUNTIME_EVENT_SCHEMA_V1,
+        panel_id: selected.panel_id.clone(),
+        seat_id: seat_id.to_string(),
+        generation: 2,
+        wake_id: fresh_managed_wake_id(),
+        attempt_id: attempt_id.to_string(),
+        attempt_no: selected.attempt_no,
+        role: source.role.clone(),
+        agent: source.agent.clone(),
+        lineage: source.lineage.clone(),
+        reviewed_head: selected.reviewed_head.clone(),
+        policy_base_sha: selected.policy_base_sha.clone(),
+        deadline_secs: review_deadline_secs(&source.role, evidence_count),
+        retry_eligible: false,
+        route_kind: "retry".to_string(),
+        selected_event_id: selected_event.event_id,
+        source_seat_id: Some(seat_id.to_string()),
+        source_generation: Some(1),
+        source_terminal_event_id: Some(source_terminal_event.event_id.clone()),
+    };
+    let event = ledger::runtime_event_v1(
+        &round,
+        Some(task_id),
+        ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route),
+    )?;
+    let (route, commit) = append_panel_followup_route_v1(
+        root,
+        &round,
+        task_id,
+        event,
+        &format!("state({round}): retry review panel {task_id}/{attempt_id}"),
+    )?;
+    Ok(ReviewPanelRouteOutcomeV1 {
+        panel_id: selected.panel_id,
+        routes: vec![route],
+        commit_sha: commit,
+        spawned: 0,
+        replayed: false,
+    })
+}
+
+/// Route the one allowed business-invalid generation two and then consume its
+/// committed wake identity. System-terminal-invalid failures never call this
+/// entry and therefore cannot consume the business retry budget.
+pub fn retry_review_panel_v1(
+    root: &Path,
+    task_id: &str,
+    attempt_id: &str,
+    seat_id: &str,
+) -> Result<ReviewPanelRouteOutcomeV1> {
+    let mut outcome = crate::close::with_protocol_transition(
+        root,
+        "review panel retry",
+        || retry_review_panel_locked_v1(root, task_id, attempt_id, seat_id),
+    )?;
+    outcome.spawned = reconcile_review_panel_routes_v1(root)?;
+    Ok(outcome)
+}
+
+fn backfill_review_panel_locked_v1(
+    root: &Path,
+    task_id: &str,
+    attempt_id: &str,
+    seat_spec: &str,
+) -> Result<ReviewPanelRouteOutcomeV1> {
+    validate_review_reconcile_attempt(task_id, attempt_id)?;
+    let (role, agent) = parse_panel_seat_spec(seat_spec)?;
+    let round = current_round(root)?;
+    let events = read_round_ledger_events(root, &round)?;
+    ledger::validate_runtime_event_history_v1_at_root(root, &events, &round)?;
+    let (selected_event, selected) = selected_panel_for_attempt(&events, task_id, attempt_id)?
+        .context("review panel backfill 缺 selected panel")?;
+    if events.iter().any(|event| {
+        matches!(
+            ledger::decode_runtime_event_v1(event),
+            Ok(Some(ledger::RuntimeEventPayloadV1::ReviewPanelClosed(ref closed)))
+                if closed.panel_id == selected.panel_id
+        )
+    }) {
+        bail!("closed review panel 不得 backfill");
+    }
+    let routes = panel_routes_for_selected(&events, &selected)?;
+    if let Some((_, replay)) = routes.iter().find(|(_, route)| {
+        route.route_kind == "backfill" && route.role == role && route.agent == agent
+    }) {
+        let rel = format!("coordination/rounds/{round}/events.jsonl");
+        let commit = ledger::commit_scoped_accounting_paths(
+            root,
+            &round,
+            &[rel],
+            &format!("state({round}): backfill review panel {task_id}/{attempt_id}"),
+        )?;
+        return Ok(ReviewPanelRouteOutcomeV1 {
+            panel_id: selected.panel_id,
+            routes: vec![panel_route_view(replay)],
+            commit_sha: commit,
+            spawned: 0,
+            replayed: true,
+        });
+    }
+    if routes.iter().any(|(_, route)| route.agent == agent) {
+        bail!("backfill agent 已在 panel 中，拒绝双计 voice");
+    }
+    let resolution = crate::plan::resolve_attempt_runtime_policy(
+        root,
+        &round,
+        &events,
+        task_id,
+        attempt_id,
+        "review-pool-v1",
+    )?;
+    if resolution.state != crate::plan::RuntimePolicyStateV1::Active {
+        bail!("backfill attempt policy base 未激活 review-pool-v1");
+    }
+    let policy = resolution.review_pool.as_ref().context("backfill 缺 review pool descriptor")?;
+    let candidate = policy
+        .candidates
+        .iter()
+        .find(|candidate| candidate.agent == agent && candidate.role == role)
+        .context("backfill seat 不在 signed candidate union")?;
+    let implementer = crate::attempt::resolve_current_dispatch(&events, task_id, &round)?
+        .agent
+        .context("backfill current dispatch 缺 agent")?;
+    if agent == implementer {
+        bail!("backfill reviewer 与 implementer 重叠");
+    }
+    let used_sources = routes
+        .iter()
+        .filter_map(|(_, route)| route.source_terminal_event_id.as_deref())
+        .collect::<BTreeSet<_>>();
+    let sources = events
+        .iter()
+        .filter_map(|event| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(terminal))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            (terminal.panel_id == selected.panel_id
+                && terminal.state == "system-terminal-invalid"
+                && !used_sources.contains(event.event_id.as_str())
+                && ((candidate.role == "nongate" && terminal.role == "secondary")
+                    || (candidate.role != "nongate" && terminal.role == candidate.role))
+                && candidate
+                    .fallback_for
+                    .as_deref()
+                    .is_none_or(|source_agent| source_agent == terminal.agent))
+                .then_some((event, terminal))
+        })
+        .collect::<Vec<_>>();
+    let [(source_event, source)] = sources.as_slice() else {
+        bail!("backfill 要求唯一、未消费且 candidate-compatible 的 system terminal");
+    };
+    let evidence_count = crate::plan::required_evidence_count_at_policy_base(
+        root,
+        &round,
+        task_id,
+        &selected.policy_base_sha,
+    )?;
+    let seat_id = format!("seat-{}", fresh_uuid());
+    let route = ledger::ReviewSeatRoutedPayloadV1 {
+        schema_version: ledger::RUNTIME_EVENT_SCHEMA_V1,
+        panel_id: selected.panel_id.clone(),
+        seat_id,
+        generation: 1,
+        wake_id: fresh_managed_wake_id(),
+        attempt_id: attempt_id.to_string(),
+        attempt_no: selected.attempt_no,
+        role: role.clone(),
+        agent: agent.clone(),
+        lineage: candidate.lineage.clone(),
+        reviewed_head: selected.reviewed_head.clone(),
+        policy_base_sha: selected.policy_base_sha.clone(),
+        deadline_secs: review_deadline_secs(&role, evidence_count),
+        retry_eligible: candidate.retry_eligible,
+        route_kind: "backfill".to_string(),
+        selected_event_id: selected_event.event_id,
+        source_seat_id: Some(source.seat_id.clone()),
+        source_generation: Some(source.generation),
+        source_terminal_event_id: Some(source_event.event_id.clone()),
+    };
+    let event = ledger::runtime_event_v1(
+        &round,
+        Some(task_id),
+        ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route),
+    )?;
+    let (route, commit) = append_panel_followup_route_v1(
+        root,
+        &round,
+        task_id,
+        event,
+        &format!("state({round}): backfill review panel {task_id}/{attempt_id}"),
+    )?;
+    Ok(ReviewPanelRouteOutcomeV1 {
+        panel_id: selected.panel_id,
+        routes: vec![route],
+        commit_sha: commit,
+        spawned: 0,
+        replayed: false,
+    })
+}
+
+/// Add one signed candidate only for an exact system-terminal-invalid source,
+/// commit the provenance-bound route, then consume its preallocated wake ID.
+pub fn backfill_review_panel_v1(
+    root: &Path,
+    task_id: &str,
+    attempt_id: &str,
+    seat_spec: &str,
+) -> Result<ReviewPanelRouteOutcomeV1> {
+    let mut outcome = crate::close::with_protocol_transition(
+        root,
+        "review panel backfill",
+        || backfill_review_panel_locked_v1(root, task_id, attempt_id, seat_spec),
+    )?;
+    outcome.spawned = reconcile_review_panel_routes_v1(root)?;
+    Ok(outcome)
+}
+
+/// Select exactly three signed candidates, commit selection and routes to
+/// main, then launch only routes whose committed wake identity is still
+/// missing.  A crash between commit and spawn is recovered without reselection.
+pub fn select_review_panel_v1(
+    root: &Path,
+    task_id: &str,
+    attempt_id: &str,
+    seat_specs: &[String],
+) -> Result<ReviewPanelRouteOutcomeV1> {
+    let mut outcome = crate::close::with_protocol_transition(
+        root,
+        "review panel select",
+        || select_review_panel_locked_v1(root, task_id, attempt_id, seat_specs),
+    )?;
+    outcome.spawned = reconcile_review_panel_routes_v1(root)?;
+    Ok(outcome)
+}
+
+fn committed_panel_route_authorization_v1(
+    root: &Path,
+    round: &str,
+    route_event_id: &str,
+) -> Result<PanelRouteAuthorizationV1> {
+    let main = crate::gitx::rev_parse(root, "refs/heads/main^{commit}")?;
+    let rel = format!("coordination/rounds/{round}/events.jsonl");
+    let bytes = crate::gitx::show_bytes(root, &main, &rel)?;
+    let text = std::str::from_utf8(&bytes).context("committed panel ledger 非 UTF-8")?;
+    let mut events = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        events.push(
+            serde_json::from_str::<orch_core::EventRecord>(line).with_context(|| {
+                format!("committed panel ledger 第 {} 行非 canonical", index + 1)
+            })?,
+        );
+    }
+    ledger::validate_runtime_event_history_v1_at_root(root, &events, round)?;
+    let routes = events
+        .iter()
+        .filter(|event| event.event_id == route_event_id)
+        .filter_map(|event| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            Some((event, route))
+        })
+        .collect::<Vec<_>>();
+    let [(route_event, route)] = routes.as_slice() else {
+        bail!("committed panel routeEventId 不唯一");
+    };
+    let selected = events
+        .iter()
+        .filter(|event| event.event_id == route.selected_event_id)
+        .filter_map(|event| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::ReviewPanelSelected(selected))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            Some((event, selected))
+        })
+        .collect::<Vec<_>>();
+    let [(selected_event, selected)] = selected.as_slice() else {
+        bail!("committed panel selectedEventId 不唯一");
+    };
+    if selected.panel_id != route.panel_id
+        || selected.attempt_id != route.attempt_id
+        || selected.reviewed_head != route.reviewed_head
+        || selected.policy_base_sha != route.policy_base_sha
+        || selected_event.task_id != route_event.task_id
+    {
+        bail!("committed panel selected/route tuple 漂移");
+    }
+    let task_id = route_event
+        .task_id
+        .clone()
+        .context("committed panel route 缺 taskId")?;
+    let resolution = crate::plan::resolve_attempt_runtime_policy(
+        root,
+        round,
+        &events,
+        &task_id,
+        &route.attempt_id,
+        "review-pool-v1",
+    )?;
+    if resolution.state != crate::plan::RuntimePolicyStateV1::Active
+        || resolution.policy_base_sha != route.policy_base_sha
+    {
+        bail!("committed panel route policy-as-of 未激活或 base 漂移");
+    }
+    Ok(PanelRouteAuthorizationV1 {
+        task_id,
+        selected_event_id: selected_event.event_id.clone(),
+        route_event_id: route_event.event_id.clone(),
+        route: route.clone(),
+    })
+}
+
+fn wake_issued_matches_panel_route_v1(
+    event: &orch_core::EventRecord,
+    round: &str,
+    task_id: &str,
+    route_event_id: &str,
+    route: &ledger::ReviewSeatRoutedPayloadV1,
+) -> bool {
+    event.kind == "WakeIssued"
+        && event.actor == "runtime:orch"
+        && event.round.as_deref() == Some(round)
+        && event.task_id.as_deref() == Some(task_id)
+        && payload_string(event, "wakeId") == Some(route.wake_id.as_str())
+        && payload_string(event, "attemptId") == Some(route.attempt_id.as_str())
+        && payload_string(event, "agent") == Some(route.agent.as_str())
+        && payload_string(event, "panelId") == Some(route.panel_id.as_str())
+        && payload_string(event, "seatId") == Some(route.seat_id.as_str())
+        && event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("generation"))
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(route.generation))
+        && payload_string(event, "routeEventId") == Some(route_event_id)
+        && payload_string(event, "policyBaseSha") == Some(route.policy_base_sha.as_str())
+        && payload_string(event, "reviewedHead") == Some(route.reviewed_head.as_str())
+}
+
+fn legacy_wake_issued_matches_panel_route_reservation_v1(
+    event: &orch_core::EventRecord,
+    round: &str,
+    task_id: &str,
+    route: &ledger::ReviewSeatRoutedPayloadV1,
+) -> bool {
+    let expected_continuation = format!(
+        "review:{round}:{task_id}:{}:{}:{}",
+        route.attempt_id, route.role, route.agent
+    );
+    let panel_keys_absent = [
+        "panelId",
+        "seatId",
+        "generation",
+        "routeEventId",
+        "policyBaseSha",
+        "reviewedHead",
+    ]
+    .iter()
+    .all(|key| {
+        event
+            .payload
+            .as_ref()
+            .is_none_or(|payload| payload.get(*key).is_none())
+    });
+    event.kind == "WakeIssued"
+        && event.actor == "runtime:orch"
+        && event.round.as_deref() == Some(round)
+        && event.task_id.as_deref() == Some(task_id)
+        && payload_string(event, "wakeId") == Some(route.wake_id.as_str())
+        && payload_string(event, "controlWakeId") == Some(route.wake_id.as_str())
+        && payload_string(event, "attemptId") == Some(route.attempt_id.as_str())
+        && payload_string(event, "agent") == Some(route.agent.as_str())
+        && payload_string(event, "continuationId") == Some(expected_continuation.as_str())
+        && panel_keys_absent
+}
+
+fn backend_receipt_rejection_matches_panel_wake_v1(
+    event: &orch_core::EventRecord,
+    round: &str,
+    task_id: &str,
+    route: &ledger::ReviewSeatRoutedPayloadV1,
+) -> bool {
+    event.kind == "ActionRejected"
+        && event.actor == "runtime:orch"
+        && event.round.as_deref() == Some(round)
+        && event.task_id.as_deref().is_none_or(|value| value == task_id)
+        && payload_string(event, "operation") == Some("wake-backend-receipt")
+        && payload_string(event, "actionId") == Some(route.wake_id.as_str())
+        && payload_string(event, "attemptId")
+            .is_none_or(|value| value == route.attempt_id)
+}
+
+fn action_rejected_matches_panel_route_v1(
+    event: &orch_core::EventRecord,
+    round: &str,
+    task_id: &str,
+    route: &ledger::ReviewSeatRoutedPayloadV1,
+) -> bool {
+    event.kind == "ActionRejected"
+        && event.actor == "runtime:orch"
+        && event.round.as_deref() == Some(round)
+        && event.task_id.as_deref() == Some(task_id)
+        && payload_string(event, "actionId") == Some(route.wake_id.as_str())
+        && payload_string(event, "attemptId") == Some(route.attempt_id.as_str())
+}
+
+fn panel_control_descriptor_is_absent(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("no managed control descriptor")
+        || message.contains("supervisor directory is absent")
+}
+
+fn reject_wake_action<T>(
+    root: &Path,
+    round: &str,
+    task_id: Option<&str>,
+    stage: &str,
+    action_id: &str,
+    reason: &str,
+    attempt: Option<&crate::attempt::AttemptRef>,
+) -> Result<T> {
+    failure::reject_action_disposition(
+        root,
+        round,
+        task_id,
+        stage,
+        action_id,
+        reason,
+        failure::CliDisposition::Rejected,
+        attempt,
+    )
+}
+
+fn orphan_panel_terminal_event_v1(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    route: &ledger::ReviewSeatRoutedPayloadV1,
+    status: &WakeSupervisorStatus,
+    events: &[orch_core::EventRecord],
+) -> Result<orch_core::EventRecord> {
+    if status.agent.as_deref() != Some(route.agent.as_str())
+        || status.wake_id != route.wake_id
+        || !status.managed_scope_terminated
+    {
+        bail!("panel orphan supervisor terminal identity/scope mismatch");
+    }
+    let lease = panel_workspace_lease_event_v1(events, round, task_id, route)?;
+    let worktree_rel = lease
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("paths"))
+        .and_then(|paths| paths.get("worktree"))
+        .and_then(serde_json::Value::as_str)
+        .context("panel orphan WorkspaceLeased 缺 paths.worktree")?;
+    let artifact_name = format!(
+        "{}-{}-g{}-{}.md",
+        route.attempt_id, route.seat_id, route.generation, route.wake_id
+    );
+    let staging = root
+        .join(worktree_rel)
+        .join(".cowork-temp/review-spool")
+        .join(artifact_name);
+    let artifact = crate::verify::optional_review_artifact_bytes(
+        root,
+        &staging,
+        "orphan panel authenticated staging artifact",
+    )?;
+    let answered = route.role != "nongate"
+        && status.error.is_none()
+        && status.exit_status == Some(0)
+        && (status.terminal_seen || status.exited_naturally)
+        && artifact.is_some();
+    let mut event = managed_wake_terminated_event(round, Some(task_id), status);
+    let payload = event
+        .payload
+        .as_mut()
+        .expect("ManagedWakeTerminated constructor has payload");
+    payload["state"] = serde_json::json!(if answered { "answered" } else { "failed" });
+    payload["exactReason"] = serde_json::json!(if answered {
+        "identity recovery: authenticated terminal and exact staging recovered before WakeIssued"
+    } else {
+        "identity recovery: supervisor terminated without recoverable exact staging before WakeIssued"
+    });
+    if let Some(bytes) = artifact {
+        let (sha256, _) = review_bytes_binding(&bytes);
+        payload["outputPath"] = serde_json::json!(staging.display().to_string());
+        payload["outputSha256"] = serde_json::json!(sha256);
+    } else {
+        payload["outputPath"] = serde_json::Value::Null;
+        payload["outputSha256"] = serde_json::Value::Null;
+    }
+    Ok(event)
+}
+
+fn run_panel_route_wake_v1(
+    root: &Path,
+    authorization: PanelRouteAuthorizationV1,
+) -> Result<WakeRunOutcome> {
+    let round = current_round(root)?;
+    if authorization.route.wake_id.is_empty() {
+        bail!("panel route wakeId 为空");
+    }
+    let fresh = read_round_ledger_events(root, &round)?;
+    let wake_events = fresh
+        .iter()
+        .filter(|event| {
+            event.kind == "WakeIssued"
+                && payload_string(event, "wakeId")
+                    == Some(authorization.route.wake_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    if !wake_events.is_empty() {
+        let [wake] = wake_events.as_slice() else {
+            bail!("panel route wakeId 含重复 WakeIssued");
+        };
+        if !wake_issued_matches_panel_route_v1(
+            wake,
+            &round,
+            &authorization.task_id,
+            &authorization.route_event_id,
+            &authorization.route,
+        ) {
+            bail!("panel route wakeId 命中非 exact WakeIssued");
+        }
+        return Ok(WakeRunOutcome::Idempotent {
+            wake_id: authorization.route.wake_id.clone(),
+        });
+    }
+    match read_managed_wake_control_descriptor(root, &authorization.route.wake_id) {
+        Ok((dir, descriptor)) => {
+            if let Some(status) = read_authenticated_terminal_status(&dir, &descriptor)? {
+                if status.agent.as_deref() != Some(authorization.route.agent.as_str()) {
+                    bail!("panel orphan supervisor status agent 漂移");
+                }
+                if status.managed_scope_terminated
+                    && !fresh.iter().any(|event| {
+                        event.kind == "ManagedWakeTerminated"
+                            && payload_string(event, "wakeId")
+                                == Some(authorization.route.wake_id.as_str())
+                    })
+                {
+                    crate::close::with_protocol_transition(
+                        root,
+                        "recover panel orphan terminal",
+                        || {
+                            let current = read_round_ledger_events(root, &round)?;
+                            if current.iter().any(|event| {
+                                event.kind == "ManagedWakeTerminated"
+                                    && payload_string(event, "wakeId")
+                                        == Some(authorization.route.wake_id.as_str())
+                            }) {
+                                return Ok(());
+                            }
+                            let terminal = orphan_panel_terminal_event_v1(
+                                root,
+                                &round,
+                                &authorization.task_id,
+                                &authorization.route,
+                                &status,
+                                &current,
+                            )?;
+                            ledger::append(root, &round, &[terminal])?;
+                            finish_panel_accounting_commit_v1(
+                                root,
+                                &round,
+                                &[],
+                                "recover panel orphan terminal",
+                            )?;
+                            Ok(())
+                        },
+                    )?;
+                }
+            }
+            return Ok(WakeRunOutcome::Idempotent {
+                wake_id: authorization.route.wake_id.clone(),
+            });
+        }
+        Err(error) if panel_control_descriptor_is_absent(&error) => {}
+        Err(error) => return Err(error).context("panel route orphan supervisor descriptor invalid"),
+    }
+    let _storage_permit = crate::storage::guard_operation(
+        root,
+        &round,
+        Some(&authorization.task_id),
+        Some(&authorization.route.attempt_id),
+        crate::storage::GuardEntry::WakeReview,
+        &[
+            root.join(".worktrees"),
+            root.join("orch/target"),
+            root.join("coordination/runtime/reviews"),
+        ],
+    )?;
+    let text = format!(
+        "orch review panel route: panel={} seat={} generation={} wake={} task={} attempt={} role={} reviewedHead={}. Complete the injected review contract exactly.",
+        authorization.route.panel_id,
+        authorization.route.seat_id,
+        authorization.route.generation,
+        authorization.route.wake_id,
+        authorization.task_id,
+        authorization.route.attempt_id,
+        authorization.route.role,
+        authorization.route.reviewed_head,
+    );
+    let resolved = ResolvedMessage {
+        bytes: text.len(),
+        text,
+        source: MessageSource::Explicit,
+    };
+    let request = ReviewRequest {
+        task_id: authorization.task_id.clone(),
+        attempt_id: authorization.route.attempt_id.clone(),
+        role: authorization.route.role.clone(),
+        agent: authorization.route.agent.clone(),
+        deadline_secs: authorization.route.deadline_secs,
+    };
+    let wake_id = authorization.route.wake_id.clone();
+    let agent = authorization.route.agent.clone();
+    let attempt_ref = crate::attempt::AttemptRef {
+        task_id: authorization.task_id.clone(),
+        ordinal: authorization.route.attempt_no,
+        attempt_id: authorization.route.attempt_id.clone(),
+    };
+    let result = crate::close::with_protocol_effect(root, "review panel routed wake", || {
+        run_wake_with_message_inner(
+            root,
+            &agent,
+            resolved,
+            Some(request),
+            &round,
+            &wake_id,
+            true,
+            None,
+            None,
+            Some(authorization.clone()),
+        )
+    });
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(error) if failure::is_action_rejection(&error) => Err(error),
+        Err(error) => match read_managed_wake_control_descriptor(root, &wake_id) {
+            Ok(_) => Err(error).context(
+                "panel provider may have spawned before durable WakeIssued; reservation retained for exact supervisor recovery",
+            ),
+            Err(descriptor_error) if panel_control_descriptor_is_absent(&descriptor_error) =>
+            {
+                reject_wake_action(
+                    root,
+                    &round,
+                    Some(&authorization.task_id),
+                    "review-panel-wake",
+                    &wake_id,
+                    &format!("{error:#}"),
+                    Some(&attempt_ref),
+                )
+            }
+            Err(descriptor_error) => Err(descriptor_error)
+                .context("panel wake failed with an untrusted control descriptor"),
+        },
+    }
+}
+
+fn reconcile_review_panel_routes_filtered_v1(
+    root: &Path,
+    task_filter: Option<(&str, &str)>,
+) -> Result<usize> {
+    let round = current_round(root)?;
+    crate::close::with_protocol_transition(root, "review panel route recovery", || {
+        let _ = recover_panel_accounting_suffix_v1(root, &round)?;
+        Ok(())
+    })?;
+    let events = read_round_ledger_events(root, &round)?;
+    ledger::validate_runtime_event_history_v1_at_root(root, &events, &round)?;
+    let mut pending = Vec::new();
+    for event in &events {
+        let Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route)) =
+            ledger::decode_runtime_event_v1(event)?
+        else {
+            continue;
+        };
+        let task_id = event.task_id.as_deref().context("panel route 缺 taskId")?;
+        if task_filter.is_some_and(|(wanted_task, wanted_attempt)| {
+            task_id != wanted_task || route.attempt_id != wanted_attempt
+        }) {
+            continue;
+        }
+        let closed = events.iter().any(|candidate| {
+            matches!(
+                ledger::decode_runtime_event_v1(candidate),
+                Ok(Some(ledger::RuntimeEventPayloadV1::ReviewPanelClosed(ref closed)))
+                    if closed.panel_id == route.panel_id
+            ) || matches!(
+                ledger::decode_runtime_event_v1(candidate),
+                Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(ref terminal)))
+                    if terminal.panel_id == route.panel_id
+                        && terminal.seat_id == route.seat_id
+                        && terminal.generation == route.generation
+            )
+        });
+        let wake_collisions = events
+            .iter()
+            .filter(|candidate| {
+                candidate.kind == "WakeIssued"
+                    && payload_string(candidate, "wakeId") == Some(route.wake_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        let exact_wakes = wake_collisions
+            .iter()
+            .filter(|candidate| {
+                wake_issued_matches_panel_route_v1(
+                    candidate,
+                    &round,
+                    task_id,
+                    &event.event_id,
+                    &route,
+                )
+            })
+            .count();
+        let legacy_wakes = wake_collisions
+            .iter()
+            .filter(|candidate| {
+                legacy_wake_issued_matches_panel_route_reservation_v1(
+                    candidate,
+                    &round,
+                    task_id,
+                    &route,
+                )
+            })
+            .count();
+        if exact_wakes + legacy_wakes != wake_collisions.len()
+            || exact_wakes + legacy_wakes > 1
+        {
+            bail!("panel route wake/action identity collision 非 exact");
+        }
+        let rejection_collisions = events
+            .iter()
+            .filter(|candidate| {
+                candidate.kind == "ActionRejected"
+                    && payload_string(candidate, "actionId") == Some(route.wake_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        let direct_rejections = rejection_collisions
+            .iter()
+            .filter(|candidate| {
+                action_rejected_matches_panel_route_v1(candidate, &round, task_id, &route)
+            })
+            .count();
+        let receipt_rejections = rejection_collisions
+            .iter()
+            .filter(|candidate| {
+                backend_receipt_rejection_matches_panel_wake_v1(
+                    candidate,
+                    &round,
+                    task_id,
+                    &route,
+                )
+            })
+            .count();
+        if direct_rejections + receipt_rejections != rejection_collisions.len()
+            || direct_rejections > 1
+            || receipt_rejections > 1
+        {
+            bail!("panel route wake/action identity collision 非 exact");
+        }
+        let wake_attempted = exact_wakes + legacy_wakes == 1;
+        let attempted = match (wake_attempted, direct_rejections, receipt_rejections) {
+            (true, 0, 0 | 1) => true,
+            (false, 1, 0) => true,
+            (false, 0, 0) => false,
+            _ => bail!("panel route wake/action terminal shape 非 canonical"),
+        };
+        let verdict = events.iter().any(|candidate| {
+            candidate.kind == "VerdictIssued"
+                && candidate.task_id == event.task_id
+                && payload_string(candidate, "attemptId") == Some(route.attempt_id.as_str())
+        });
+        if !closed && !attempted && !verdict {
+            pending.push(event.event_id.clone());
+        }
+    }
+    let mut spawned = 0usize;
+    for route_event_id in pending {
+        let authorization =
+            committed_panel_route_authorization_v1(root, &round, &route_event_id)?;
+        match run_panel_route_wake_v1(root, authorization) {
+            Ok(WakeRunOutcome::Spawned { .. }) => {
+                spawned += 1;
+                crate::close::with_protocol_transition(
+                    root,
+                    "commit spawned panel routed wake",
+                    || {
+                        finish_panel_accounting_commit_v1(
+                            root,
+                            &round,
+                            &[],
+                            "record spawned panel routed wake",
+                        )?;
+                        Ok(())
+                    },
+                )?;
+            }
+            Ok(WakeRunOutcome::Idempotent { .. }) => {}
+            Err(error) if failure::is_action_rejection(&error) => {
+                eprintln!("[orch] panel routed wake system-terminal-invalid: {error:#}");
+                crate::close::with_protocol_transition(
+                    root,
+                    "commit panel routed wake rejection",
+                    || {
+                        finish_panel_accounting_commit_v1(
+                            root,
+                            &round,
+                            &[],
+                            "record panel routed wake rejection",
+                        )?;
+                        Ok(())
+                    },
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(spawned)
+}
+
+/// Spawn every committed V1 route that has neither its exact WakeIssued nor a
+/// terminal/rejection.  Route identities are reread from main before each
+/// spawn, so recovery never reselects a panel or allocates a new wake ID.
+pub fn reconcile_review_panel_routes_v1(root: &Path) -> Result<usize> {
+    reconcile_review_panel_routes_filtered_v1(root, None)
+}
+
+fn panel_expectation_from_route_v1(
+    round: &str,
+    task_id: &str,
+    route: &ledger::ReviewSeatRoutedPayloadV1,
+) -> Result<crate::verify::ReviewContractExpectation> {
+    crate::verify::ReviewContractExpectation::panel_exact(
+        task_id,
+        round,
+        &route.attempt_id,
+        &route.role,
+        &route.agent,
+        &route.reviewed_head,
+        &route.seat_id,
+        route.generation,
+        &route.wake_id,
+        &route.policy_base_sha,
+    )
+}
+
+fn panel_route_terminal_source_v1<'a>(
+    root: &Path,
+    events: &'a [orch_core::EventRecord],
+    round: &str,
+    task_id: &str,
+    route: &ledger::ReviewSeatRoutedPayloadV1,
+) -> Result<Option<&'a orch_core::EventRecord>> {
+    let managed = events
+        .iter()
+        .filter(|event| {
+            event.kind == "ManagedWakeTerminated"
+                && payload_string(event, "wakeId") == Some(route.wake_id.as_str())
+                && payload_string(event, "agent") == Some(route.agent.as_str())
+                && event.actor == "runtime:orch"
+                && event.round.as_deref() == Some(round)
+                && event.task_id.as_deref() == Some(task_id)
+        })
+        .collect::<Vec<_>>();
+    if managed.len() > 1 {
+        bail!("panel route 含重复 ManagedWakeTerminated");
+    }
+    if let [terminal] = managed.as_slice() {
+        return Ok(Some(*terminal));
+    }
+    let rejected_for_wake = events
+        .iter()
+        .filter(|event| {
+            event.kind == "ActionRejected"
+                && payload_string(event, "actionId") == Some(route.wake_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let rejected = rejected_for_wake
+        .iter()
+        .copied()
+        .filter(|event| {
+            event.actor == "runtime:orch"
+                && event.round.as_deref() == Some(round)
+                && event.task_id.as_deref() == Some(task_id)
+                && payload_string(event, "attemptId") == Some(route.attempt_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    if !rejected_for_wake.is_empty() && rejected.len() != rejected_for_wake.len() {
+        bail!("panel route actionId 命中非 exact ActionRejected");
+    }
+    match rejected.as_slice() {
+        [] => Ok(None),
+        [_] => match read_managed_wake_control_descriptor(root, &route.wake_id) {
+            Ok(_) => Ok(None),
+            Err(error) if panel_control_descriptor_is_absent(&error) => {
+                Ok(Some(rejected[0]))
+            }
+            Err(error) => Err(error).context("panel rejected wake control descriptor is corrupt"),
+        },
+        _ => bail!("panel route 含重复 ActionRejected"),
+    }
+}
+
+/// Classify an invalid/no-artifact terminal without consuming business retry
+/// for admission/auth/pin failures or any Agy empty/failure.  An answered
+/// non-Agy artifact contract failure remains business-invalid.
+pub fn classify_review_panel_invalid_v1(
+    agent: &str,
+    terminal_state: &str,
+    exact_reason: &str,
+) -> ReviewPanelSeatStateV1 {
+    if terminal_state == "answered" {
+        return ReviewPanelSeatStateV1::BusinessInvalid;
+    }
+    if agent == "executor-antigravity" {
+        return ReviewPanelSeatStateV1::SystemInvalid;
+    }
+    let reason = exact_reason.to_ascii_lowercase();
+    [
+        "admission",
+        "auth",
+        "credential",
+        "pin",
+        "launch",
+        "identity",
+        "preflight",
+    ]
+    .iter()
+    .any(|needle| reason.contains(needle))
+    .then_some(ReviewPanelSeatStateV1::SystemInvalid)
+    .unwrap_or(ReviewPanelSeatStateV1::BusinessInvalid)
+}
+
+fn panel_workspace_lease_event_v1<'a>(
+    events: &'a [orch_core::EventRecord],
+    round: &str,
+    task_id: &str,
+    route: &ledger::ReviewSeatRoutedPayloadV1,
+) -> Result<&'a orch_core::EventRecord> {
+    let matching = events
+        .iter()
+        .filter(|event| {
+            event.kind == "WorkspaceLeased"
+                && event.actor == "runtime:orch"
+                && event.round.as_deref() == Some(round)
+                && event.task_id.as_deref() == Some(task_id)
+                && payload_string(event, "attemptId") == Some(route.attempt_id.as_str())
+                && payload_string(event, "role") == Some(route.role.as_str())
+                && payload_string(event, "agent") == Some(route.agent.as_str())
+                && payload_string(event, "wakeId") == Some(route.wake_id.as_str())
+                && payload_string(event, "reviewedHead") == Some(route.reviewed_head.as_str())
+        })
+        .collect::<Vec<_>>();
+    let [lease] = matching.as_slice() else {
+        bail!("panel spool promotion 缺唯一 WorkspaceLeased");
+    };
+    Ok(*lease)
+}
+
+fn panel_wake_event_v1<'a>(
+    events: &'a [orch_core::EventRecord],
+    round: &str,
+    task_id: &str,
+    route: &ledger::ReviewSeatRoutedPayloadV1,
+) -> Result<Option<&'a orch_core::EventRecord>> {
+    let route_events = events
+        .iter()
+        .filter(|event| event.task_id.as_deref() == Some(task_id))
+        .filter_map(|event| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(candidate))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            (candidate.panel_id == route.panel_id
+                && candidate.seat_id == route.seat_id
+                && candidate.generation == route.generation)
+                .then_some(event)
+        })
+        .collect::<Vec<_>>();
+    let [route_event] = route_events.as_slice() else {
+        bail!("panel spool promotion 缺唯一 route event identity");
+    };
+    let collisions = events
+        .iter()
+        .filter(|event| {
+            event.kind == "WakeIssued"
+                && payload_string(event, "wakeId") == Some(route.wake_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let matching = collisions
+        .iter()
+        .copied()
+        .filter(|event| {
+            wake_issued_matches_panel_route_v1(
+                event,
+                round,
+                task_id,
+                &route_event.event_id,
+                route,
+            )
+        })
+        .collect::<Vec<_>>();
+    let legacy = collisions
+        .iter()
+        .copied()
+        .filter(|event| {
+            legacy_wake_issued_matches_panel_route_reservation_v1(
+                event,
+                round,
+                task_id,
+                route,
+            )
+        })
+        .collect::<Vec<_>>();
+    if matching.len() + legacy.len() != collisions.len()
+        || matching.len() + legacy.len() > 1
+    {
+        bail!("panel spool promotion wakeId 命中非 exact/重复 WakeIssued");
+    }
+    // A pre-fix legacy-shaped event proves only that the reserved external
+    // effect may have happened. It is never accepted as panel identity; the
+    // caller must recover through the authenticated supervisor descriptor.
+    if !legacy.is_empty() {
+        return Ok(None);
+    }
+    Ok(matching.first().copied())
+}
+
+fn panel_delivery_event_v1(
+    round: &str,
+    task_id: &str,
+    route: &ledger::ReviewSeatRoutedPayloadV1,
+    checked: &crate::verify::CheckedReviewArtifact,
+    canonical_rel: &str,
+    sha256: &str,
+    bytes: u64,
+    wake_event: Option<&orch_core::EventRecord>,
+    lease_event: &orch_core::EventRecord,
+) -> orch_core::EventRecord {
+    let common = serde_json::json!({
+        "attemptId": route.attempt_id,
+        "role": route.role,
+        "agent": route.agent,
+        "bodyLen": checked.substantive_body_len(),
+        "panelId": route.panel_id,
+        "seatId": route.seat_id,
+        "generation": route.generation,
+        "wakeId": route.wake_id,
+        "policyBaseSha": route.policy_base_sha,
+        "reviewedHead": route.reviewed_head,
+    });
+    if route.role != "nongate" {
+        return ledger::event(
+            "ReviewDelivered",
+            "runtime:orch",
+            Some(task_id),
+            Some(round),
+            common,
+        );
+    }
+    let mut payload = common;
+    payload["path"] = serde_json::json!(canonical_rel);
+    payload["sha256"] = serde_json::json!(sha256);
+    payload["bytes"] = serde_json::json!(bytes);
+    payload["verdict"] = serde_json::json!(checked.verdict());
+    payload["receiptState"] = serde_json::json!("answered");
+    payload["wakeIssuedEventId"] =
+        serde_json::json!(wake_event.expect("nongate promotion requires WakeIssued").event_id);
+    payload["workspaceLeasedEventId"] = serde_json::json!(lease_event.event_id);
+    ledger::event(
+        "NongateReviewDelivered",
+        "runtime:orch",
+        Some(task_id),
+        Some(round),
+        payload,
+    )
+}
+
+enum PanelPromotionOutcomeV1 {
+    NotAnswered,
+    BusinessInvalid(String),
+    Promoted {
+        canonical_rel: String,
+        promotion: orch_core::EventRecord,
+        delivery: orch_core::EventRecord,
+        verdict: String,
+    },
+}
+
+fn panel_staging_rel_for_lease_v1(worktree_rel: &str, artifact_name: &str) -> Result<String> {
+    let worktree_path = Path::new(worktree_rel);
+    if worktree_path.is_absolute()
+        || !worktree_rel.starts_with(".worktrees/")
+        || worktree_path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        || artifact_name.is_empty()
+        || artifact_name.contains('/')
+    {
+        bail!("panel WorkspaceLeased/staging identity 非 canonical");
+    }
+    Ok(format!(
+        "{worktree_rel}/.cowork-temp/review-spool/{artifact_name}"
+    ))
+}
+
+/// Integration-test seam for the pure lease-to-staging relation used by the
+/// production spool promoter. It performs no filesystem mutation.
+#[doc(hidden)]
+pub fn validate_panel_staging_lease_for_test(
+    worktree_rel: &str,
+    staging_rel: &str,
+    artifact_name: &str,
+) -> Result<()> {
+    if panel_staging_rel_for_lease_v1(worktree_rel, artifact_name)? != staging_rel {
+        bail!("panel staging path 未绑定 exact leased worktree");
+    }
+    Ok(())
+}
+
+fn promote_panel_review_v1(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    route: &ledger::ReviewSeatRoutedPayloadV1,
+    terminal: &orch_core::EventRecord,
+    events: &[orch_core::EventRecord],
+) -> Result<PanelPromotionOutcomeV1> {
+    if terminal.kind != "ManagedWakeTerminated"
+        || payload_string(terminal, "state") != Some("answered")
+    {
+        return Ok(PanelPromotionOutcomeV1::NotAnswered);
+    }
+    let expectation = panel_expectation_from_route_v1(round, task_id, route)?;
+    let wake = panel_wake_event_v1(events, round, task_id, route)?;
+    let lease = panel_workspace_lease_event_v1(events, round, task_id, route)?;
+    let output_path = payload_string(terminal, "outputPath")
+        .filter(|value| !value.is_empty())
+        .context("answered panel terminal 缺 outputPath")?;
+    let output_sha = payload_string(terminal, "outputSha256")
+        .filter(|value| valid_sha256(value))
+        .context("answered panel terminal 缺 outputSha256")?;
+    let path = PathBuf::from(output_path);
+    if !path.is_absolute() || !path.starts_with(root) {
+        bail!("panel terminal outputPath 逃出 repository");
+    }
+    let staging_rel = path
+        .strip_prefix(root)?
+        .to_str()
+        .context("panel staging path 非 UTF-8")?
+        .to_string();
+    let panel = expectation
+        .panel_identity()
+        .context("panel expectation 丢失 identity")?;
+    let expected_name = format!(
+        "{}-{}-g{}-{}.md",
+        route.attempt_id, panel.seat_id, panel.generation, panel.wake_id
+    );
+    let worktree_rel = lease
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("paths"))
+        .and_then(|paths| paths.get("worktree"))
+        .and_then(serde_json::Value::as_str)
+        .context("panel WorkspaceLeased 缺 paths.worktree")?;
+    let expected_staging_rel = panel_staging_rel_for_lease_v1(worktree_rel, &expected_name)?;
+    if staging_rel != expected_staging_rel {
+        bail!("panel staging path 未绑定 exact leased worktree/seat/generation/wake");
+    }
+    if let Some(wake) = wake {
+        if payload_string(wake, "reviewOutputPath") != Some(output_path) {
+            bail!("WakeIssued.reviewOutputPath 与 terminal staging path 漂移");
+        }
+    } else {
+        let (dir, descriptor) = read_managed_wake_control_descriptor(root, &route.wake_id)?;
+        let status = read_authenticated_terminal_status(&dir, &descriptor)?
+            .context("orphan answered panel terminal 缺 authenticated supervisor status")?;
+        if status.agent.as_deref() != Some(route.agent.as_str())
+            || !status.managed_scope_terminated
+            || terminal.actor != "runtime:orch"
+            || terminal.round.as_deref() != Some(round)
+            || terminal.task_id.as_deref() != Some(task_id)
+        {
+            bail!("orphan answered panel terminal authority 漂移");
+        }
+    }
+    let Some(bytes) = crate::verify::optional_review_artifact_bytes(
+        root,
+        &path,
+        "panel lease-scoped staging artifact",
+    )? else {
+        return Ok(PanelPromotionOutcomeV1::BusinessInvalid(
+            "answered terminal produced no staging artifact".to_string(),
+        ));
+    };
+    let (sha256, byte_len) = review_bytes_binding(&bytes);
+    if sha256 != output_sha {
+        bail!("panel terminal outputSha256 与 staging bytes 漂移");
+    }
+    let checked = match crate::verify::check_review_artifact_contract(&bytes, &expectation) {
+        Ok(Some(checked)) => checked,
+        Ok(None) => {
+            return Ok(PanelPromotionOutcomeV1::BusinessInvalid(
+                "panel staging frontmatter is incomplete".to_string(),
+            ))
+        }
+        Err(error) => {
+            return Ok(PanelPromotionOutcomeV1::BusinessInvalid(format!(
+                "panel staging contract invalid: {error:#}"
+            )))
+        }
+    };
+    if checked.substantive_body_len() == 0 {
+        return Ok(PanelPromotionOutcomeV1::BusinessInvalid(
+            "panel staging artifact lacks substantive body".to_string(),
+        ));
+    }
+    crate::verify::report_ignored_review_fields(
+        &expectation.artifact_relpath(),
+        checked.ignored_fields(),
+    );
+    let canonical_rel = expectation.artifact_relpath();
+    install_review_no_clobber(root, &canonical_rel, &bytes)?;
+    let delivery = panel_delivery_event_v1(
+        round,
+        task_id,
+        route,
+        &checked,
+        &canonical_rel,
+        &sha256,
+        byte_len,
+        wake,
+        lease,
+    );
+    let promotion = ledger::runtime_event_v1(
+        round,
+        Some(task_id),
+        ledger::RuntimeEventPayloadV1::ReviewSpoolPromoted(
+            ledger::ReviewSpoolPromotedPayloadV1 {
+                schema_version: ledger::RUNTIME_EVENT_SCHEMA_V1,
+                panel_id: route.panel_id.clone(),
+                seat_id: route.seat_id.clone(),
+                generation: route.generation,
+                wake_id: route.wake_id.clone(),
+                attempt_id: route.attempt_id.clone(),
+                attempt_no: route.attempt_no,
+                role: route.role.clone(),
+                agent: route.agent.clone(),
+                reviewed_head: route.reviewed_head.clone(),
+                policy_base_sha: route.policy_base_sha.clone(),
+                staging_path: staging_rel,
+                canonical_path: canonical_rel.clone(),
+                sha256,
+                bytes: byte_len,
+                body_len: checked.substantive_body_len() as u64,
+                verdict: checked.verdict().to_string(),
+                terminal_event_id: terminal.event_id.clone(),
+                delivery_event_id: delivery.event_id.clone(),
+            },
+        ),
+    )?;
+    Ok(PanelPromotionOutcomeV1::Promoted {
+        canonical_rel,
+        promotion,
+        delivery,
+        verdict: checked.verdict().to_string(),
+    })
+}
+
+fn panel_seat_terminal_event_v1(
+    round: &str,
+    task_id: &str,
+    route: &ledger::ReviewSeatRoutedPayloadV1,
+    terminal: &orch_core::EventRecord,
+    delivery: Option<&orch_core::EventRecord>,
+    state: &str,
+    reason: &str,
+) -> Result<orch_core::EventRecord> {
+    ledger::runtime_event_v1(
+        round,
+        Some(task_id),
+        ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(
+            ledger::ReviewSeatTerminatedPayloadV1 {
+                schema_version: ledger::RUNTIME_EVENT_SCHEMA_V1,
+                panel_id: route.panel_id.clone(),
+                seat_id: route.seat_id.clone(),
+                generation: route.generation,
+                wake_id: route.wake_id.clone(),
+                attempt_id: route.attempt_id.clone(),
+                attempt_no: route.attempt_no,
+                role: route.role.clone(),
+                agent: route.agent.clone(),
+                lineage: route.lineage.clone(),
+                reviewed_head: route.reviewed_head.clone(),
+                policy_base_sha: route.policy_base_sha.clone(),
+                state: state.to_string(),
+                terminal_event_id: terminal.event_id.clone(),
+                delivery_event_id: delivery.map(|event| event.event_id.clone()),
+                reason: reason.to_string(),
+            },
+        ),
+    )
+}
+
+fn reconcile_one_panel_route_v1(
+    root: &Path,
+    round: &str,
+    route_event_id: &str,
+) -> Result<Vec<String>> {
+    let events = read_round_ledger_events(root, round)?;
+    let route_events = events
+        .iter()
+        .filter(|event| event.event_id == route_event_id)
+        .filter_map(|event| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            Some((event, route))
+        })
+        .collect::<Vec<_>>();
+    let [(route_event, route)] = route_events.as_slice() else {
+        bail!("panel reconcile routeEventId 不唯一");
+    };
+    let task_id = route_event.task_id.as_deref().context("panel route 缺 taskId")?;
+    if exact_root_verdict_for_review(&events, round, task_id, &route.attempt_id)?.is_some() {
+        return Ok(Vec::new());
+    }
+    if events.iter().any(|event| {
+        matches!(
+            ledger::decode_runtime_event_v1(event),
+            Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(ref terminal)))
+                if terminal.panel_id == route.panel_id
+                    && terminal.seat_id == route.seat_id
+                    && terminal.generation == route.generation
+        )
+    }) {
+        return Ok(Vec::new());
+    }
+    let Some(terminal) =
+        panel_route_terminal_source_v1(root, &events, round, task_id, route)?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut canonical_paths = Vec::new();
+    let mut batch = Vec::new();
+    match promote_panel_review_v1(root, round, task_id, route, terminal, &events)? {
+        PanelPromotionOutcomeV1::Promoted {
+            canonical_rel,
+            promotion,
+            delivery,
+            verdict,
+        } => {
+            let state = match verdict.as_str() {
+                "PASS" => "pass",
+                "FAIL" => "fail",
+                "BLOCKED" => "blocked",
+                _ => bail!("promoted panel verdict 非闭合词汇"),
+            };
+            let seat_terminal = panel_seat_terminal_event_v1(
+                round,
+                task_id,
+                route,
+                terminal,
+                Some(&delivery),
+                state,
+                &format!("substantive {verdict} artifact promoted from exact managed terminal"),
+            )?;
+            canonical_paths.push(canonical_rel);
+            batch.extend([promotion, delivery, seat_terminal]);
+        }
+        PanelPromotionOutcomeV1::BusinessInvalid(reason) => {
+            batch.push(panel_seat_terminal_event_v1(
+                round,
+                task_id,
+                route,
+                terminal,
+                None,
+                "business-invalid",
+                &reason,
+            )?);
+        }
+        PanelPromotionOutcomeV1::NotAnswered => {
+            let reason = payload_string(terminal, "exactReason")
+                .or_else(|| payload_string(terminal, "reason"))
+                .unwrap_or("managed terminal produced no substantive panel artifact");
+            let classified = if terminal.kind == "ActionRejected" {
+                ReviewPanelSeatStateV1::SystemInvalid
+            } else {
+                classify_review_panel_invalid_v1(
+                    &route.agent,
+                    payload_string(terminal, "state").unwrap_or("failed"),
+                    reason,
+                )
+            };
+            let state = match classified {
+                ReviewPanelSeatStateV1::SystemInvalid => "system-terminal-invalid",
+                ReviewPanelSeatStateV1::BusinessInvalid => "business-invalid",
+                _ => unreachable!("invalid terminal classifier has two outcomes"),
+            };
+            batch.push(panel_seat_terminal_event_v1(
+                round,
+                task_id,
+                route,
+                terminal,
+                None,
+                state,
+                reason,
+            )?);
+        }
+    }
+    ledger::append_checked(root, round, |fresh| {
+        if fresh.iter().any(|event| {
+            matches!(
+                ledger::decode_runtime_event_v1(event),
+                Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(ref existing)))
+                    if existing.panel_id == route.panel_id
+                        && existing.seat_id == route.seat_id
+                        && existing.generation == route.generation
+            )
+        }) {
+            return Ok(Vec::new());
+        }
+        Ok(batch)
+    })?;
+    Ok(canonical_paths)
+}
+
+#[derive(Debug, Clone)]
+struct ReviewPanelBackfillOptionV1 {
+    primary_lineage: bool,
+    source_terminal_event_ids: Vec<String>,
+}
+
+fn maximum_backfill_matching_v1(
+    options: &[ReviewPanelBackfillOptionV1],
+    excluded_candidate: Option<usize>,
+    reserved_source: Option<&str>,
+) -> usize {
+    fn augment(
+        candidate: usize,
+        options: &[ReviewPanelBackfillOptionV1],
+        excluded_candidate: Option<usize>,
+        reserved_source: Option<&str>,
+        visited: &mut BTreeSet<String>,
+        source_owner: &mut BTreeMap<String, usize>,
+    ) -> bool {
+        for source in &options[candidate].source_terminal_event_ids {
+            if reserved_source == Some(source.as_str()) || !visited.insert(source.clone()) {
+                continue;
+            }
+            let prior = source_owner.get(source).copied();
+            if prior.is_none_or(|owner| {
+                owner != candidate
+                    && excluded_candidate != Some(owner)
+                    && augment(
+                        owner,
+                        options,
+                        excluded_candidate,
+                        reserved_source,
+                        visited,
+                        source_owner,
+                    )
+            }) {
+                source_owner.insert(source.clone(), candidate);
+                return true;
+            }
+        }
+        false
+    }
+
+    let mut source_owner = BTreeMap::<String, usize>::new();
+    for candidate in 0..options.len() {
+        if excluded_candidate == Some(candidate) {
+            continue;
+        }
+        let mut visited = BTreeSet::new();
+        let _ = augment(
+            candidate,
+            options,
+            excluded_candidate,
+            reserved_source,
+            &mut visited,
+            &mut source_owner,
+        );
+    }
+    source_owner.len()
+}
+
+fn maximum_backfill_matching_with_primary_v1(
+    options: &[ReviewPanelBackfillOptionV1],
+) -> usize {
+    options
+        .iter()
+        .enumerate()
+        .filter(|(_, option)| option.primary_lineage)
+        .flat_map(|(candidate, option)| {
+            option.source_terminal_event_ids.iter().map(move |source| {
+                1 + maximum_backfill_matching_v1(
+                    options,
+                    Some(candidate),
+                    Some(source.as_str()),
+                )
+            })
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn current_panel_routes_v1(
+    events: &[orch_core::EventRecord],
+    panel_id: &str,
+) -> Result<BTreeMap<String, ledger::ReviewSeatRoutedPayloadV1>> {
+    let mut current = BTreeMap::<String, ledger::ReviewSeatRoutedPayloadV1>::new();
+    for event in events {
+        let Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route)) =
+            ledger::decode_runtime_event_v1(event)?
+        else {
+            continue;
+        };
+        if route.panel_id != panel_id {
+            continue;
+        }
+        if current
+            .get(&route.seat_id)
+            .is_some_and(|prior| prior.generation == route.generation)
+        {
+            bail!("panel current-route projection sees duplicate generation");
+        }
+        if current
+            .get(&route.seat_id)
+            .is_none_or(|prior| prior.generation < route.generation)
+        {
+            current.insert(route.seat_id.clone(), route);
+        }
+    }
+    Ok(current)
+}
+
+fn current_panel_seats_v1(
+    events: &[orch_core::EventRecord],
+    current: &BTreeMap<String, ledger::ReviewSeatRoutedPayloadV1>,
+) -> Result<Vec<ReviewPanelSeatV1>> {
+    let mut seats = Vec::new();
+    for route in current.values() {
+        let terminals = events
+            .iter()
+            .filter_map(|event| {
+                let Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(terminal))) =
+                    ledger::decode_runtime_event_v1(event)
+                else {
+                    return None;
+                };
+                (terminal.panel_id == route.panel_id
+                    && terminal.seat_id == route.seat_id
+                    && terminal.generation == route.generation)
+                    .then_some(terminal)
+            })
+            .collect::<Vec<_>>();
+        if terminals.len() > 1 {
+            bail!("panel close projection sees duplicate terminal");
+        }
+        let state = match terminals.first().map(|terminal| terminal.state.as_str()) {
+            Some("pass") => ReviewPanelSeatStateV1::Pass,
+            Some("fail") => ReviewPanelSeatStateV1::Fail,
+            Some("blocked") => ReviewPanelSeatStateV1::Blocked,
+            Some("business-invalid") => ReviewPanelSeatStateV1::BusinessInvalid,
+            Some("system-terminal-invalid") => ReviewPanelSeatStateV1::SystemInvalid,
+            None => ReviewPanelSeatStateV1::Pending,
+            Some(other) => bail!("panel close projection unknown terminal state: {other}"),
+        };
+        seats.push(ReviewPanelSeatV1 {
+            seat_id: route.seat_id.clone(),
+            generation: route.generation,
+            role: route.role.clone(),
+            agent: route.agent.clone(),
+            primary_lineage: route.lineage == "primary",
+            retry_eligible: route.retry_eligible,
+            state,
+        });
+    }
+    Ok(seats)
+}
+
+fn panel_backfill_options_v1(
+    events: &[orch_core::EventRecord],
+    panel_id: &str,
+    current: &BTreeMap<String, ledger::ReviewSeatRoutedPayloadV1>,
+    policy: &crate::plan::ReviewPoolPolicyV1,
+) -> Result<Vec<ReviewPanelBackfillOptionV1>> {
+    let used_agents = current
+        .values()
+        .map(|route| route.agent.as_str())
+        .collect::<BTreeSet<_>>();
+    let used_sources = events
+        .iter()
+        .filter_map(|event| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            (route.panel_id == panel_id).then_some(route.source_terminal_event_id)
+        })
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    let system_sources = events
+        .iter()
+        .filter_map(|event| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(terminal))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            (terminal.panel_id == panel_id
+                && terminal.state == "system-terminal-invalid"
+                && !used_sources.contains(&event.event_id))
+                .then_some((event.event_id.as_str(), terminal.role, terminal.agent))
+        })
+        .collect::<Vec<_>>();
+    Ok(policy
+        .candidates
+        .iter()
+        .filter(|candidate| !used_agents.contains(candidate.agent.as_str()))
+        .filter_map(|candidate| {
+            let source_terminal_event_ids = system_sources
+                .iter()
+                .filter(|(_, role, agent)| {
+                    ((candidate.role == "nongate" && *role == "secondary")
+                        || (candidate.role != "nongate" && candidate.role == *role))
+                        && candidate
+                            .fallback_for
+                            .as_deref()
+                            .is_none_or(|source_agent| source_agent == *agent)
+                })
+                .map(|(event_id, _, _)| (*event_id).to_string())
+                .collect::<Vec<_>>();
+            (!source_terminal_event_ids.is_empty()).then_some(ReviewPanelBackfillOptionV1 {
+                primary_lineage: candidate.lineage == "primary",
+                source_terminal_event_ids,
+            })
+        })
+        .collect())
+}
+
+/// Return whether pending routes, the one business retry, or a one-to-one
+/// matching of unused signed backfills can still satisfy quorum and primary
+/// lineage for this exact panel.  It is shared by close-time and replay-time
+/// validators so a merely compatible but insufficient candidate cannot delay
+/// pool exhaustion.
+pub(crate) fn review_panel_future_reachable_v1(
+    events: &[orch_core::EventRecord],
+    panel_id: &str,
+    policy: &crate::plan::ReviewPoolPolicyV1,
+) -> Result<bool> {
+    let current = current_panel_routes_v1(events, panel_id)?;
+    let seats = current_panel_seats_v1(events, &current)?;
+    let retries_used = current
+        .values()
+        .filter(|route| route.route_kind == "retry")
+        .count();
+    let decision = evaluate_review_panel_v1(
+        &ReviewPanelPolicyV1 {
+            minimum_passes: policy.minimum_passes,
+            require_primary_pass: policy.require_primary_pass,
+            maximum_business_retries: policy.maximum_business_retries,
+            nongate_substitutes_secondary_only: policy.nongate_substitutes_role == "secondary",
+        },
+        &seats,
+        retries_used,
+        0,
+    );
+    if matches!(decision, ReviewPanelDecisionV1::Retry { .. }) {
+        return Ok(true);
+    }
+    let pending = seats
+        .iter()
+        .filter(|seat| seat.state == ReviewPanelSeatStateV1::Pending)
+        .count();
+    if pending > 0
+        && seats.iter().any(|seat| {
+            matches!(
+                seat.state,
+                ReviewPanelSeatStateV1::Fail | ReviewPanelSeatStateV1::Blocked
+            )
+        })
+    {
+        return Ok(true);
+    }
+
+    let primary_pass = seats
+        .iter()
+        .any(|seat| seat.primary_lineage && seat.state == ReviewPanelSeatStateV1::Pass);
+    let primary_pending = seats
+        .iter()
+        .any(|seat| seat.primary_lineage && seat.state == ReviewPanelSeatStateV1::Pending);
+    let formal_passes = seats
+        .iter()
+        .filter(|seat| seat.role != "nongate" && seat.state == ReviewPanelSeatStateV1::Pass)
+        .count();
+    let unavailable_secondary = seats.iter().any(|seat| {
+        seat.role == "secondary"
+            && matches!(
+                seat.state,
+                ReviewPanelSeatStateV1::BusinessInvalid | ReviewPanelSeatStateV1::SystemInvalid
+            )
+    });
+    let nongate_substitution = seats
+        .iter()
+        .any(|seat| seat.role == "nongate" && seat.state == ReviewPanelSeatStateV1::Pass)
+        && unavailable_secondary;
+    let pass_count = formal_passes + usize::from(nongate_substitution);
+    let pending_passes = seats
+        .iter()
+        .filter(|seat| {
+            seat.state == ReviewPanelSeatStateV1::Pending && seat.role != "nongate"
+        })
+        .count()
+        + usize::from(
+            unavailable_secondary
+                && seats.iter().any(|seat| {
+                    seat.state == ReviewPanelSeatStateV1::Pending && seat.role == "nongate"
+                }),
+        );
+    let options = panel_backfill_options_v1(events, panel_id, &current, policy)?;
+    let matching = if !policy.require_primary_pass || primary_pass || primary_pending {
+        maximum_backfill_matching_v1(&options, None, None)
+    } else {
+        maximum_backfill_matching_with_primary_v1(&options)
+    };
+    let primary_reachable = !policy.require_primary_pass
+        || primary_pass
+        || primary_pending
+        || matching > 0
+            && options.iter().any(|option| option.primary_lineage);
+    Ok(primary_reachable
+        && pass_count
+            .saturating_add(pending_passes)
+            .saturating_add(matching)
+            >= policy.minimum_passes)
+}
+
+fn panel_close_candidate_v1(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    selected: &ledger::ReviewPanelSelectedPayloadV1,
+    events: &[orch_core::EventRecord],
+) -> Result<Option<Vec<orch_core::EventRecord>>> {
+    if events.iter().any(|event| {
+        matches!(
+            ledger::decode_runtime_event_v1(event),
+            Ok(Some(ledger::RuntimeEventPayloadV1::ReviewPanelClosed(ref closed)))
+                if closed.panel_id == selected.panel_id
+        )
+    }) {
+        return Ok(None);
+    }
+    let current = current_panel_routes_v1(events, &selected.panel_id)?;
+    let seats = current_panel_seats_v1(events, &current)?;
+    let terminal_count = seats
+        .iter()
+        .filter(|seat| seat.state != ReviewPanelSeatStateV1::Pending)
+        .count();
+    let resolution = crate::plan::resolve_attempt_runtime_policy(
+        root,
+        round,
+        events,
+        task_id,
+        &selected.attempt_id,
+        "review-pool-v1",
+    )?;
+    let policy = resolution
+        .review_pool
+        .as_ref()
+        .context("panel close 缺 review-pool descriptor")?;
+    let retries_used = current.values().filter(|route| route.route_kind == "retry").count();
+    let mut decision = evaluate_review_panel_v1(
+        &ReviewPanelPolicyV1 {
+            minimum_passes: policy.minimum_passes,
+            require_primary_pass: policy.require_primary_pass,
+            maximum_business_retries: policy.maximum_business_retries,
+            nongate_substitutes_secondary_only: policy.nongate_substitutes_role == "secondary",
+        },
+        &seats,
+        retries_used,
+        0,
+    );
+    if matches!(decision, ReviewPanelDecisionV1::Retry { .. }) {
+        return Ok(None);
+    }
+    if matches!(
+        decision,
+        ReviewPanelDecisionV1::Awaiting | ReviewPanelDecisionV1::PoolExhausted
+    ) {
+        if review_panel_future_reachable_v1(events, &selected.panel_id, policy)? {
+            return Ok(None);
+        }
+        decision = ReviewPanelDecisionV1::PoolExhausted;
+    }
+    let primary_pass = seats
+        .iter()
+        .any(|seat| seat.primary_lineage && seat.state == ReviewPanelSeatStateV1::Pass);
+    let formal_passes = seats
+        .iter()
+        .filter(|seat| seat.role != "nongate" && seat.state == ReviewPanelSeatStateV1::Pass)
+        .count();
+    let unavailable_secondary = seats.iter().any(|seat| {
+        seat.role == "secondary"
+            && matches!(
+                seat.state,
+                ReviewPanelSeatStateV1::BusinessInvalid | ReviewPanelSeatStateV1::SystemInvalid
+            )
+    });
+    let nongate_substitution = seats
+        .iter()
+        .any(|seat| seat.role == "nongate" && seat.state == ReviewPanelSeatStateV1::Pass)
+        && unavailable_secondary;
+    let pass_count = formal_passes + usize::from(nongate_substitution);
+    let (outcome, reason) = match decision {
+        ReviewPanelDecisionV1::Pass => (
+            "pass",
+            "minimum substantive quorum and primary lineage satisfied".to_string(),
+        ),
+        ReviewPanelDecisionV1::Veto => (
+            "veto",
+            "substantive FAIL/BLOCKED finding is monotonic".to_string(),
+        ),
+        ReviewPanelDecisionV1::PoolExhausted => (
+            "pool-exhausted",
+            "signed pool cannot reach quorum or primary lineage".to_string(),
+        ),
+        other => return Err(anyhow::anyhow!("panel close decision unresolved: {other:?}")),
+    };
+    let closed = ledger::runtime_event_v1(
+        round,
+        Some(task_id),
+        ledger::RuntimeEventPayloadV1::ReviewPanelClosed(
+            ledger::ReviewPanelClosedPayloadV1 {
+                schema_version: ledger::RUNTIME_EVENT_SCHEMA_V1,
+                panel_id: selected.panel_id.clone(),
+                attempt_id: selected.attempt_id.clone(),
+                attempt_no: selected.attempt_no,
+                reviewed_head: selected.reviewed_head.clone(),
+                policy_base_sha: selected.policy_base_sha.clone(),
+                outcome: outcome.to_string(),
+                reason: reason.clone(),
+                terminal_seat_count: terminal_count,
+                pass_count,
+                primary_pass,
+            },
+        ),
+    )?;
+    let mut batch = vec![closed];
+    if outcome == "pool-exhausted" {
+        batch.push(ledger::event(
+            "AttemptBlocked",
+            "runtime:orch",
+            Some(task_id),
+            Some(round),
+            serde_json::json!({
+                "attemptId": selected.attempt_id,
+                "attemptNo": selected.attempt_no,
+                "agent": "runtime-review-panel",
+                "stage": "review-panel-exhausted",
+                "reason": reason,
+                "panelId": selected.panel_id,
+            }),
+        ));
+    }
+    Ok(Some(batch))
+}
+
+/// Validate the sole runtime-owned terminal-agent exception consumed by
+/// successor inference. The `AttemptBlocked` must be immediately adjacent to
+/// its typed `ReviewPanelClosed(pool-exhausted)` and bind the same task,
+/// attempt, ordinal, panel and reason.
+pub(crate) fn canonical_review_panel_exhaustion_terminal_for_successor(
+    events: &[orch_core::EventRecord],
+    terminal_position: usize,
+    task: &str,
+    attempt_id: &str,
+    attempt_no: usize,
+) -> Result<bool> {
+    let terminal = &events[terminal_position];
+    let Some(payload) = terminal.payload.as_ref() else {
+        return Ok(false);
+    };
+    let string = |key: &str| payload.get(key).and_then(serde_json::Value::as_str);
+    if terminal.kind != "AttemptBlocked"
+        || terminal.actor != "runtime:orch"
+        || terminal.task_id.as_deref() != Some(task)
+        || string("agent") != Some("runtime-review-panel")
+        || string("attemptId") != Some(attempt_id)
+        || string("stage") != Some("review-panel-exhausted")
+        || payload
+            .get("attemptNo")
+            .and_then(serde_json::Value::as_u64)
+            != Some(attempt_no as u64)
+    {
+        return Ok(false);
+    }
+    let Some(closed_event) = terminal_position
+        .checked_sub(1)
+        .and_then(|position| events.get(position))
+    else {
+        return Ok(false);
+    };
+    let Some(ledger::RuntimeEventPayloadV1::ReviewPanelClosed(closed)) =
+        ledger::decode_runtime_event_v1(closed_event)?
+    else {
+        return Ok(false);
+    };
+    Ok(closed_event.actor == "runtime:orch"
+        && closed_event.task_id.as_deref() == Some(task)
+        && closed_event.round == terminal.round
+        && closed.attempt_id == attempt_id
+        && closed.attempt_no == attempt_no
+        && closed.outcome == "pool-exhausted"
+        && string("panelId") == Some(closed.panel_id.as_str())
+        && string("reason") == Some(closed.reason.as_str()))
+}
+
+fn finish_panel_accounting_commit_v1(
+    root: &Path,
+    round: &str,
+    canonical_paths: &[String],
+    label: &str,
+) -> Result<String> {
+    let mut paths = vec![format!("coordination/rounds/{round}/events.jsonl")];
+    paths.extend(canonical_paths.iter().cloned());
+    paths.sort();
+    paths.dedup();
+    ledger::commit_scoped_accounting_paths(
+        root,
+        round,
+        &paths,
+        &format!("state({round}): {label}"),
+    )
+}
+
+fn managed_terminal_recovery_batch_is_exact_v1(
+    committed: &[orch_core::EventRecord],
+    suffix: &[orch_core::EventRecord],
+    round: &str,
+) -> bool {
+    if suffix.is_empty() {
+        return false;
+    }
+    let mut cursor = 0usize;
+    let mut seen_wakes = BTreeSet::new();
+    while cursor < suffix.len() {
+        let terminal = &suffix[cursor];
+        let (Some(task_id), Some(wake_id), Some(agent)) = (
+            terminal.task_id.as_deref(),
+            payload_string(terminal, "wakeId"),
+            payload_string(terminal, "agent"),
+        ) else {
+            return false;
+        };
+        if terminal.kind != "ManagedWakeTerminated"
+            || terminal.actor != "runtime:orch"
+            || terminal.round.as_deref() != Some(round)
+            || terminal
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("managedScopeTerminated"))
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            || !seen_wakes.insert(wake_id.to_string())
+            || committed.iter().any(|event| {
+                event.kind == "ManagedWakeTerminated"
+                    && payload_string(event, "wakeId") == Some(wake_id)
+            })
+        {
+            return false;
+        }
+        if committed
+            .iter()
+            .filter(|event| {
+                event.kind == "WakeIssued"
+                    && event.actor == "runtime:orch"
+                    && event.round.as_deref() == Some(round)
+                    && event.task_id.as_deref() == Some(task_id)
+                    && payload_string(event, "wakeId") == Some(wake_id)
+                    && payload_string(event, "agent") == Some(agent)
+            })
+            .count()
+            != 1
+        {
+            return false;
+        }
+        let leases = committed
+            .iter()
+            .filter(|event| {
+                event.kind == "WorkspaceLeased"
+                    && event.actor == "runtime:orch"
+                    && event.round.as_deref() == Some(round)
+                    && event.task_id.as_deref() == Some(task_id)
+                    && payload_string(event, "wakeId") == Some(wake_id)
+                    && payload_string(event, "agent") == Some(agent)
+            })
+            .collect::<Vec<_>>();
+        if leases.len() > 1 {
+            return false;
+        }
+        cursor += 1;
+        let Some(lease) = leases.first().copied() else {
+            continue;
+        };
+        let Some(release) = suffix.get(cursor) else {
+            return false;
+        };
+        let (Some(lease_payload), Some(release_payload)) =
+            (lease.payload.as_ref(), release.payload.as_ref())
+        else {
+            return false;
+        };
+        if release.kind != "WorkspaceReleased"
+            || release.actor != "runtime:orch"
+            || release.round.as_deref() != Some(round)
+            || release.task_id.as_deref() != Some(task_id)
+            || payload_string(release, "wakeId") != Some(wake_id)
+            || payload_string(release, "agent") != Some(agent)
+            || payload_string(release, "terminationEventId")
+                != Some(terminal.event_id.as_str())
+            || payload_string(release, "completionReceipt")
+                != Some("runtime:orch/managed-wake-terminated")
+            || ["attemptId", "siteId", "role", "generation"]
+                .iter()
+                .any(|key| lease_payload.get(*key) != release_payload.get(*key))
+        {
+            return false;
+        }
+        cursor += 1;
+    }
+    true
+}
+
+fn panel_wake_recovery_batch_is_exact_v1(
+    committed: &[orch_core::EventRecord],
+    suffix: &[orch_core::EventRecord],
+    round: &str,
+) -> Result<bool> {
+    if !matches!(
+        suffix.iter().map(|event| event.kind.as_str()).collect::<Vec<_>>().as_slice(),
+        ["WorkspaceLeased", "WakeIssued"]
+            | ["WorkspaceLeased", "WakeIssued", "ReviewRequested"]
+    ) {
+        return Ok(false);
+    }
+    let lease = &suffix[0];
+    let wake = &suffix[1];
+    let wake_id = payload_string(wake, "wakeId").unwrap_or_default();
+    let mut routes = Vec::new();
+    for event in committed {
+        if let Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route)) =
+            ledger::decode_runtime_event_v1(event)?
+        {
+            if route.wake_id == wake_id {
+                routes.push((event, route));
+            }
+        }
+    }
+    let [(route_event, route)] = routes.as_slice() else {
+        return Ok(false);
+    };
+    let Some(task_id) = route_event.task_id.as_deref() else {
+        return Ok(false);
+    };
+    if committed.iter().any(|event| {
+        (event.kind == "WakeIssued" && payload_string(event, "wakeId") == Some(wake_id))
+            || (event.kind == "WorkspaceLeased"
+                && payload_string(event, "wakeId") == Some(wake_id))
+    }) || lease.kind != "WorkspaceLeased"
+        || lease.actor != "runtime:orch"
+        || lease.round.as_deref() != Some(round)
+        || lease.task_id.as_deref() != Some(task_id)
+        || payload_string(lease, "agent") != Some(route.agent.as_str())
+        || payload_string(lease, "attemptId") != Some(route.attempt_id.as_str())
+        || payload_string(lease, "role") != Some(route.role.as_str())
+        || payload_string(lease, "wakeId") != Some(route.wake_id.as_str())
+        || payload_string(lease, "reviewedHead") != Some(route.reviewed_head.as_str())
+        || lease
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("generation"))
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|generation| generation == 0 || u32::try_from(generation).is_err())
+        || !wake_issued_matches_panel_route_v1(
+            wake,
+            round,
+            task_id,
+            &route_event.event_id,
+            route,
+        )
+    {
+        return Ok(false);
+    }
+    let formal = route.role != "nongate";
+    if suffix.len() != if formal { 3 } else { 2 } {
+        return Ok(false);
+    }
+    if !formal {
+        return Ok(true);
+    }
+    let requested = &suffix[2];
+    let expected_continuation = format!(
+        "review:{round}:{task_id}:{}:{}:{}",
+        route.attempt_id, route.role, route.agent
+    );
+    Ok(requested.kind == "ReviewRequested"
+        && requested.actor == "runtime:orch"
+        && requested.round.as_deref() == Some(round)
+        && requested.task_id.as_deref() == Some(task_id)
+        && payload_string(requested, "agent") == Some(route.agent.as_str())
+        && payload_string(requested, "attemptId") == Some(route.attempt_id.as_str())
+        && payload_string(requested, "role") == Some(route.role.as_str())
+        && payload_string(requested, "wakeId") == Some(route.wake_id.as_str())
+        && payload_string(requested, "continuationId") == Some(expected_continuation.as_str())
+        && payload_string(requested, "panelId") == Some(route.panel_id.as_str())
+        && payload_string(requested, "seatId") == Some(route.seat_id.as_str())
+        && payload_string(requested, "routeEventId") == Some(route_event.event_id.as_str())
+        && payload_string(requested, "policyBaseSha") == Some(route.policy_base_sha.as_str())
+        && payload_string(requested, "reviewedHead") == Some(route.reviewed_head.as_str())
+        && requested
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("generation"))
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(route.generation)))
+}
+
+fn panel_escalation_recovery_batch_is_exact_v1(
+    committed: &[orch_core::EventRecord],
+    suffix: &[orch_core::EventRecord],
+    round: &str,
+) -> Result<bool> {
+    if suffix.is_empty() || suffix.iter().any(|event| event.kind != "EscalationRaised") {
+        return Ok(false);
+    }
+    let mut seen_identities = BTreeSet::new();
+    for escalation in suffix {
+        let Some(task_id) = escalation.task_id.as_deref() else {
+            return Ok(false);
+        };
+        let (Some(stage), Some(agent), Some(role)) = (
+            payload_string(escalation, "stage"),
+            payload_string(escalation, "agent"),
+            payload_string(escalation, "role"),
+        ) else {
+            return Ok(false);
+        };
+        if escalation.actor != "runtime:orch"
+            || escalation.round.as_deref() != Some(round)
+            || payload_string(escalation, "reason").is_none_or(str::is_empty)
+        {
+            return Ok(false);
+        }
+        match stage {
+            "review-probe" => {
+                let Some(wake_id) = payload_string(escalation, "wakeId") else {
+                    return Ok(false);
+                };
+                if payload_string(escalation, "taskId") != Some(task_id)
+                    || !seen_identities.insert(format!("review-probe:{wake_id}"))
+                    || ["logPath", "worktree", "targetDir"]
+                        .iter()
+                        .any(|key| payload_string(escalation, key).is_none_or(str::is_empty))
+                {
+                    return Ok(false);
+                }
+                let mut routes = Vec::new();
+                for event in committed {
+                    if let Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route)) =
+                        ledger::decode_runtime_event_v1(event)?
+                    {
+                        if route.wake_id == wake_id
+                            && route.agent == agent
+                            && route.role == role
+                            && event.task_id.as_deref() == Some(task_id)
+                        {
+                            routes.push((event, route));
+                        }
+                    }
+                }
+                let [(route_event, route)] = routes.as_slice() else {
+                    return Ok(false);
+                };
+                if committed
+                    .iter()
+                    .filter(|event| {
+                        wake_issued_matches_panel_route_v1(
+                            event,
+                            round,
+                            task_id,
+                            &route_event.event_id,
+                            route,
+                        )
+                    })
+                    .count()
+                    != 1
+                {
+                    return Ok(false);
+                }
+            }
+            "site-cleanup-storage" => {
+                let (Some(site_id), Some(attempt_id), Some(generation)) = (
+                    payload_string(escalation, "siteId"),
+                    payload_string(escalation, "attemptId"),
+                    escalation
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("generation"))
+                        .and_then(serde_json::Value::as_u64),
+                ) else {
+                    return Ok(false);
+                };
+                if payload_string(escalation, "action") != Some("refuse-delete")
+                    || !seen_identities.insert(format!("site-cleanup-storage:{site_id}"))
+                {
+                    return Ok(false);
+                }
+                let leases = committed
+                    .iter()
+                    .filter(|event| {
+                        event.kind == "WorkspaceLeased"
+                            && event.actor == "runtime:orch"
+                            && event.round.as_deref() == Some(round)
+                            && event.task_id.as_deref() == Some(task_id)
+                            && payload_string(event, "siteId") == Some(site_id)
+                            && payload_string(event, "attemptId") == Some(attempt_id)
+                            && payload_string(event, "agent") == Some(agent)
+                            && payload_string(event, "role") == Some(role)
+                            && event
+                                .payload
+                                .as_ref()
+                                .and_then(|payload| payload.get("generation"))
+                                .and_then(serde_json::Value::as_u64)
+                                == Some(generation)
+                    })
+                    .collect::<Vec<_>>();
+                let [lease] = leases.as_slice() else {
+                    return Ok(false);
+                };
+                let Some(wake_id) = payload_string(lease, "wakeId") else {
+                    return Ok(false);
+                };
+                let mut routes = Vec::new();
+                for event in committed {
+                    if let Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route)) =
+                        ledger::decode_runtime_event_v1(event)?
+                    {
+                        if route.wake_id == wake_id
+                            && route.agent == agent
+                            && route.role == role
+                            && event.task_id.as_deref() == Some(task_id)
+                        {
+                            routes.push(route);
+                        }
+                    }
+                }
+                let [route] = routes.as_slice() else {
+                    return Ok(false);
+                };
+                let seat_terminals = committed
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            ledger::decode_runtime_event_v1(event),
+                            Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(ref terminal)))
+                                if terminal.panel_id == route.panel_id
+                                    && terminal.seat_id == route.seat_id
+                                    && terminal.generation == route.generation
+                                    && terminal.wake_id == route.wake_id
+                        )
+                    })
+                    .count();
+                let releases = committed
+                    .iter()
+                    .filter(|event| {
+                        event.kind == "WorkspaceReleased"
+                            && event.actor == "runtime:orch"
+                            && event.round.as_deref() == Some(round)
+                            && event.task_id.as_deref() == Some(task_id)
+                            && payload_string(event, "siteId") == Some(site_id)
+                            && payload_string(event, "wakeId") == Some(wake_id)
+                    })
+                    .count();
+                let managed_terminals = committed
+                    .iter()
+                    .filter(|event| {
+                        event.kind == "ManagedWakeTerminated"
+                            && event.actor == "runtime:orch"
+                            && event.round.as_deref() == Some(round)
+                            && event.task_id.as_deref() == Some(task_id)
+                            && payload_string(event, "wakeId") == Some(wake_id)
+                            && payload_string(event, "agent") == Some(agent)
+                            && event
+                                .payload
+                                .as_ref()
+                                .and_then(|payload| payload.get("managedScopeTerminated"))
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(true)
+                    })
+                    .count();
+                if seat_terminals != 1
+                    || releases > 1
+                    || managed_terminals > 1
+                    || releases + managed_terminals == 0
+                {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+fn panel_consumption_timeout_recovery_batch_is_exact_v1(
+    committed: &[orch_core::EventRecord],
+    suffix: &[orch_core::EventRecord],
+    round: &str,
+) -> Result<bool> {
+    if !matches!(suffix.len(), 4 | 5) {
+        return Ok(false);
+    }
+    let lease = &suffix[0];
+    let wake = &suffix[1];
+    let receipt = &suffix[suffix.len() - 2];
+    let escalation = &suffix[suffix.len() - 1];
+    let Some(wake_id) = payload_string(wake, "wakeId") else {
+        return Ok(false);
+    };
+    let mut routes = Vec::new();
+    for event in committed {
+        if let Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route)) =
+            ledger::decode_runtime_event_v1(event)?
+        {
+            if route.wake_id == wake_id {
+                routes.push((event, route));
+            }
+        }
+    }
+    let [(route_event, route)] = routes.as_slice() else {
+        return Ok(false);
+    };
+    let prefix_len = if route.role == "nongate" { 2 } else { 3 };
+    if suffix.len() != prefix_len + 2
+        || !panel_wake_recovery_batch_is_exact_v1(
+            committed,
+            &suffix[..prefix_len],
+            round,
+        )?
+    {
+        return Ok(false);
+    }
+    let facts = durable_receipt_facts(wake)?;
+    if !existing_receipt_matches(receipt, &facts)?
+        || committed
+            .iter()
+            .any(|event| existing_receipt_matches(event, &facts).unwrap_or(false))
+    {
+        return Ok(false);
+    }
+
+    let Some(task_id) = route_event.task_id.as_deref() else {
+        return Ok(false);
+    };
+    let Some(payload) = escalation
+        .payload
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(false);
+    };
+    const ESCALATION_KEYS: &[&str] = &[
+        "stage",
+        "taskId",
+        "role",
+        "agent",
+        "wakeId",
+        "logPath",
+        "worktree",
+        "targetDir",
+        "reason",
+    ];
+    if payload.len() != ESCALATION_KEYS.len()
+        || ESCALATION_KEYS
+            .iter()
+            .any(|key| !payload.contains_key(*key))
+        || escalation.kind != "EscalationRaised"
+        || escalation.actor != "runtime:orch"
+        || escalation.round.as_deref() != Some(round)
+        || escalation.task_id.as_deref() != Some(task_id)
+        || payload_string(escalation, "stage") != Some("review-consumption")
+        || payload_string(escalation, "taskId") != Some(task_id)
+        || payload_string(escalation, "role") != Some(route.role.as_str())
+        || payload_string(escalation, "agent") != Some(route.agent.as_str())
+        || payload_string(escalation, "wakeId") != Some(route.wake_id.as_str())
+        || payload_string(escalation, "logPath") != Some(facts.log_path.as_str())
+        || payload_string(escalation, "reason").is_none_or(|reason| reason.trim().is_empty())
+    {
+        return Ok(false);
+    }
+    let Some(paths) = lease
+        .payload
+        .as_ref()
+        .and_then(|value| value.get("paths"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(false);
+    };
+    let (Some(worktree_rel), Some(target_rel), Some(worktree), Some(target)) = (
+        paths.get("worktree").and_then(serde_json::Value::as_str),
+        paths.get("target").and_then(serde_json::Value::as_str),
+        payload_string(escalation, "worktree"),
+        payload_string(escalation, "targetDir"),
+    ) else {
+        return Ok(false);
+    };
+    Ok(Path::new(worktree).is_absolute()
+        && Path::new(target).is_absolute()
+        && Path::new(worktree).ends_with(worktree_rel)
+        && Path::new(target).ends_with(target_rel))
+}
+
+fn panel_backend_receipt_recovery_batch_is_exact_v1(
+    committed: &[orch_core::EventRecord],
+    suffix: &[orch_core::EventRecord],
+    round: &str,
+) -> Result<bool> {
+    if !matches!(suffix.len(), 3 | 4) {
+        return Ok(false);
+    }
+    let wake = &suffix[1];
+    let receipt = &suffix[suffix.len() - 1];
+    let Some(wake_id) = payload_string(wake, "wakeId") else {
+        return Ok(false);
+    };
+    let mut routes = Vec::new();
+    for event in committed {
+        if let Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route)) =
+            ledger::decode_runtime_event_v1(event)?
+        {
+            if route.wake_id == wake_id {
+                routes.push(route);
+            }
+        }
+    }
+    let [route] = routes.as_slice() else {
+        return Ok(false);
+    };
+    let prefix_len = if route.role == "nongate" { 2 } else { 3 };
+    if suffix.len() != prefix_len + 1
+        || !panel_wake_recovery_batch_is_exact_v1(committed, &suffix[..prefix_len], round)?
+    {
+        return Ok(false);
+    }
+    let facts = durable_receipt_facts(wake)?;
+    Ok(existing_receipt_matches(receipt, &facts)?
+        && !committed
+            .iter()
+            .any(|event| existing_receipt_matches(event, &facts).unwrap_or(false)))
+}
+
+fn panel_accounting_recovery_batch_is_exact_v1(
+    committed: &[orch_core::EventRecord],
+    batch: &[orch_core::EventRecord],
+    round: &str,
+) -> Result<bool> {
+    let kinds = batch
+        .iter()
+        .map(|event| event.kind.as_str())
+        .collect::<Vec<_>>();
+    Ok(panel_wake_recovery_batch_is_exact_v1(committed, batch, round)?
+        || panel_backend_receipt_recovery_batch_is_exact_v1(committed, batch, round)?
+        || panel_consumption_timeout_recovery_batch_is_exact_v1(committed, batch, round)?
+        || panel_escalation_recovery_batch_is_exact_v1(committed, batch, round)?
+        || managed_terminal_recovery_batch_is_exact_v1(committed, batch, round)
+        || match kinds.as_slice() {
+            ["ReviewPanelSelected", "ReviewSeatRouted", "ReviewSeatRouted", "ReviewSeatRouted"] => {
+                batch[1..].iter().all(|event| {
+                    matches!(
+                        ledger::decode_runtime_event_v1(event),
+                        Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(ref route)))
+                            if route.route_kind == "initial"
+                    )
+                })
+            }
+            ["ReviewSeatRouted"] => matches!(
+                ledger::decode_runtime_event_v1(&batch[0]),
+                Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(ref route)))
+                    if matches!(route.route_kind.as_str(), "retry" | "backfill")
+            ),
+            ["ReviewSpoolPromoted", delivery, "ReviewSeatTerminated"] => {
+                matches!(*delivery, "ReviewDelivered" | "NongateReviewDelivered")
+            }
+            ["ReviewSeatTerminated"] | ["ReviewPanelClosed"] => true,
+            ["ReviewPanelClosed", "AttemptBlocked"] => true,
+            ["ActionRejected"] => {
+                let rejected = &batch[0];
+                let wake_id = payload_string(rejected, "actionId");
+                let attempt_id = payload_string(rejected, "attemptId");
+                rejected.actor == "runtime:orch"
+                    && rejected.round.as_deref() == Some(round)
+                    && rejected.task_id.is_some()
+                    && committed
+                        .iter()
+                        .filter(|event| {
+                            matches!(
+                                ledger::decode_runtime_event_v1(event),
+                                Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(ref route)))
+                                    if wake_id == Some(route.wake_id.as_str())
+                                        && attempt_id == Some(route.attempt_id.as_str())
+                                        && rejected.task_id == event.task_id
+                            )
+                        })
+                        .count()
+                        == 1
+            }
+            _ => false,
+        })
+}
+
+/// Validate one or more exact accounting batches left uncommitted by adjacent
+/// runtime actors. Each later batch is checked against the committed prefix
+/// plus every earlier accepted batch, so it may bind a wake/lease that was
+/// durably appended immediately before it without admitting an unbound event.
+fn panel_accounting_recovery_suffix_is_exact_v1(
+    committed: &[orch_core::EventRecord],
+    suffix: &[orch_core::EventRecord],
+    round: &str,
+) -> Result<bool> {
+    if suffix.is_empty() {
+        return Ok(false);
+    }
+    let mut cursor = 0usize;
+    while cursor < suffix.len() {
+        let mut visible = Vec::with_capacity(committed.len() + cursor);
+        visible.extend_from_slice(committed);
+        visible.extend_from_slice(&suffix[..cursor]);
+        let mut accepted_end = None;
+        for end in ((cursor + 1)..=suffix.len()).rev() {
+            if panel_accounting_recovery_batch_is_exact_v1(
+                &visible,
+                &suffix[cursor..end],
+                round,
+            )? {
+                accepted_end = Some(end);
+                break;
+            }
+        }
+        let Some(end) = accepted_end else {
+            return Ok(false);
+        };
+        cursor = end;
+    }
+    Ok(true)
+}
+
+fn recover_panel_accounting_suffix_v1(root: &Path, round: &str) -> Result<bool> {
+    let ledger_rel = format!("coordination/rounds/{round}/events.jsonl");
+    let current = fs::read(root.join(&ledger_rel))?;
+    let current_events = current
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(serde_json::from_slice::<orch_core::EventRecord>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut contains_panel_accounting = false;
+    for event in &current_events {
+        if matches!(
+            ledger::decode_runtime_event_v1(event)?,
+            Some(
+                    ledger::RuntimeEventPayloadV1::ReviewPanelSelected(_)
+                        | ledger::RuntimeEventPayloadV1::ReviewSeatRouted(_)
+                        | ledger::RuntimeEventPayloadV1::ReviewSpoolPromoted(_)
+                        | ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(_)
+                        | ledger::RuntimeEventPayloadV1::ReviewPanelClosed(_)
+            )
+        ) {
+            contains_panel_accounting = true;
+        }
+    }
+    if !contains_panel_accounting {
+        return Ok(false);
+    }
+    let main = crate::gitx::rev_parse(root, "refs/heads/main^{commit}")?;
+    let committed = crate::gitx::show_bytes(root, &main, &ledger_rel)?;
+    if current == committed {
+        return Ok(false);
+    }
+    if !current.starts_with(&committed)
+        || (!committed.is_empty() && !committed.ends_with(b"\n"))
+    {
+        bail!("panel accounting recovery ledger 不是 main ledger 严格扩展");
+    }
+    let suffix = &current[committed.len()..];
+    let suffix_events = suffix
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .enumerate()
+        .map(|(index, line)| {
+            serde_json::from_slice::<orch_core::EventRecord>(line).with_context(|| {
+                format!("panel accounting recovery suffix 第 {} 行非 canonical", index + 1)
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let kinds = suffix_events
+        .iter()
+        .map(|event| event.kind.as_str())
+        .collect::<Vec<_>>();
+    let committed_events = committed
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(serde_json::from_slice::<orch_core::EventRecord>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let exact_shape = panel_accounting_recovery_suffix_is_exact_v1(
+        &committed_events,
+        &suffix_events,
+        round,
+    )?;
+    if !exact_shape {
+        bail!("panel accounting recovery suffix 不是单个 exact panel batch: {kinds:?}");
+    }
+    let events = read_round_ledger_events(root, round)?;
+    ledger::validate_runtime_event_history_v1_at_root(root, &events, round)?;
+    let mut canonical_paths = Vec::new();
+    for event in &suffix_events {
+        if let Some(ledger::RuntimeEventPayloadV1::ReviewSpoolPromoted(promotion)) =
+            ledger::decode_runtime_event_v1(event)?
+        {
+            let bytes = crate::verify::optional_review_artifact_bytes(
+                root,
+                &root.join(&promotion.canonical_path),
+                "crash-replayed panel canonical review",
+            )?
+            .context("ReviewSpoolPromoted crash replay 缺 canonical blob")?;
+            let (sha256, len) = review_bytes_binding(&bytes);
+            if sha256 != promotion.sha256 || len != promotion.bytes {
+                bail!("ReviewSpoolPromoted crash replay canonical bytes 漂移");
+            }
+            canonical_paths.push(promotion.canonical_path);
+        }
+    }
+    finish_panel_accounting_commit_v1(
+        root,
+        round,
+        &canonical_paths,
+        "recover panel accounting",
+    )?;
+    Ok(true)
+}
+
+fn reconcile_review_panel_transitions_locked_v1(
+    root: &Path,
+    task_filter: Option<(&str, &str)>,
+) -> Result<usize> {
+    let round = current_round(root)?;
+    crate::close::with_protocol_transition(root, "commit panel site cleanup recovery", || {
+        let _ = recover_panel_accounting_suffix_v1(root, &round)?;
+        Ok(())
+    })?;
+    let mut changed = 0usize;
+    let events = read_round_ledger_events(root, &round)?;
+    let route_ids = events
+        .iter()
+        .filter_map(|event| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            let task = event.task_id.as_deref()?;
+            let already_terminal = events.iter().any(|candidate| {
+                matches!(
+                    ledger::decode_runtime_event_v1(candidate),
+                    Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(ref terminal)))
+                        if terminal.panel_id == route.panel_id
+                            && terminal.seat_id == route.seat_id
+                            && terminal.generation == route.generation
+                )
+            });
+            (!already_terminal
+                && task_filter.is_none_or(|(wanted_task, wanted_attempt)| {
+                    task == wanted_task && route.attempt_id == wanted_attempt
+                }))
+            .then_some(event.event_id.clone())
+        })
+        .collect::<Vec<_>>();
+    for route_id in route_ids {
+        let paths = reconcile_one_panel_route_v1(root, &round, &route_id)?;
+        let fresh = read_round_ledger_events(root, &round)?;
+        let newly_terminal = fresh.iter().any(|event| {
+            matches!(
+                ledger::decode_runtime_event_v1(event),
+                Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(ref terminal)))
+                    if fresh.iter().any(|route_event| {
+                        route_event.event_id == route_id
+                            && matches!(
+                                ledger::decode_runtime_event_v1(route_event),
+                                Ok(Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(ref route)))
+                                    if route.panel_id == terminal.panel_id
+                                        && route.seat_id == terminal.seat_id
+                                        && route.generation == terminal.generation
+                            )
+                    })
+            )
+        });
+        if newly_terminal {
+            finish_panel_accounting_commit_v1(root, &round, &paths, "reconcile panel seat")?;
+            changed += 1;
+        }
+    }
+    let fresh = read_round_ledger_events(root, &round)?;
+    let selected = fresh
+        .iter()
+        .filter_map(|event| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::ReviewPanelSelected(selected))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            let task = event.task_id.as_deref()?;
+            task_filter
+                .is_none_or(|(wanted_task, wanted_attempt)| {
+                    task == wanted_task && selected.attempt_id == wanted_attempt
+                })
+                .then_some((task.to_string(), selected))
+        })
+        .collect::<Vec<_>>();
+    for (task_id, panel) in selected {
+        let current = read_round_ledger_events(root, &round)?;
+        if let Some(batch) = panel_close_candidate_v1(
+            root,
+            &round,
+            &task_id,
+            &panel,
+            &current,
+        )? {
+            let appended = ledger::append_checked(root, &round, |events| {
+                if events.iter().any(|event| {
+                    matches!(
+                        ledger::decode_runtime_event_v1(event),
+                        Ok(Some(ledger::RuntimeEventPayloadV1::ReviewPanelClosed(ref closed)))
+                            if closed.panel_id == panel.panel_id
+                    )
+                }) {
+                    return Ok(Vec::new());
+                }
+                Ok(batch)
+            })?;
+            if appended > 0 {
+                finish_panel_accounting_commit_v1(root, &round, &[], "close review panel")?;
+                changed += 1;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+/// Reconcile managed terminals, panel spool promotion, exact delivery, seat
+/// closure, and unreachable-quorum termination for one current attempt.
+pub fn reconcile_review_attempt_v1(
+    root: &Path,
+    task_id: &str,
+    attempt_id: &str,
+) -> Result<usize> {
+    validate_review_reconcile_attempt(task_id, attempt_id)?;
+    let routed = reconcile_review_panel_routes_filtered_v1(root, Some((task_id, attempt_id)))?;
+    let panel = crate::close::with_protocol_transition(root, "review attempt reconcile", || {
+        let round = current_round(root)?;
+        let _ = reconcile_pending_backend_receipts(root, &round)?;
+        reconcile_review_panel_transitions_locked_v1(root, Some((task_id, attempt_id)))
+    })?;
+    let formal = reconcile_committed_review_delivery_slots(root, task_id, attempt_id)?;
+    let round = current_round(root)?;
+    let nongate =
+        reconcile_nongate_review_delivery_slots_filtered(root, &round, Some((task_id, attempt_id)))?;
+    if let Err(error) = crate::sites::reap_released_sites(root, &round) {
+        eprintln!("[orch] panel transition 后 site GC 保守留场: {error:#}");
+    }
+    crate::close::with_protocol_transition(
+        root,
+        "commit global panel site cleanup recovery",
+        || {
+            let _ = recover_panel_accounting_suffix_v1(root, &round)?;
+            Ok(())
+        },
+    )?;
+    Ok(routed + panel + formal + nongate)
+}
+
+/// Reconcile the global managed-terminal/spool/seat-closure phase for every
+/// selected panel. Route recovery and legacy formal/nongate delivery remain in
+/// [`reconcile_review_transitions`], so callers needing the full pass use it.
+pub fn reconcile_review_panels_v1(root: &Path) -> Result<usize> {
+    let changed = crate::close::with_protocol_transition(root, "review panel reconcile", || {
+        let round = current_round(root)?;
+        let _ = reconcile_pending_backend_receipts(root, &round)?;
+        reconcile_review_panel_transitions_locked_v1(root, None)
+    })?;
+    let round = current_round(root)?;
+    if let Err(error) = crate::sites::reap_released_sites(root, &round) {
+        eprintln!("[orch] global panel transition 后 site GC 保守留场: {error:#}");
+    }
+    let _ = recover_panel_accounting_suffix_v1(root, &round)?;
+    Ok(changed)
+}
+
+/// Run the shared global review reconciler used by CLI, runloop, serve, and
+/// deadline processing: panel route recovery, terminal/spool closure, then
+/// legacy formal and nongate delivery for the active signed review contract.
+pub fn reconcile_review_transitions(root: &Path) -> Result<usize> {
+    let panel_changes =
+        reconcile_review_panel_routes_v1(root)? + reconcile_review_panels_v1(root)?;
+    let round = current_round(root)?;
+    let events = read_round_ledger_events(root, &round)?;
+    let ir_path = root.join(format!("coordination/rounds/{round}/ROUND-IR.yaml"));
+    if !ir_path.exists() {
+        if events.iter().any(|event| {
+            matches!(
+                ledger::decode_runtime_event_v1(event),
+                Ok(Some(
+                    ledger::RuntimeEventPayloadV1::ReviewPanelSelected(_)
+                        | ledger::RuntimeEventPayloadV1::ReviewSeatRouted(_)
+                        | ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(_)
+                        | ledger::RuntimeEventPayloadV1::ReviewSpoolPromoted(_)
+                        | ledger::RuntimeEventPayloadV1::ReviewPanelClosed(_)
+                ))
+            )
+        }) {
+            bail!("panel review history requires committed ROUND-IR authority");
+        }
+        // Pre-IR daemon fixtures and historical rounds cannot contain a panel
+        // contract. Preserve their old no-op review tick instead of making a
+        // newly shared serve/runloop call reject unrelated planner work.
+        return Ok(panel_changes);
+    }
+    let active = crate::plan::require_active_round_ir(root, &round, &events)?;
+    if !active
+        .candidate
+        .tasks
+        .iter()
+        .any(|task| task.review_quorum.is_some() || !task.review_fallbacks.is_empty())
+    {
+        return Ok(panel_changes);
+    }
+    reconcile_review_delivery_slots(root, &round)?;
+    Ok(panel_changes + reconcile_nongate_review_delivery_slots(root, &round)?)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WakeRunOutcome {
     Spawned { wake_id: String },
@@ -16355,7 +22175,7 @@ pub fn run_wake(root: &Path, agent: &str, message: &str) -> Result<()> {
 /// WakeIssued payload 携带 messageSource 与 messageBytes（B109 契约）。
 /// 与旧 [run_wake] 行为一致，仅多落两个字段（消费方按需读，未消费字段无破坏）。
 pub fn run_wake_with_message(root: &Path, agent: &str, resolved: ResolvedMessage) -> Result<()> {
-    run_wake_with_message_mode(root, agent, resolved, None, false, None).map(|_| ())
+    run_wake_with_message_mode(root, agent, resolved, None, false, None, None).map(|_| ())
 }
 
 pub fn run_wake_with_message_authorized(
@@ -16372,7 +22192,7 @@ pub fn run_wake_with_message_authorized(
         crate::storage::GuardEntry::WakeReview,
         &[root.join(".worktrees"), root.join("orch/target")],
     )?;
-    run_wake_with_message_mode(root, agent, resolved, None, true, None)
+    run_wake_with_message_mode(root, agent, resolved, None, true, None, None)
 }
 
 /// Explicit review wake. This is the same production path as an ordinary wake;
@@ -16384,7 +22204,7 @@ pub fn run_wake_with_message_review(
     resolved: ResolvedMessage,
     review: ReviewRequest,
 ) -> Result<()> {
-    run_wake_with_message_mode(root, agent, resolved, Some(review), false, None).map(|_| ())
+    run_wake_with_message_mode(root, agent, resolved, Some(review), false, None, None).map(|_| ())
 }
 
 pub fn run_wake_with_message_authorized_review(
@@ -16406,7 +22226,327 @@ pub fn run_wake_with_message_authorized_review(
             root.join("coordination/runtime/reviews"),
         ],
     )?;
-    run_wake_with_message_mode(root, agent, resolved, Some(review), true, None)
+    run_wake_with_message_mode(root, agent, resolved, Some(review), true, None, None)
+}
+
+fn terminal_allows_review_fallback(event: &orch_core::EventRecord) -> bool {
+    event.kind == "ManagedWakeTerminated"
+        && event.actor == "runtime:orch"
+        && event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("managedScopeTerminated"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && !matches!(
+            payload_string(event, "outcomeClass"),
+            Some("OperationalError" | "StoppedByAuthenticatedCancel") | None
+        )
+}
+
+fn append_review_fallback_exhaustions(root: &Path, round: &str) -> Result<usize> {
+    ledger::append_checked(root, round, |events| {
+        let mut escalations = Vec::new();
+        for selection in events.iter().filter(|event| {
+            event.kind == "ReviewFallbackSelected"
+                && event.actor == "runtime:orch"
+                && event.round.as_deref() == Some(round)
+        }) {
+            let Some(task_id) = selection.task_id.as_deref() else {
+                bail!("ReviewFallbackSelected 缺 taskId");
+            };
+            let required = |field: &str| {
+                payload_string(selection, field)
+                    .filter(|value| !value.is_empty())
+                    .with_context(|| format!("ReviewFallbackSelected 缺 payload.{field}"))
+            };
+            let attempt_id = required("attemptId")?;
+            let role = required("role")?;
+            let to_agent = required("toAgent")?;
+            let target_wake_id = required("targetWakeId")?;
+            if events.iter().any(|event| {
+                event.kind == "EscalationRaised"
+                    && event.task_id.as_deref() == Some(task_id)
+                    && payload_string(event, "stage") == Some("review-fallback-exhausted")
+                    && payload_string(event, "selectionEventId")
+                        == Some(selection.event_id.as_str())
+            }) {
+                continue;
+            }
+            if events.iter().any(|event| {
+                event.kind == "ReviewDelivered"
+                    && event.task_id.as_deref() == Some(task_id)
+                    && payload_string(event, "attemptId") == Some(attempt_id)
+                    && payload_string(event, "role") == Some(role)
+                    && payload_string(event, "agent") == Some(to_agent)
+                    && event
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("bodyLen"))
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some_and(|len| len > 0)
+            }) {
+                continue;
+            }
+            let terminals = events
+                .iter()
+                .filter(|event| {
+                    payload_string(event, "wakeId") == Some(target_wake_id)
+                        && terminal_allows_review_fallback(event)
+                })
+                .collect::<Vec<_>>();
+            let [terminal] = terminals.as_slice() else {
+                if terminals.len() > 1 {
+                    bail!("fallback target 含重复 ManagedWakeTerminated");
+                }
+                continue;
+            };
+            let canonical =
+                crate::verify::canonical_review_artifact_relpath(round, attempt_id, role, to_agent);
+            let inbox = review_inbox_relpath(round, attempt_id, role, to_agent)?;
+            if root.join(&canonical).exists() || root.join(inbox).exists() {
+                continue;
+            }
+            escalations.push(ledger::event(
+                "EscalationRaised",
+                "runtime:orch",
+                Some(task_id),
+                Some(round),
+                serde_json::json!({
+                    "stage": "review-fallback-exhausted",
+                    "attemptId": attempt_id,
+                    "role": role,
+                    "agent": to_agent,
+                    "selectionEventId": selection.event_id,
+                    "terminalEventId": terminal.event_id,
+                    "targetWakeId": target_wake_id,
+                }),
+            ));
+        }
+        Ok(escalations)
+    })
+}
+
+fn append_review_fallback_cancel_escalations(root: &Path, round: &str) -> Result<usize> {
+    ledger::append_checked(root, round, |events| {
+        let active = crate::plan::require_active_round_ir(root, round, events)?;
+        let mut escalations = Vec::new();
+        for task in &active.candidate.tasks {
+            let Some(current) = crate::attempt::current_attempt(events, &task.id)? else {
+                continue;
+            };
+            for required in &task.required_reviews {
+                if signed_review_fallback(task, &required.role).is_none() {
+                    continue;
+                }
+                let Some(request) = events.iter().rev().find(|event| {
+                    event.kind == "ReviewRequested"
+                        && event.actor == "runtime:orch"
+                        && event.round.as_deref() == Some(round)
+                        && event.task_id.as_deref() == Some(task.id.as_str())
+                        && payload_string(event, "attemptId") == Some(current.attempt_id.as_str())
+                        && payload_string(event, "role") == Some(required.role.as_str())
+                        && payload_string(event, "agent") == Some(required.agent.as_str())
+                }) else {
+                    continue;
+                };
+                let Some(wake_id) = payload_string(request, "wakeId") else {
+                    bail!("fallback cancel source ReviewRequested 缺 wakeId");
+                };
+                let terminals = events
+                    .iter()
+                    .filter(|event| {
+                        event.kind == "ManagedWakeTerminated"
+                            && event.actor == "runtime:orch"
+                            && event.round.as_deref() == Some(round)
+                            && event.task_id.as_deref() == Some(task.id.as_str())
+                            && payload_string(event, "wakeId") == Some(wake_id)
+                            && payload_string(event, "agent") == Some(required.agent.as_str())
+                            && payload_string(event, "outcomeClass")
+                                == Some("StoppedByAuthenticatedCancel")
+                            && event
+                                .payload
+                                .as_ref()
+                                .and_then(|payload| payload.get("managedScopeTerminated"))
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(true)
+                    })
+                    .collect::<Vec<_>>();
+                let [terminal] = terminals.as_slice() else {
+                    if terminals.len() > 1 {
+                        bail!("fallback cancel source terminal 重复");
+                    }
+                    continue;
+                };
+                if events.iter().any(|event| {
+                    event.kind == "EscalationRaised"
+                        && event.task_id.as_deref() == Some(task.id.as_str())
+                        && payload_string(event, "stage")
+                            == Some("review-fallback-authenticated-cancel")
+                        && payload_string(event, "terminalEventId")
+                            == Some(terminal.event_id.as_str())
+                }) {
+                    continue;
+                }
+                escalations.push(ledger::event(
+                    "EscalationRaised",
+                    "runtime:orch",
+                    Some(&task.id),
+                    Some(round),
+                    serde_json::json!({
+                        "stage": "review-fallback-authenticated-cancel",
+                        "attemptId": current.attempt_id,
+                        "role": required.role,
+                        "agent": required.agent,
+                        "wakeId": wake_id,
+                        "terminalEventId": terminal.event_id,
+                    }),
+                ));
+            }
+        }
+        Ok(escalations)
+    })
+}
+
+/// Advance every eligible signed formal fallback through the same managed
+/// wake transition used by interactive review requests.
+///
+/// Delivery reconciliation runs first. Each selected fallback is revalidated
+/// under the protocol/capacity/identity locks and appends
+/// `ReviewFallbackSelected + WakeIssued + ReviewRequested` in one effect.
+/// Repeated or concurrent ticks therefore return the already-bound wake and
+/// never create a third reviewer.
+pub fn review_fallback_tick(root: &Path) -> Result<usize> {
+    let round = current_round(root)?;
+    let initial_events = read_round_ledger_events(root, &round)?;
+    let initial_active = crate::plan::require_active_round_ir(root, &round, &initial_events)?;
+    if !initial_active
+        .candidate
+        .tasks
+        .iter()
+        .any(|task| !task.review_fallbacks.is_empty())
+    {
+        return Ok(0);
+    }
+    let _ = reconcile_pending_backend_receipts(root, &round)?;
+    let _ = reconcile_review_transitions(root)?;
+    let _ = append_review_fallback_cancel_escalations(root, &round)?;
+    let _ = append_review_fallback_exhaustions(root, &round)?;
+    let events = read_round_ledger_events(root, &round)?;
+    let active = crate::plan::require_active_round_ir(root, &round, &events)?;
+    let mut candidates = Vec::<(String, ReviewRequest, ReviewFallbackContext)>::new();
+    for task in &active.candidate.tasks {
+        let Some(current) = crate::attempt::current_attempt(&events, &task.id)? else {
+            continue;
+        };
+        if events.iter().any(|event| {
+            (event.kind == "VerdictIssued" && event.task_id.as_deref() == Some(task.id.as_str()))
+                && payload_string(event, "attemptId") == Some(current.attempt_id.as_str())
+                || crate::attempt::event_terminates_attempt(event, &current.attempt_id)
+        }) {
+            continue;
+        }
+        for required in &task.required_reviews {
+            let Some(target) = signed_review_fallback(task, &required.role) else {
+                continue;
+            };
+            if events.iter().any(|event| {
+                event.kind == "ReviewFallbackSelected"
+                    && event.task_id.as_deref() == Some(task.id.as_str())
+                    && payload_string(event, "attemptId") == Some(current.attempt_id.as_str())
+                    && payload_string(event, "role") == Some(required.role.as_str())
+            }) {
+                continue;
+            }
+            let requests = events
+                .iter()
+                .filter(|event| {
+                    event.kind == "ReviewRequested"
+                        && event.actor == "runtime:orch"
+                        && event.round.as_deref() == Some(round.as_str())
+                        && event.task_id.as_deref() == Some(task.id.as_str())
+                        && payload_string(event, "attemptId") == Some(current.attempt_id.as_str())
+                        && payload_string(event, "role") == Some(required.role.as_str())
+                        && payload_string(event, "agent") == Some(required.agent.as_str())
+                })
+                .collect::<Vec<_>>();
+            let [source_request] = requests.as_slice() else {
+                if requests.len() > 1 {
+                    bail!("fallback source ReviewRequested 不唯一");
+                }
+                continue;
+            };
+            let source_wake_id = payload_string(source_request, "wakeId")
+                .filter(|value| !value.is_empty())
+                .context("fallback source ReviewRequested 缺 wakeId")?;
+            let terminals = events
+                .iter()
+                .filter(|event| {
+                    event.round.as_deref() == Some(round.as_str())
+                        && event.task_id.as_deref() == Some(task.id.as_str())
+                        && payload_string(event, "wakeId") == Some(source_wake_id)
+                        && terminal_allows_review_fallback(event)
+                })
+                .collect::<Vec<_>>();
+            let [terminal] = terminals.as_slice() else {
+                if terminals.len() > 1 {
+                    bail!("fallback source ManagedWakeTerminated 不唯一");
+                }
+                continue;
+            };
+            let expectation =
+                review_expectation_from_request_event(&events, &round, source_request)?;
+            let deadline_secs = source_request
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("deadlineSecs"))
+                .and_then(serde_json::Value::as_u64)
+                .context("fallback source ReviewRequested 缺 deadlineSecs")?;
+            candidates.push((
+                target.to_string(),
+                ReviewRequest {
+                    task_id: task.id.clone(),
+                    attempt_id: current.attempt_id.clone(),
+                    role: required.role.clone(),
+                    agent: target.to_string(),
+                    deadline_secs,
+                },
+                ReviewFallbackContext {
+                    from_agent: required.agent.clone(),
+                    source_wake_id: source_wake_id.to_string(),
+                    terminal_event_id: terminal.event_id.clone(),
+                    reviewed_head: expectation.reviewed_head().to_string(),
+                },
+            ));
+        }
+    }
+    let mut spawned = 0usize;
+    for (agent, request, context) in candidates {
+        let text = format!(
+            "orch signed review fallback: task={} attempt={} role={} reviewedHead={}. Complete the injected review contract exactly.",
+            request.task_id, request.attempt_id, request.role, context.reviewed_head
+        );
+        let resolved = ResolvedMessage {
+            bytes: text.len(),
+            text,
+            source: MessageSource::Explicit,
+        };
+        if matches!(
+            run_wake_with_message_mode(
+                root,
+                &agent,
+                resolved,
+                Some(request),
+                true,
+                None,
+                Some(context),
+            )?,
+            WakeRunOutcome::Spawned { .. }
+        ) {
+            spawned += 1;
+        }
+    }
+    Ok(spawned)
 }
 
 /// Explicitly replace one managed OpenCode formal-review wake after its exact
@@ -16443,14 +22583,13 @@ pub fn run_review_wake_reissue_authorized(
     let (binding, request) = match prepared {
         Ok(value) => value,
         Err(error) => {
-            return failure::reject_action_disposition(
+            return reject_wake_action(
                 root,
                 &round,
                 None,
                 "wake-reissue",
                 &preflight_action_id,
                 &format!("{error:#}"),
-                failure::CliDisposition::Rejected,
                 None,
             );
         }
@@ -16489,6 +22628,7 @@ pub fn run_review_wake_reissue_authorized(
         Some(request),
         true,
         Some(source_wake_id),
+        None,
     )?;
     let (successor_wake_id, spawned) = match outcome {
         WakeRunOutcome::Spawned { wake_id } => (wake_id, true),
@@ -16508,6 +22648,7 @@ fn run_wake_with_message_mode(
     review: Option<ReviewRequest>,
     require_active: bool,
     reissue_source_wake_id: Option<&str>,
+    fallback: Option<ReviewFallbackContext>,
 ) -> Result<WakeRunOutcome> {
     let round = current_round(root)?;
     let preflight_wake_id = fresh_uuid();
@@ -16536,6 +22677,7 @@ fn run_wake_with_message_mode(
             review,
             require_active,
             reissue_source_wake_id,
+            fallback,
         )
     });
     match result {
@@ -16561,6 +22703,7 @@ fn run_wake_with_message_mode_effect(
     review: Option<ReviewRequest>,
     require_active: bool,
     reissue_source_wake_id: Option<&str>,
+    fallback: Option<ReviewFallbackContext>,
 ) -> Result<WakeRunOutcome> {
     // The action identity must exist before any rejectable registry/session/budget/provider step.
     // This exact wakeId is used by both WakeIssued and every ActionRejected fallback.
@@ -16575,6 +22718,8 @@ fn run_wake_with_message_mode_effect(
         &wake_id,
         require_active,
         reissue_source_wake_id,
+        fallback,
+        None,
     ) {
         Ok(outcome) => Ok(outcome),
         Err(error) if failure::is_action_rejection(&error) => Err(error),
@@ -16600,6 +22745,8 @@ fn run_wake_with_message_inner(
     wake_id: &str,
     require_active: bool,
     reissue_source_wake_id: Option<&str>,
+    fallback: Option<ReviewFallbackContext>,
+    panel_route_authorization: Option<PanelRouteAuthorizationV1>,
 ) -> Result<WakeRunOutcome> {
     run_wake_with_message_inner_and_append(
         root,
@@ -16610,6 +22757,8 @@ fn run_wake_with_message_inner(
         wake_id,
         require_active,
         reissue_source_wake_id,
+        fallback,
+        panel_route_authorization,
         ledger::append,
     )
 }
@@ -16624,6 +22773,8 @@ fn run_wake_with_message_inner_and_append<F>(
     wake_id: &str,
     require_active: bool,
     reissue_source_wake_id: Option<&str>,
+    fallback: Option<ReviewFallbackContext>,
+    panel_route_authorization: Option<PanelRouteAuthorizationV1>,
     append: F,
 ) -> Result<WakeRunOutcome>
 where
@@ -16640,6 +22791,8 @@ where
                 wake_id,
                 require_active,
                 reissue_source_wake_id,
+                fallback,
+                panel_route_authorization,
                 append,
             )
         })
@@ -16653,6 +22806,8 @@ where
             wake_id,
             require_active,
             reissue_source_wake_id,
+            fallback,
+            panel_route_authorization,
             append,
         )
     }
@@ -16668,6 +22823,8 @@ fn run_wake_with_message_inner_and_append_locked<F>(
     wake_id: &str,
     require_active: bool,
     reissue_source_wake_id: Option<&str>,
+    fallback: Option<ReviewFallbackContext>,
+    panel_route_authorization: Option<PanelRouteAuthorizationV1>,
     append: F,
 ) -> Result<WakeRunOutcome>
 where
@@ -16683,6 +22840,8 @@ where
             wake_id,
             require_active,
             reissue_source_wake_id,
+            fallback,
+            panel_route_authorization,
             append,
         )
     })
@@ -16698,11 +22857,16 @@ fn run_wake_with_message_inner_and_append_identity_locked<F>(
     wake_id: &str,
     require_active: bool,
     reissue_source_wake_id: Option<&str>,
+    fallback: Option<ReviewFallbackContext>,
+    panel_route_authorization: Option<PanelRouteAuthorizationV1>,
     append: F,
 ) -> Result<WakeRunOutcome>
 where
     F: FnOnce(&Path, &str, &[orch_core::EventRecord]) -> Result<()>,
 {
+    if fallback.is_some() && review.is_none() {
+        bail!("review fallback transition 必须携带 exact formal ReviewRequest");
+    }
     let continuation_id = if let Some(request) = review.as_ref() {
         format!(
             "review:{round}:{}:{}:{}:{agent}",
@@ -16784,8 +22948,29 @@ where
     }
     let review_expectation = review
         .as_ref()
-        .map(|request| new_review_expectation(root, round, &fresh_events, request))
+        .map(|request| {
+            new_review_expectation(
+                root,
+                round,
+                &fresh_events,
+                request,
+                fallback.as_ref(),
+                panel_route_authorization.as_ref(),
+            )
+        })
         .transpose()?;
+    if let (Some(request), Some(context)) = (review.as_ref(), fallback.as_ref()) {
+        if reissue_source_wake_id.is_some() {
+            bail!("fallback 与 review reissue 是互斥 transition");
+        }
+        if let Some(existing_wake_id) =
+            validate_review_fallback_transition(root, &fresh_events, round, request, context)?
+        {
+            return Ok(WakeRunOutcome::Idempotent {
+                wake_id: existing_wake_id,
+            });
+        }
+    }
     let active = if provider_bound {
         if reissue_source_wake_id.is_some() {
             active_wakes_from_events_raw(&fresh_events, round, agent)?
@@ -16846,7 +23031,9 @@ where
         }
     }
 
-    let declared_dead_replacement = if reissue_authorization.is_none() {
+    let declared_dead_replacement = if reissue_authorization.is_none()
+        && panel_route_authorization.is_none()
+    {
         review
             .as_ref()
             .map(|request| declared_dead_review_replacement(root, &fresh_events, round, request))
@@ -16855,7 +23042,9 @@ where
     } else {
         None
     };
-    let superseded_wake_id = if let Some(authorization) = reissue_authorization.as_ref() {
+    let superseded_wake_id = if let Some(context) = fallback.as_ref() {
+        Some(context.source_wake_id.clone())
+    } else if let Some(authorization) = reissue_authorization.as_ref() {
         let capacity = wake_capacity_from_events(root, round, &fresh_events, agent)?;
         match reissue_decision(
             &active,
@@ -16879,20 +23068,27 @@ where
             ReissueOutcome::Refused { reason } => bail!("wake reissue refused: {reason}"),
         }
     } else {
-        let fence = if !provider_bound {
-            WakeFenceDecision::Spawn
+        // A committed panel route already carries generation, wakeId, policy
+        // base and (for retry/backfill) the exact source terminal. The legacy
+        // continuation digest is intentionally stable across a role, while a
+        // route message changes by generation; comparing those digests would
+        // reject every lawful gen2 before spawn. Route-level idempotence stays
+        // fenced by the preallocated wakeId under the wake-identity lock.
+        let capacity = if provider_bound && panel_route_authorization.is_none() {
+            wake_capacity_from_events(root, round, &fresh_events, agent)?
         } else {
-            let capacity = wake_capacity_from_events(root, round, &fresh_events, agent)?;
-            wake_fence_decision(
-                &active,
-                agent,
-                &WakeIntent::Continuation(continuation_id.clone()),
-                &request_message_sha256,
-                capacity,
-            )
-            .map(WakeFenceDecision::from)
-            .map_err(anyhow::Error::msg)?
+            1
         };
+        let fence = new_wake_fence_decision(
+            &active,
+            agent,
+            &WakeIntent::Continuation(continuation_id.clone()),
+            &request_message_sha256,
+            capacity,
+            provider_bound,
+            panel_route_authorization.is_some(),
+        )
+        .map_err(anyhow::Error::msg)?;
         if let WakeFenceDecision::Idempotent {
             wake_id: existing_wake_id,
             ..
@@ -16930,13 +23126,19 @@ where
         review_permit_role(role)
     });
     if require_active || required_role.is_some() {
-        validate_wake_permit_with_replacement(
-            root,
-            round,
-            agent,
-            required_role.as_deref(),
-            replacement,
-        )?;
+        if let (Some(authorization), Some(role)) =
+            (panel_route_authorization.as_ref(), required_role.as_deref())
+        {
+            validate_panel_route_wake_permit(root, round, agent, role, authorization)?;
+        } else {
+            validate_wake_permit_with_replacement(
+                root,
+                round,
+                agent,
+                required_role.as_deref(),
+                replacement,
+            )?;
+        }
     }
 
     // Review-site creation is a precondition of the review request, not an
@@ -16966,13 +23168,19 @@ where
     budget::bind_model_wake_reservation(root, &permit, wake_id)?;
 
     if require_active || required_role.is_some() {
-        validate_wake_permit_with_replacement(
-            root,
-            round,
-            agent,
-            required_role.as_deref(),
-            replacement,
-        )?;
+        if let (Some(authorization), Some(role)) =
+            (panel_route_authorization.as_ref(), required_role.as_deref())
+        {
+            validate_panel_route_wake_permit(root, round, agent, role, authorization)?;
+        } else {
+            validate_wake_permit_with_replacement(
+                root,
+                round,
+                agent,
+                required_role.as_deref(),
+                replacement,
+            )?;
+        }
     }
 
     let (resolved, prepared_probe) = match (provisioned.as_ref(), sandbox_scope.as_ref()) {
@@ -16999,6 +23207,11 @@ where
         &resolved.text,
         Some(wake_id),
         review.as_ref().map(|request| request.deadline_secs),
+        Some(&continuation),
+        provisioned.as_ref(),
+        prepared_probe
+            .as_ref()
+            .map(|probe| probe.output_path.as_str()),
     ) {
         Ok(launch) => launch,
         Err(error) => {
@@ -17034,6 +23247,7 @@ where
         "agent": agent,
         "providerKind": launch.provider_kind.map(BackendReceiptKind::as_str),
         "tool": launch.tool,
+        "requestedProvider": launch.requested_provider,
         "requestedModel": launch.requested_model,
         "requestedEffort": launch.requested_effort,
         "quotaDomain": launch.quota_domain,
@@ -17056,9 +23270,41 @@ where
         // B109：富输入来源 + UTF-8 字节数（落账；消费方按需读）
         "messageSource": resolved.source.as_str(),
         "messageBytes": resolved.bytes,
+        "reviewOutputPath": launch.review_output_path,
     });
+    bind_registered_wake_harness_identity(
+        &mut wake_payload,
+        launch.harness_id,
+        launch.terminal_capability,
+        &launch.harness_registry_digest,
+    )?;
+    bind_panel_route_event_identity_v1(
+        &mut wake_payload,
+        panel_route_authorization.as_ref(),
+    );
     if let Some(source_wake_id) = superseded_wake_id.as_deref() {
         wake_payload["supersededWakeId"] = serde_json::json!(source_wake_id);
+    }
+    let fallback_event = fallback.as_ref().map(|context| {
+        ledger::event(
+            "ReviewFallbackSelected",
+            "runtime:orch",
+            continuation.task_id.as_deref(),
+            Some(round),
+            serde_json::json!({
+                "attemptId": review.as_ref().expect("fallback has review request").attempt_id,
+                "role": review.as_ref().expect("fallback has review request").role,
+                "fromAgent": context.from_agent,
+                "toAgent": agent,
+                "reviewedHead": context.reviewed_head,
+                "sourceWakeId": context.source_wake_id,
+                "terminalEventId": context.terminal_event_id,
+                "targetWakeId": wake_id,
+            }),
+        )
+    });
+    if let Some(selection) = fallback_event.as_ref() {
+        wake_payload["reviewFallbackEventId"] = serde_json::json!(selection.event_id);
     }
     let wake_event = ledger::event(
         "WakeIssued",
@@ -17078,7 +23324,19 @@ where
             .and_then(|value| value.as_str()),
         reservation_id.as_deref()
     );
-    let mut events = vec![wake_event];
+    let mut events = Vec::with_capacity(if fallback_event.is_some() { 4 } else { 3 });
+    if let Some(selection) = fallback_event {
+        events.push(selection);
+    }
+    events.push(wake_event);
+    if launch.terminal_capability == Some(crate::harness::CapabilitySource::Absent) {
+        events.push(managed_wake_terminal_absent_event(
+            round,
+            continuation.task_id.as_deref(),
+            wake_id,
+            agent,
+        )?);
+    }
     if let Some(request) = review.as_ref().filter(|request| {
         crate::sites::SiteRole::parse(&request.role)
             .is_ok_and(crate::sites::SiteRole::satisfies_formal_review_slot)
@@ -17095,12 +23353,20 @@ where
         payload["renderedMessageSha256"] = serde_json::json!(rendered_message_sha256);
         payload["providerKind"] =
             serde_json::json!(launch.provider_kind.map(BackendReceiptKind::as_str));
+        payload["requestedProvider"] = serde_json::json!(launch.requested_provider);
         payload["requestSessionId"] = serde_json::json!(launch.request_session_id);
         payload["logPath"] = serde_json::json!(launch.log_path.display().to_string());
         payload["reviewedHead"] = serde_json::json!(review_expectation
             .as_ref()
             .expect("review expectation exists with request")
             .reviewed_head());
+        bind_panel_route_event_identity_v1(payload, panel_route_authorization.as_ref());
+        if let Some(selection) = events
+            .iter()
+            .find(|event| event.kind == "ReviewFallbackSelected")
+        {
+            payload["reviewFallbackEventId"] = serde_json::json!(selection.event_id);
+        }
         events.push(event);
     }
     // A provider was really spawned. From this point an append failure must be
@@ -17128,14 +23394,16 @@ where
                     let captured =
                         capture_probe_window(&launch.log_path, 0).map_err(anyhow::Error::msg)?;
                     let bytes = read_captured_probe_bytes(captured)?;
-                    let expectation = BackendReceiptExpectation::new(
+                    let expectation = backend_receipt_expectation_with_pin(
                         launch.provider_kind.expect("checked provider kind"),
                         wake_id,
                         &continuation_id,
                         &request_message_sha256,
                         launch.request_session_id.as_deref(),
-                    )
-                    .map_err(anyhow::Error::msg)?;
+                        launch.requested_provider.as_deref(),
+                        launch.requested_model.as_deref(),
+                        launch.requested_effort.as_deref(),
+                    )?;
                     Ok(backend_receipt_from_log(&expectation, &bytes, true)
                         .err()
                         .unwrap_or_else(|| "backend receipt timed out".to_string()))
@@ -17156,63 +23424,67 @@ where
         let mut plain_text_consumed = false;
         // Unknown test adapters retain the legacy consumption shim. Every
         // production provider above is gated by its action-scoped receipt.
-        if launch.provider_kind.is_none() {
-            let consumption_failure = if launch.plain_text_review_channel {
-                match await_plain_text_review_consumption(
-                    &launch.log_path,
-                    &probe.output_path,
-                    &probe.expectation,
-                    review_probe_timeout(),
-                ) {
-                    Ok(true) => {
-                        plain_text_consumed = true;
-                        None
-                    }
-                    Ok(false) => Some(format!(
-                        "agy exact review contract was not consumed after {}s",
-                        review_probe_timeout().as_secs()
-                    )),
-                    Err(error) => Some(format!(
-                        "agy exact review consumption probe failed: {error:#}"
-                    )),
+        let consumption_failure = if launch.plain_text_review_channel {
+            let request = review
+                .as_ref()
+                .context("plain-text review consumption 缺 review request")?;
+            let consumption_timeout = plain_text_review_consumption_timeout(request);
+            match await_plain_text_review_consumption(
+                &launch.log_path,
+                &probe.output_path,
+                &probe.expectation,
+                consumption_timeout,
+            ) {
+                Ok(true) => {
+                    plain_text_consumed = true;
+                    None
                 }
-            } else {
-                match await_review_probe(&launch.log_path, probe, review_probe_timeout()) {
-                    Ok(Some(_)) => None,
-                    Ok(None) => Some(format!(
-                        "review structured consumption was not proven after {}s",
-                        review_probe_timeout().as_secs()
-                    )),
-                    Err(error) => Some(format!("review consumption probe failed: {error:#}")),
-                }
-            };
-            if let Some(reason) = consumption_failure {
-                let request = review
-                    .as_ref()
-                    .expect("a prepared review probe always has a review request");
-                ledger::append(
-                    root,
-                    round,
-                    &[ledger::event(
-                        "EscalationRaised",
-                        "runtime:orch",
-                        Some(&request.task_id),
-                        Some(round),
-                        serde_json::json!({
-                            "stage": "review-consumption",
-                            "taskId": request.task_id,
-                            "role": request.role,
-                            "agent": request.agent,
-                            "wakeId": wake_id,
-                            "logPath": launch.log_path.display().to_string(),
-                            "worktree": probe.site.worktree,
-                            "targetDir": probe.site.target_dir,
-                            "reason": reason,
-                        }),
-                    )],
-                )?;
-                bail!("审查注入未消费：注入可能被忙碌会话吞掉，请稍后重试；{reason}");
+                Ok(false) => Some(format!(
+                    "agy exact review contract was not consumed after {}s",
+                    consumption_timeout.as_secs()
+                )),
+                Err(error) => Some(format!(
+                    "agy exact review consumption probe failed: {error:#}"
+                )),
             }
+        } else if launch.provider_kind.is_none() {
+            match await_review_probe(&launch.log_path, probe, review_probe_timeout()) {
+                Ok(Some(_)) => None,
+                Ok(None) => Some(format!(
+                    "review structured consumption was not proven after {}s",
+                    review_probe_timeout().as_secs()
+                )),
+                Err(error) => Some(format!("review consumption probe failed: {error:#}")),
+            }
+        } else {
+            None
+        };
+        if let Some(reason) = consumption_failure {
+            let request = review
+                .as_ref()
+                .expect("a prepared review probe always has a review request");
+            ledger::append(
+                root,
+                round,
+                &[ledger::event(
+                    "EscalationRaised",
+                    "runtime:orch",
+                    Some(&request.task_id),
+                    Some(round),
+                    serde_json::json!({
+                        "stage": "review-consumption",
+                        "taskId": request.task_id,
+                        "role": request.role,
+                        "agent": request.agent,
+                        "wakeId": wake_id,
+                        "logPath": launch.log_path.display().to_string(),
+                        "worktree": probe.site.worktree,
+                        "targetDir": probe.site.target_dir,
+                        "reason": reason,
+                    }),
+                )],
+            )?;
+            bail!("审查注入未消费：注入可能被忙碌会话吞掉，请稍后重试；{reason}");
         }
 
         // The sentinel remains the stronger review-site reachability
@@ -17324,7 +23596,8 @@ fn dispatch_wake_effect(
         .with_context(|| format!("AgentRegistry 未注册 agent: {agent}"))?;
     match spec {
         s if s.injectable && !s.session_id.is_empty() && !no_wake => {
-            let launch = spawn_registered_wake(root, round, agent, message, None, None)?;
+            let launch =
+                spawn_registered_wake(root, round, agent, message, None, None, None, None, None)?;
             println!("✅ 已注入唤醒 {agent}（injectable）");
             Ok(DispatchWakeOutcome {
                 injected: true,
@@ -17462,7 +23735,64 @@ pub(crate) fn dispatch_wake_for_continuation_messages(
     rendered_message: &str,
     no_wake: bool,
 ) -> Result<DispatchWakeOutcome> {
+    dispatch_wake_for_continuation_messages_with_resume(
+        root,
+        agent,
+        round,
+        continuation_id,
+        request_message,
+        rendered_message,
+        no_wake,
+        None,
+    )
+}
+
+/// Deliver one exact `orch resume` implementation wake.  A changed request
+/// digest is allowed only when `scope` binds the current durable
+/// `ResumeWakeLaunching` generation and the former implementation wake has an
+/// accepted receipt plus exact terminal managed-scope proof.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_resume_wake_for_continuation(
+    root: &Path,
+    agent: &str,
+    round: &str,
+    continuation_id: &str,
+    message: &str,
+    action_id: &str,
+    owner: &str,
+    generation: &str,
+) -> Result<DispatchWakeOutcome> {
+    dispatch_wake_for_continuation_messages_with_resume(
+        root,
+        agent,
+        round,
+        continuation_id,
+        message,
+        message,
+        false,
+        Some(resume_dispatch::Scope {
+            action_id,
+            owner,
+            generation,
+        }),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_wake_for_continuation_messages_with_resume(
+    root: &Path,
+    agent: &str,
+    round: &str,
+    continuation_id: &str,
+    request_message: &str,
+    rendered_message: &str,
+    no_wake: bool,
+    resume_scope: Option<resume_dispatch::Scope<'_>>,
+) -> Result<DispatchWakeOutcome> {
     if no_wake {
+        if resume_scope.is_some() {
+            bail!("resume continuation cannot use no-wake mode");
+        }
         return dispatch_wake(root, agent, round, rendered_message, true);
     }
     let identity = parse_continuation_identity(continuation_id).map_err(anyhow::Error::msg)?;
@@ -17476,15 +23806,39 @@ pub(crate) fn dispatch_wake_for_continuation_messages(
             let events = read_round_ledger_events(root, round)?;
             let active = active_wakes_from_events(&events, round, agent)?;
             let capacity = wake_capacity_from_events(root, round, &events, agent)?;
-            let fence = wake_fence_decision(
+            let baseline = wake_fence_decision(
                 &active,
                 agent,
                 &WakeIntent::Continuation(continuation_id.to_string()),
                 &request_message_sha256,
                 capacity,
-            )
-            .map(WakeFenceDecision::from)
-            .map_err(anyhow::Error::msg)?;
+            );
+            let mut resumed_from_wake_id = None;
+            let fence = match (resume_scope, baseline) {
+                (None, result) => result
+                    .map(WakeFenceDecision::from)
+                    .map_err(anyhow::Error::msg)?,
+                (Some(_), Ok(WakeFenceOutcome::Spawn)) => WakeFenceDecision::Spawn,
+                (Some(_), Ok(outcome @ WakeFenceOutcome::Idempotent { .. })) => outcome.into(),
+                (Some(scope), Err(error)) => {
+                    let digest_error =
+                        format!("continuation {continuation_id} request digest changed");
+                    if error != digest_error {
+                        return Err(anyhow::Error::msg(error));
+                    }
+                    resumed_from_wake_id = Some(resume_dispatch::authorize(
+                        &events,
+                        &active,
+                        round,
+                        agent,
+                        continuation_id,
+                        &request_message_sha256,
+                        capacity,
+                        scope,
+                    )?);
+                    WakeFenceDecision::Spawn
+                }
+            };
             if let WakeFenceDecision::Idempotent {
                 wake_id,
                 backend_accepted: _,
@@ -17521,8 +23875,17 @@ pub(crate) fn dispatch_wake_for_continuation_messages(
                 .manual_wake_id
                 .clone()
                 .unwrap_or_else(fresh_managed_wake_id);
-            let launch =
-                spawn_registered_wake(root, round, agent, rendered_message, Some(&wake_id), None)?;
+            let launch = spawn_registered_wake(
+                root,
+                round,
+                agent,
+                rendered_message,
+                Some(&wake_id),
+                None,
+                Some(&identity),
+                None,
+                None,
+            )?;
             let Some(provider_kind) = launch.provider_kind else {
                 // Custom/legacy adapters have no provider-bound grammar. They
                 // retain their former behavior instead of fabricating a receipt.
@@ -17540,6 +23903,51 @@ pub(crate) fn dispatch_wake_for_continuation_messages(
             };
             let rendered_message_sha256 = sha256_hex(rendered_message.as_bytes());
             let probe_end = fs::metadata(&launch.log_path)?.len();
+            let mut wake_payload = serde_json::json!({
+                "wakeId": wake_id,
+                "controlWakeId": launch.wake_id,
+                "runtimeLimit": launch.runtime_limit,
+                "continuationId": continuation_id,
+                "attemptId": identity.attempt_id,
+                "agent": agent,
+                "providerKind": provider_kind.as_str(),
+                "tool": launch.tool,
+                "requestedProvider": launch.requested_provider,
+                "requestedModel": launch.requested_model,
+                "requestedEffort": launch.requested_effort,
+                "quotaDomain": launch.quota_domain,
+                "requestMessageSha256": request_message_sha256,
+                "renderedMessageSha256": rendered_message_sha256,
+                "requestSessionId": launch.request_session_id,
+                "backendState": "pending",
+                "pid": launch.pid,
+                "logPath": launch.log_path.display().to_string(),
+                "probeOffset": 0,
+                "probeEnd": probe_end,
+                "legacyProbeOffset": launch.legacy_offset,
+                "legacyProbe": launch.legacy_probe.as_str(),
+                "method": "typed-runtime",
+            });
+            bind_registered_wake_harness_identity(
+                &mut wake_payload,
+                launch.harness_id,
+                launch.terminal_capability,
+                &launch.harness_registry_digest,
+            )?;
+            debug_assert!(wake_payload.get("harnessId").is_some());
+            debug_assert!(wake_payload.get("terminalCapability").is_some());
+            debug_assert_eq!(
+                wake_payload
+                    .get("harnessRegistryDigest")
+                    .and_then(serde_json::Value::as_str),
+                Some(launch.harness_registry_digest.as_str())
+            );
+            if let (Some(source), Some(scope)) = (resumed_from_wake_id.as_deref(), resume_scope) {
+                wake_payload["resumedFromWakeId"] = serde_json::json!(source);
+                wake_payload["resumeActionId"] = serde_json::json!(scope.action_id);
+                wake_payload["resumeOwner"] = serde_json::json!(scope.owner);
+                wake_payload["resumeLeaseGeneration"] = serde_json::json!(scope.generation);
+            }
             ledger::append(
                 root,
                 round,
@@ -17548,30 +23956,7 @@ pub(crate) fn dispatch_wake_for_continuation_messages(
                     "runtime:orch",
                     identity.task_id.as_deref(),
                     Some(round),
-                    serde_json::json!({
-                        "wakeId": wake_id,
-                        "controlWakeId": launch.wake_id,
-                        "runtimeLimit": launch.runtime_limit,
-                        "continuationId": continuation_id,
-                        "attemptId": identity.attempt_id,
-                        "agent": agent,
-                        "providerKind": provider_kind.as_str(),
-                        "tool": launch.tool,
-                        "requestedModel": launch.requested_model,
-                        "requestedEffort": launch.requested_effort,
-                        "quotaDomain": launch.quota_domain,
-                        "requestMessageSha256": request_message_sha256,
-                        "renderedMessageSha256": rendered_message_sha256,
-                        "requestSessionId": launch.request_session_id,
-                        "backendState": "pending",
-                        "pid": launch.pid,
-                        "logPath": launch.log_path.display().to_string(),
-                        "probeOffset": 0,
-                        "probeEnd": probe_end,
-                        "legacyProbeOffset": launch.legacy_offset,
-                        "legacyProbe": launch.legacy_probe.as_str(),
-                        "method": "typed-runtime",
-                    }),
+                    wake_payload,
                 )],
             )?;
             let started = Instant::now();
@@ -17790,6 +24175,305 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn b307_wake_payload_harness_identity_is_closed_and_descriptor_derived() {
+        let mut payload = serde_json::json!({"wakeId": "wake-b307"});
+        bind_registered_wake_harness_identity(
+            &mut payload,
+            Some(crate::harness::HarnessId::Codex),
+            Some(crate::harness::CapabilitySource::Derived),
+            "registry-digest-b307",
+        )
+        .unwrap();
+        assert_eq!(payload["harnessId"], "codex");
+        assert_eq!(payload["terminalCapability"], "derived");
+        assert_eq!(payload["harnessRegistryDigest"], "registry-digest-b307");
+    }
+
+    fn b303_terminal(outcome: &str, managed: bool) -> orch_core::EventRecord {
+        ledger::event(
+            "ManagedWakeTerminated",
+            "runtime:orch",
+            Some("B303"),
+            Some("r79"),
+            serde_json::json!({
+                "wakeId": "wake-target",
+                "agent": "executor-pi",
+                "outcomeClass": outcome,
+                "managedScopeTerminated": managed,
+            }),
+        )
+    }
+
+    #[test]
+    fn b303_fallback_terminal_requires_managed_non_operational_non_cancel_scope() {
+        assert!(terminal_allows_review_fallback(&b303_terminal(
+            "TruncatedNoTerminal",
+            true
+        )));
+        assert!(!terminal_allows_review_fallback(&b303_terminal(
+            "OperationalError",
+            true
+        )));
+        assert!(!terminal_allows_review_fallback(&b303_terminal(
+            "StoppedByAuthenticatedCancel",
+            true
+        )));
+        assert!(!terminal_allows_review_fallback(&b303_terminal(
+            "TruncatedNoTerminal",
+            false
+        )));
+    }
+
+    #[test]
+    fn b303_fallback_is_artifact_first_for_partial_and_complete_sources() {
+        let root = temp_root("b303-artifact-first");
+        let expectation = crate::verify::ReviewContractExpectation::exact(
+            "B303",
+            "r79",
+            "B303-A0001",
+            "primary",
+            "executor-opencode",
+            &"a".repeat(40),
+        )
+        .unwrap();
+        fallback_artifact_absent(&root, "r79", &expectation).unwrap();
+        let inbox = root.join(
+            review_inbox_relpath("r79", "B303-A0001", "primary", "executor-opencode").unwrap(),
+        );
+        fs::create_dir_all(inbox.parent().unwrap()).unwrap();
+        fs::write(&inbox, "---\ntaskId: B303\n").unwrap();
+        assert!(fallback_artifact_absent(&root, "r79", &expectation).is_err());
+        fs::write(
+            &inbox,
+            format!(
+                "---\ntaskId: B303\nround: r79\nattemptId: B303-A0001\nrole: primary\nreviewer: executor-opencode\nverdict: PASS\nreviewedHead: {}\n---\nsubstantive\n",
+                "a".repeat(40)
+            ),
+        )
+        .unwrap();
+        assert!(fallback_artifact_absent(&root, "r79", &expectation).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn b303_exhausted_fallback_escalates_exactly_once() {
+        let root = temp_root("b303-exhausted-once");
+        fs::create_dir_all(root.join("coordination/rounds/r79")).unwrap();
+        let selection = ledger::event(
+            "ReviewFallbackSelected",
+            "runtime:orch",
+            Some("B303"),
+            Some("r79"),
+            serde_json::json!({
+                "attemptId": "B303-A0001",
+                "role": "primary",
+                "fromAgent": "executor-opencode",
+                "toAgent": "executor-pi",
+                "reviewedHead": "a".repeat(40),
+                "sourceWakeId": "wake-source",
+                "terminalEventId": "terminal-source",
+                "targetWakeId": "wake-target",
+            }),
+        );
+        let terminal = b303_terminal("TruncatedNoTerminal", true);
+        ledger::append(&root, "r79", &[selection, terminal]).unwrap();
+        assert_eq!(append_review_fallback_exhaustions(&root, "r79").unwrap(), 1);
+        assert_eq!(append_review_fallback_exhaustions(&root, "r79").unwrap(), 0);
+        let read =
+            orch_core::read_ledger(&root.join("coordination/rounds/r79/events.jsonl")).unwrap();
+        assert_eq!(
+            read.events
+                .iter()
+                .filter(|event| {
+                    event.kind == "EscalationRaised"
+                        && payload_string(event, "stage") == Some("review-fallback-exhausted")
+                })
+                .count(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // ── D-25 (r78 planner direct fix) ────────────────────────────────────────
+    // Custody admission asked the *receipt-grammar* classifier instead of the
+    // *topology* classifier, so DSH — a registered wrapper that declares
+    // `receipt: absent` — was leased and then refused immediately before spawn
+    // (r77 events 01M0MJMYY94WCSZR0QXYC3B45D / 01M0MJN08...).  These pin the two
+    // halves that must not be re-conflated: every registered stream wrapper is
+    // admitted, and DSH still gets no fabricated backend receipt.
+
+    fn stream_wrapper_argv(script: &str) -> Vec<String> {
+        vec!["sh".to_string(), script.to_string(), "probe".to_string()]
+    }
+
+    #[test]
+    fn d25_custody_admits_every_registered_stream_wrapper() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .unwrap();
+        for (script, expected) in [
+            (PI_STREAM_SCRIPT_REL, crate::harness::HarnessId::Pi),
+            (ZCODE_STREAM_SCRIPT_REL, crate::harness::HarnessId::ZCode),
+            (DSH_STREAM_SCRIPT_REL, crate::harness::HarnessId::Dsh),
+        ] {
+            let argv = stream_wrapper_argv(script);
+            assert_eq!(
+                managed_stream_harness(&argv),
+                Some(expected),
+                "D-25: {script} 必须由 topology classifier 认出"
+            );
+            // The supervisor spec validator additionally requires the declared
+            // wrapper to be a real regular non-symlink file under orch/scripts.
+            let wrapper = root.join(script);
+            let metadata = std::fs::symlink_metadata(&wrapper)
+                .unwrap_or_else(|e| panic!("D-25: {script} 不存在: {e}"));
+            assert!(
+                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                "D-25: {script} 必须是真实常规文件，否则 custody 判据无从成立"
+            );
+            let resolved = resolve_managed_program("/bin/sh", &argv).unwrap_or_else(|e| {
+                panic!("D-25: 已注册 wrapper {script} 仍被 custody 拒绝: {e:#}")
+            });
+            assert_eq!(
+                resolved.file_name().and_then(|name| name.to_str()),
+                Some("sh"),
+                "D-25: managed provider 必须解析到 wrapper shell"
+            );
+        }
+    }
+
+    #[test]
+    fn d25_dsh_still_gets_no_fabricated_backend_receipt() {
+        let argv = stream_wrapper_argv(DSH_STREAM_SCRIPT_REL);
+        assert!(
+            managed_legacy_wrapper_kind(&argv).is_none(),
+            "D-25: DSH 的描述符是 receipt: absent —— 给它编一个 receipt kind \
+             会让手写收据冒充 provider 事实"
+        );
+        assert!(
+            backend_receipt_kind_from_argv(&argv).is_err(),
+            "D-25: 放开 custody 不等于放开 receipt 语法"
+        );
+        for script in [PI_STREAM_SCRIPT_REL, ZCODE_STREAM_SCRIPT_REL] {
+            assert!(
+                managed_legacy_wrapper_kind(&stream_wrapper_argv(script)).is_some(),
+                "D-25: Pi/ZCode 的 receipt 语法不得被本次修改带走"
+            );
+        }
+    }
+
+    // ── D-26 (r78 planner direct fix) ────────────────────────────────────────
+    // Darwin can return `proc_pidpath` length 0 with ENOENT for a process that is
+    // still alive.  The old classifier raised an operational error, the wake
+    // supervisor turned that into a TERM, and a primary reviewer that had already
+    // done most of its work was killed while walking 458 helper processes
+    // (r77/B296, wake 01a02924-4b7e-4962-8e3e-816576bb4406 — the direct cause of
+    // that card being force-abandoned).  The fix must not swing to the opposite
+    // failure of treating ENOENT as proof of life, so these pin both halves.
+
+    #[cfg(target_os = "macos")]
+    fn d26_topology(pid: u32, uid: u32, birth: &str) -> ManagedProcessTopology {
+        ManagedProcessTopology {
+            pid,
+            observed_ppid: 1,
+            pgid: pid,
+            sid: pid,
+            uid,
+            birth_identity: birth.to_string(),
+            zombie: false,
+            executable_hint: "opencode".to_string(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn d26_empty_pidpath_with_enoent_is_ambiguous_not_terminal() {
+        let mut path = [0u8; 8];
+        path[..3].copy_from_slice(b"abc");
+        assert_eq!(
+            classify_darwin_pidpath_read(0, Some(2), &path).unwrap(),
+            DarwinPidPathDisposition::EmptyWithoutEsrch,
+            "D-26: ENOENT 必须交回调用方判别，不能直接当 operational error"
+        );
+        // ESRCH still means gone; every other errno still fails closed.
+        assert_eq!(
+            classify_darwin_pidpath_read(0, Some(3), &path).unwrap(),
+            DarwinPidPathDisposition::Missing
+        );
+        for errno in [0, 1, 13, 22] {
+            assert!(
+                classify_darwin_pidpath_read(0, Some(errno), &path).is_err(),
+                "D-26: 只放开 ENOENT 一个 errno；errno={errno} 必须仍 fail-closed"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn d26_recheck_retries_only_inside_the_same_epoch() {
+        let before = d26_topology(4321, 501, "macos-sec-usec:100:200");
+
+        assert_eq!(
+            darwin_pidpath_recheck_disposition(&before, Some(&before)),
+            DarwinPidPathRecheck::SameEpochRetry,
+            "D-26: 同 pid/同 birth/同 uid ⇒ 同一个活进程，允许再读一次"
+        );
+        assert_eq!(
+            darwin_pidpath_recheck_disposition(&before, None),
+            DarwinPidPathRecheck::Vanished,
+            "D-26: 进程已消失 ⇒ 旧进程缺席，是普通观察不是故障"
+        );
+        for after in [
+            d26_topology(4321, 501, "macos-sec-usec:100:201"),
+            d26_topology(4321, 502, "macos-sec-usec:100:200"),
+            d26_topology(4322, 501, "macos-sec-usec:100:200"),
+        ] {
+            assert_eq!(
+                darwin_pidpath_recheck_disposition(&before, Some(&after)),
+                DarwinPidPathRecheck::Vanished,
+                "D-26: pid 会被复用——birth/uid/pid 任一不同就是另一个 epoch，\
+                 绝不能靠第二次读把死进程读活"
+            );
+        }
+    }
+
+    #[test]
+    fn d25_unregistered_wrapper_is_still_refused_before_spawn() {
+        let argv = stream_wrapper_argv("orch/scripts/wake-not-registered.sh");
+        assert!(
+            managed_stream_harness(&argv).is_none(),
+            "D-25: 未注册脚本不得因为放在 orch/scripts 下就获得 custody"
+        );
+        assert!(
+            resolve_managed_program("/bin/sh", &argv).is_err(),
+            "D-25: 未注册 wrapper 的 /bin/sh 必须在 spawn 前被拒"
+        );
+    }
+
+    #[test]
+    fn b294_manual_handshake_uses_explicit_unscoped_envelope_identities() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .unwrap();
+        let wake_id = "01a026d5-0000-4000-8000-000000000001";
+        let continuation =
+            parse_continuation_identity(&format!("manual:r77:{wake_id}:executor-dsh")).unwrap();
+        let context =
+            harness_invocation_context(root, "r77", wake_id, Some(&continuation), None, None, 120)
+                .unwrap();
+        assert_eq!(context.task_id, "MANUAL");
+        assert_eq!(context.attempt_id, "MANUAL-A0000");
+        assert_eq!(context.role, "implement");
+        assert_eq!(
+            context.fixed_head,
+            crate::gitx::rev_parse(root, "HEAD").unwrap()
+        );
+        assert_eq!(context.review_output_path, crate::harness::NO_REVIEW_OUTPUT);
+    }
 
     #[test]
     fn b260_review_deadline_table_is_monotone_role_aware_and_saturating() {
@@ -18012,6 +24696,7 @@ mod tests {
             observed_session_id: Some(session.to_string()),
             probe_offset: 0,
             probe_end: 246,
+            signed_pin: None,
         };
         backend_receipt_event(
             B246_ROUND,
@@ -19048,6 +25733,175 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn b307_terminal_status(
+        wake_id: &str,
+        token: &str,
+        runtime_limit: ManagedWakeRuntimeLimit,
+    ) -> WakeSupervisorStatus {
+        let containment = production_managed_containment(true);
+        WakeSupervisorStatus {
+            protocol_revision: WAKE_SUPERVISOR_PROTOCOL_REVISION,
+            token: token.to_string(),
+            wake_id: wake_id.to_string(),
+            agent: Some("executor-desktop".to_string()),
+            runtime_limit,
+            completion_reason: ManagedWakeStopReason::NaturalExit,
+            hard_deadline_reached: false,
+            cancel_request_id: None,
+            cancel_reason: None,
+            terminal_seen: true,
+            exited_naturally: true,
+            signals: Vec::new(),
+            containment_capability: containment.capability,
+            containment_claim: containment.claim,
+            managed_scope_terminated: containment.managed_scope_terminated,
+            fork_complete: containment.fork_complete,
+            process_tree_terminated: containment.legacy_process_tree_terminated,
+            owned_helpers: 0,
+            termination_order: Vec::new(),
+            ambiguity: Vec::new(),
+            exit_status: Some(0),
+            error: None,
+            topology_snapshots: 1,
+            full_credential_inspections: 1,
+            log_bytes_read: 0,
+            last_frame_age_secs: None,
+            last_frame_summary: None,
+            elapsed_secs: Some(1),
+        }
+    }
+
+    #[test]
+    fn b307_pending_terminal_reconcile_is_wake_scoped_and_idempotent() {
+        let root = temp_root("b307-terminal-wake-scope");
+        let round = "r307";
+        let runtime_dir = root.join("coordination/runtime");
+        let log_dir = runtime_dir.join("logs");
+        fs::create_dir_all(root.join(format!("coordination/rounds/{round}"))).unwrap();
+        fs::create_dir_all(&log_dir).unwrap();
+        fs::write(
+            root.join(format!("coordination/rounds/{round}/events.jsonl")),
+            "",
+        )
+        .unwrap();
+
+        let target_wake = "019fc307-1111-4222-8333-444455556666";
+        let other_wake = "019fc307-7777-4888-8999-aaaabbbbcccc";
+        let target_token = "30730730730730730730730730730730";
+        let runtime_limit = managed_wake_runtime_limit(Some(1_800));
+        let target_log = log_dir.join("target.jsonl");
+        let other_log = log_dir.join("other.jsonl");
+        fs::write(&target_log, "").unwrap();
+        fs::write(&other_log, "").unwrap();
+
+        let target_status = b307_terminal_status(target_wake, target_token, runtime_limit);
+        let other_status = b307_terminal_status(
+            other_wake,
+            "30730730730730730730730730730731",
+            runtime_limit,
+        );
+        let other_record =
+            crate::harness::classify_terminal_observation(crate::harness::TerminalObservation {
+                capability: crate::harness::CapabilitySource::Derived,
+                exit_code: Some(0),
+                exact_reason: "other wake completed without an answer".to_string(),
+                turn_ended: true,
+                final_text: None,
+                final_text_sha256: None,
+                output_path: None,
+                output_sha256: None,
+                usage: None,
+                usage_absent_reason: Some("fixture has no provider usage".to_string()),
+                managed_scope_terminated: true,
+                activity_seen: false,
+                authenticated_cancel: false,
+            })
+            .unwrap();
+        ledger::append(
+            &root,
+            round,
+            &[
+                ledger::event(
+                    "WakeIssued",
+                    "runtime:orch",
+                    Some("B307"),
+                    Some(round),
+                    serde_json::json!({
+                        "wakeId": target_wake,
+                        "controlWakeId": target_wake,
+                        "agent": "executor-desktop",
+                        "runtimeLimit": runtime_limit,
+                        "terminalCapability": "derived",
+                        "logPath": target_log,
+                    }),
+                ),
+                ledger::event(
+                    "WakeIssued",
+                    "runtime:orch",
+                    Some("B307"),
+                    Some(round),
+                    serde_json::json!({
+                        "wakeId": other_wake,
+                        "controlWakeId": other_wake,
+                        "agent": "executor-desktop",
+                        "runtimeLimit": runtime_limit,
+                        "terminalCapability": "derived",
+                        "logPath": other_log,
+                    }),
+                ),
+                managed_wake_terminated_event_with_record(
+                    round,
+                    Some("B307"),
+                    &other_status,
+                    other_record,
+                ),
+            ],
+        )
+        .unwrap();
+
+        let dir = authenticated_supervisor_dir(&root, true).unwrap();
+        let status_path = dir.join(format!("{target_token}.status.json"));
+        let _control = ManagedWakeControlRuntime::publish(
+            &root,
+            target_wake,
+            target_token,
+            30_701,
+            30_702,
+            &status_path,
+            runtime_limit,
+            Instant::now(),
+            None,
+        )
+        .unwrap();
+        atomic_create_json(&status_path, &target_status).unwrap();
+
+        reconcile_pending_backend_receipts(&root, round).unwrap();
+        reconcile_pending_backend_receipts(&root, round).unwrap();
+        let read =
+            orch_core::read_ledger(&root.join(format!("coordination/rounds/{round}/events.jsonl")))
+                .unwrap();
+        assert!(read.bad_lines.is_empty());
+        let target_terminals = read
+            .events
+            .iter()
+            .filter(|event| {
+                event.kind == "ManagedWakeTerminated"
+                    && payload_string(event, "wakeId") == Some(target_wake)
+            })
+            .count();
+        let other_terminals = read
+            .events
+            .iter()
+            .filter(|event| {
+                event.kind == "ManagedWakeTerminated"
+                    && payload_string(event, "wakeId") == Some(other_wake)
+            })
+            .count();
+        assert_eq!(target_terminals, 1, "target wake must close exactly once");
+        assert_eq!(other_terminals, 1, "peer terminal must remain independent");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn b197_terminal_facts_land_in_the_ledger_exactly_once() {
         let root = temp_root("b197-terminal-ledger-once");
@@ -19161,6 +26015,137 @@ mod tests {
                 "terminal ledger payload must not expose {forbidden}"
             );
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn b295_usage_terminal_reconciles_with_null_absence_reason() {
+        let root = temp_root("b295-usage-terminal-reconcile");
+        let round = "r295";
+        let runtime_dir = root.join("coordination/runtime");
+        let log_dir = runtime_dir.join("logs");
+        fs::create_dir_all(root.join(format!("coordination/rounds/{round}"))).unwrap();
+        fs::create_dir_all(&log_dir).unwrap();
+        fs::write(
+            root.join(format!("coordination/rounds/{round}/events.jsonl")),
+            "",
+        )
+        .unwrap();
+
+        let wake_id = "019fc295-1111-4222-8333-444455556666";
+        let token = "29529529529529529529529529529529";
+        let runtime_limit = managed_wake_runtime_limit(Some(1_800));
+        let log_path = log_dir.join("wake-pi.jsonl");
+        fs::write(
+            &log_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "pi.terminal",
+                    "exactReason": "provider completed with usage",
+                    "finalTextSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "usage": {"inputTokens": 12, "outputTokens": 3},
+                    "usageAbsentReason": null,
+                })
+            ),
+        )
+        .unwrap();
+        ledger::append(
+            &root,
+            round,
+            &[ledger::event(
+                "WakeIssued",
+                "runtime:orch",
+                Some("B295"),
+                Some(round),
+                serde_json::json!({
+                    "wakeId": wake_id,
+                    "controlWakeId": wake_id,
+                    "agent": "executor-pi",
+                    "runtimeLimit": runtime_limit,
+                    "terminalCapability": "derived",
+                    "logPath": log_path,
+                }),
+            )],
+        )
+        .unwrap();
+
+        let dir = authenticated_supervisor_dir(&root, true).unwrap();
+        let status_path = dir.join(format!("{token}.status.json"));
+        let _control = ManagedWakeControlRuntime::publish(
+            &root,
+            wake_id,
+            token,
+            29_501,
+            29_502,
+            &status_path,
+            runtime_limit,
+            Instant::now(),
+            None,
+        )
+        .unwrap();
+        let containment = production_managed_containment(true);
+        atomic_create_json(
+            &status_path,
+            &WakeSupervisorStatus {
+                protocol_revision: WAKE_SUPERVISOR_PROTOCOL_REVISION,
+                token: token.to_string(),
+                wake_id: wake_id.to_string(),
+                agent: Some("executor-pi".to_string()),
+                runtime_limit,
+                completion_reason: ManagedWakeStopReason::NaturalExit,
+                hard_deadline_reached: false,
+                cancel_request_id: None,
+                cancel_reason: None,
+                terminal_seen: true,
+                exited_naturally: true,
+                signals: Vec::new(),
+                containment_capability: containment.capability,
+                containment_claim: containment.claim,
+                managed_scope_terminated: containment.managed_scope_terminated,
+                fork_complete: containment.fork_complete,
+                process_tree_terminated: containment.legacy_process_tree_terminated,
+                owned_helpers: 0,
+                termination_order: Vec::new(),
+                ambiguity: Vec::new(),
+                exit_status: Some(0),
+                error: None,
+                topology_snapshots: 1,
+                full_credential_inspections: 1,
+                log_bytes_read: 1,
+                last_frame_age_secs: None,
+                last_frame_summary: None,
+                elapsed_secs: Some(1),
+            },
+        )
+        .unwrap();
+
+        assert!(reconcile_managed_wake_termination(&root, round, wake_id).unwrap());
+        let read =
+            orch_core::read_ledger(&root.join(format!("coordination/rounds/{round}/events.jsonl")))
+                .unwrap();
+        assert!(read.bad_lines.is_empty());
+        let fact = read
+            .events
+            .iter()
+            .find(|event| {
+                event.kind == "ManagedWakeTerminated"
+                    && payload_string(event, "wakeId") == Some(wake_id)
+            })
+            .unwrap();
+        let payload = fact.payload.as_ref().unwrap();
+        assert_eq!(payload["state"], "answered");
+        assert_eq!(payload["exactReason"], "provider completed with usage");
+        assert_eq!(
+            payload["finalTextSha256"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            payload["usage"],
+            serde_json::json!({"inputTokens": 12, "outputTokens": 3})
+        );
+        assert!(payload["usageAbsentReason"].is_null());
+        assert_eq!(payload["managedScopeTerminated"], true);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -20538,6 +27523,7 @@ mod tests {
             &fresh_managed_wake_id(),
             managed_wake_runtime_limit(None),
             &BTreeMap::new(),
+            None,
         )
         .unwrap();
         let provider =
@@ -20697,6 +27683,7 @@ mod tests {
                 &fresh_managed_wake_id(),
                 managed_wake_runtime_limit(None),
                 &BTreeMap::new(),
+                None,
             );
             let spawn_error = result.as_ref().err().map(|error| format!("{error:#}"));
             let capture = require_test_hook_capture_or_explain(
@@ -26073,6 +33060,10 @@ mod tests {
             verdict: "PASS".to_string(),
             sha256,
             bytes: byte_len,
+            delivery_event_id: None,
+            substituted_role: None,
+            substituted_agent: None,
+            source_terminal_event_id: None,
         }
     }
 
@@ -27899,8 +34890,15 @@ sleep 1
             .any(|event| event.kind == "EscalationRaised"));
 
         let events = read_round_ledger_events(&root, "r53").unwrap();
-        let expectation =
-            new_review_expectation(&root, "r53", &events, &test_review_request()).unwrap();
+        let expectation = new_review_expectation(
+            &root,
+            "r53",
+            &events,
+            &test_review_request(),
+            None,
+            None,
+        )
+        .unwrap();
         let lease_wake_id = events
             .iter()
             .find(|event| event.kind == "WorkspaceLeased")
@@ -28041,6 +35039,9 @@ PY
             .arg("PROMPT_SECRET")
             .env("ORCH_PI_CWD", &root)
             .env("ORCH_PI_TIMEOUT", "30")
+            .env("ORCH_PI_PROVIDER", "deepseek")
+            .env("ORCH_PI_MODEL", "deepseek-v4-pro")
+            .env("ORCH_PI_EFFORT", "max")
             .env("PI_ARGS_CAPTURE", &capture)
             .env("PATH", format!("{}:{inherited_path}", fake_bin.display()))
             .output()
@@ -28139,6 +35140,9 @@ sys.exit(int(os.environ.get("PI_STUB_EXIT", "0")))
             .env("PATH", path)
             .env("ORCH_PI_CWD", &root)
             .env("ORCH_PI_TIMEOUT", "30")
+            .env("ORCH_PI_PROVIDER", "deepseek")
+            .env("ORCH_PI_MODEL", "deepseek-v4-pro")
+            .env("ORCH_PI_EFFORT", "max")
             .env("PI_STUB_OUTPUT", B225_PI_CHALLENGE)
             .env("PI_STUB_SLEEP", "2")
             .stdout(Stdio::piped())
@@ -28177,6 +35181,9 @@ sys.exit(int(os.environ.get("PI_STUB_EXIT", "0")))
             .env("PATH", path)
             .env("ORCH_PI_CWD", &root)
             .env("ORCH_PI_TIMEOUT", "30")
+            .env("ORCH_PI_PROVIDER", "deepseek")
+            .env("ORCH_PI_MODEL", "deepseek-v4-pro")
+            .env("ORCH_PI_EFFORT", "max")
             .env("PI_STUB_OUTPUT", B225_PI_CHALLENGE)
             .env("PI_STUB_EXIT", "23")
             .stdout(Stdio::null())
@@ -28198,6 +35205,9 @@ sys.exit(int(os.environ.get("PI_STUB_EXIT", "0")))
             .env("PATH", path)
             .env("ORCH_PI_CWD", &root)
             .env("ORCH_PI_TIMEOUT", "30")
+            .env("ORCH_PI_PROVIDER", "deepseek")
+            .env("ORCH_PI_MODEL", "deepseek-v4-pro")
+            .env("ORCH_PI_EFFORT", "max")
             .env("PI_STUB_OUTPUT", "X".repeat(200 * 1024))
             .output()
             .unwrap();
@@ -28210,6 +35220,47 @@ sys.exit(int(os.environ.get("PI_STUB_EXIT", "0")))
         assert!(frame.as_bytes().len() <= 64 * 1024);
         let value: serde_json::Value = serde_json::from_str(frame).unwrap();
         assert_eq!(value.get("truncated").and_then(|v| v.as_bool()), Some(true));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zcode_drifted_pin_refuses_before_local_bundle_launch() {
+        let root = temp_root("b283-zcode-drift");
+        let rollout = root.join("rollout");
+        fs::create_dir_all(&rollout).unwrap();
+        let bundle = root.join("b283-drift-provider.cjs");
+        let sentinel = root.join("bundle-started");
+        let config = root.join("config.json");
+        fs::write(
+            &bundle,
+            r#"require("fs").writeFileSync(process.env.B283_ZCODE_SENTINEL, "started");
+console.log(JSON.stringify({sessionId: "b283-drift", response: "ok"}));
+"#,
+        )
+        .unwrap();
+        fs::write(&config, r#"{"provider": {}}"#).unwrap();
+
+        let status = Command::new("/bin/sh")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/wake-zcode-stream.sh"))
+            .arg("synthetic drift check")
+            .env("B283_ZCODE_SENTINEL", &sentinel)
+            .env("ORCH_ZCODE_BIN", &bundle)
+            .env("ORCH_ZCODE_CONFIG", &config)
+            .env("ORCH_ZCODE_ROLLOUT_DIR", &rollout)
+            .env("ORCH_ZCODE_CWD", &root)
+            .env("ORCH_ZCODE_TIMEOUT", "1")
+            .env("ORCH_ZCODE_PROVIDER", "expected-provider")
+            .env("ORCH_ZCODE_MODEL", "expected-model")
+            .env("ORCH_ZCODE_EFFORT", "max")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(67));
+        assert!(
+            !sentinel.exists(),
+            "a mismatched signed pin must refuse before the local bundle starts"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -28313,6 +35364,27 @@ printf '{"type":"tool_result","sessionId":"claw","callId":"read_1","output":"%s"
                     .is_some_and(|stage| matches!(stage, "review-consumption" | "review-probe"))
         }));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agy_plain_text_consumption_keeps_tests_short_while_binding_the_request() {
+        let request = ReviewRequest {
+            task_id: "B304".to_string(),
+            attempt_id: "B304-A0002".to_string(),
+            role: "nongate".to_string(),
+            agent: "executor-antigravity".to_string(),
+            deadline_secs: 6_300,
+        };
+        assert_eq!(
+            plain_text_review_consumption_timeout(&request),
+            review_probe_timeout(),
+            "cfg(test) must retain the bounded five-second fixture budget"
+        );
+        assert_eq!(
+            managed_wake_runtime_limit(Some(request.deadline_secs)).effective_secs,
+            6_300,
+            "production derives the plain-text wait from the signed role deadline"
+        );
     }
 
     #[test]
@@ -28673,6 +35745,8 @@ printf '%s\n' '{"type":"text","text":"probe deliberately skipped"}'
             "00000000-0000-4000-8000-000000000157",
             false,
             None,
+            None,
+            None,
             |_root, _round, events| {
                 assert_eq!(events.len(), 2);
                 assert_eq!(events[0].kind, "WakeIssued");
@@ -29011,6 +36085,20 @@ printf '%s\n' '{"type":"text","text":"probe deliberately skipped"}'
             DurableIdentityKind::WakeLogProxy
         );
         assert!(durable_identity_kind(&strings(&["agy", "-c"])).is_err());
+        assert_eq!(
+            durable_identity_kind(&strings(&[
+                "agy",
+                "-p",
+                "message",
+                "--model",
+                "gemini-3.7-flash-high",
+                "--effort",
+                "high",
+                "--dangerously-skip-permissions",
+            ]))
+            .unwrap(),
+            DurableIdentityKind::ManagedPidGroup
+        );
 
         let root = temp_root("working-heartbeat");
         write_working_heartbeat(&root, "executor-test", 4242, "r48", "B131-A0001").unwrap();
@@ -29737,6 +36825,7 @@ printf '%s\n' '{"type":"text","text":"probe deliberately skipped"}'
             &wake_id,
             managed_wake_runtime_limit(None),
             &BTreeMap::new(),
+            None,
         )
         .unwrap();
         assert!(provider_pid > 0);
@@ -29812,6 +36901,7 @@ printf '%s\n' '{"type":"text","text":"probe deliberately skipped"}'
             &wake_id,
             managed_wake_runtime_limit(Some(1)),
             &BTreeMap::new(),
+            None,
         )
         .unwrap();
         let (dir, descriptor) = read_managed_wake_control_descriptor(&root, &wake_id).unwrap();
@@ -29901,6 +36991,7 @@ printf '%s\n' '{"type":"text","text":"probe deliberately skipped"}'
             &wake_id,
             runtime_limit,
             &BTreeMap::new(),
+            None,
         )
         .unwrap();
         assert!(provider_pid > 0);
@@ -30104,5 +37195,861 @@ printf '%s\n' '{"type":"text","text":"probe deliberately skipped"}'
         std::os::unix::fs::symlink(&target, &path).unwrap();
         assert!(secure_read_lf_frame(&path, &dir, 4096).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn b310_committed_panel_generation_bypasses_only_the_legacy_digest_fence() {
+        let continuation = "review:r81:B306:B306-A0004:secondary:executor-pi";
+        let prior = ActiveWake::new(
+            "executor-pi",
+            continuation,
+            "wake-generation-one",
+            &"a".repeat(64),
+            true,
+            false,
+        )
+        .unwrap();
+        let intent = WakeIntent::continuation(continuation).unwrap();
+        let changed_digest = "b".repeat(64);
+        assert_eq!(
+            new_wake_fence_decision(
+                std::slice::from_ref(&prior),
+                "executor-pi",
+                &intent,
+                &changed_digest,
+                3,
+                true,
+                true,
+            )
+            .unwrap(),
+            WakeFenceDecision::Spawn,
+            "the committed route identity, not a generation-one message digest, authorizes gen2"
+        );
+        let legacy = new_wake_fence_decision(
+            &[prior],
+            "executor-pi",
+            &intent,
+            &changed_digest,
+            3,
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert!(legacy.contains("request digest changed"), "{legacy}");
+    }
+
+    #[test]
+    fn b310_panel_site_reap_waits_for_the_exact_spool_transition() {
+        let route_payload = ledger::ReviewSeatRoutedPayloadV1 {
+            schema_version: 1,
+            panel_id: "panel-spool".to_string(),
+            seat_id: "seat-spool".to_string(),
+            generation: 1,
+            wake_id: "wake-spool".to_string(),
+            attempt_id: "B306-A0005".to_string(),
+            attempt_no: 5,
+            role: "primary".to_string(),
+            agent: "executor-dsh".to_string(),
+            lineage: "primary".to_string(),
+            reviewed_head: "a".repeat(40),
+            policy_base_sha: "b".repeat(40),
+            deadline_secs: 3600,
+            retry_eligible: true,
+            route_kind: "initial".to_string(),
+            selected_event_id: "selected-spool".to_string(),
+            source_seat_id: None,
+            source_generation: None,
+            source_terminal_event_id: None,
+        };
+        let route = ledger::runtime_event_v1(
+            "r81",
+            Some("B306"),
+            ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route_payload.clone()),
+        )
+        .unwrap();
+        assert!(panel_route_awaits_spool_transition_v1(
+            std::slice::from_ref(&route),
+            "wake-spool",
+        )
+        .unwrap());
+
+        let terminal = ledger::runtime_event_v1(
+            "r81",
+            Some("B306"),
+            ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(
+                ledger::ReviewSeatTerminatedPayloadV1 {
+                    schema_version: 1,
+                    panel_id: route_payload.panel_id.clone(),
+                    seat_id: route_payload.seat_id.clone(),
+                    generation: route_payload.generation,
+                    wake_id: route_payload.wake_id.clone(),
+                    attempt_id: route_payload.attempt_id.clone(),
+                    attempt_no: route_payload.attempt_no,
+                    role: route_payload.role.clone(),
+                    agent: route_payload.agent.clone(),
+                    lineage: route_payload.lineage.clone(),
+                    reviewed_head: route_payload.reviewed_head.clone(),
+                    policy_base_sha: route_payload.policy_base_sha.clone(),
+                    state: "pass".to_string(),
+                    terminal_event_id: "managed-spool".to_string(),
+                    delivery_event_id: Some("delivery-spool".to_string()),
+                    reason: "exact spool promoted".to_string(),
+                },
+            ),
+        )
+        .unwrap();
+        assert!(!panel_route_awaits_spool_transition_v1(
+            &[route.clone(), terminal],
+            "wake-spool",
+        )
+        .unwrap());
+        assert!(panel_route_awaits_spool_transition_v1(
+            &[route.clone(), route],
+            "wake-spool",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn b310_panel_wake_recovery_binds_the_committed_route_and_formal_request() {
+        let route_payload = ledger::ReviewSeatRoutedPayloadV1 {
+            schema_version: 1,
+            panel_id: "panel-wake-batch".to_string(),
+            seat_id: "seat-wake-batch".to_string(),
+            generation: 2,
+            wake_id: "wake-wake-batch".to_string(),
+            attempt_id: "B306-A0005".to_string(),
+            attempt_no: 5,
+            role: "primary".to_string(),
+            agent: "executor-dsh".to_string(),
+            lineage: "primary".to_string(),
+            reviewed_head: "a".repeat(40),
+            policy_base_sha: "b".repeat(40),
+            deadline_secs: 3600,
+            retry_eligible: false,
+            route_kind: "retry".to_string(),
+            selected_event_id: "selected-wake-batch".to_string(),
+            source_seat_id: Some("seat-wake-batch".to_string()),
+            source_generation: Some(1),
+            source_terminal_event_id: Some("terminal-generation-one".to_string()),
+        };
+        let route = ledger::runtime_event_v1(
+            "r81",
+            Some("B306"),
+            ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route_payload.clone()),
+        )
+        .unwrap();
+        let authorization = PanelRouteAuthorizationV1 {
+            task_id: "B306".to_string(),
+            selected_event_id: route_payload.selected_event_id.clone(),
+            route_event_id: route.event_id.clone(),
+            route: route_payload.clone(),
+        };
+        let lease = ledger::event(
+            "WorkspaceLeased",
+            "runtime:orch",
+            Some("B306"),
+            Some("r81"),
+            serde_json::json!({
+                "agent": route_payload.agent,
+                "attemptId": route_payload.attempt_id,
+                "generation": route_payload.generation,
+                "reviewedHead": route_payload.reviewed_head,
+                "role": route_payload.role,
+                "siteId": "site-wake-batch",
+                "wakeId": route_payload.wake_id,
+            }),
+        );
+        let mut wake_payload = serde_json::json!({
+            "agent": route_payload.agent,
+            "attemptId": route_payload.attempt_id,
+            "controlWakeId": route_payload.wake_id,
+            "continuationId": "review:r81:B306:B306-A0005:primary:executor-dsh",
+            "wakeId": route_payload.wake_id,
+        });
+        bind_panel_route_event_identity_v1(&mut wake_payload, Some(&authorization));
+        let wake = ledger::event(
+            "WakeIssued",
+            "runtime:orch",
+            Some("B306"),
+            Some("r81"),
+            wake_payload,
+        );
+        let mut request_payload = serde_json::json!({
+            "agent": route_payload.agent,
+            "attemptId": route_payload.attempt_id,
+            "continuationId": "review:r81:B306:B306-A0005:primary:executor-dsh",
+            "role": route_payload.role,
+            "wakeId": route_payload.wake_id,
+        });
+        bind_panel_route_event_identity_v1(&mut request_payload, Some(&authorization));
+        let request = ledger::event(
+            "ReviewRequested",
+            "runtime:orch",
+            Some("B306"),
+            Some("r81"),
+            request_payload,
+        );
+        let committed = vec![route];
+        let suffix = vec![lease, wake, request];
+        assert!(panel_wake_recovery_batch_is_exact_v1(
+            &committed, &suffix, "r81"
+        )
+        .unwrap());
+
+        assert!(!panel_wake_recovery_batch_is_exact_v1(
+            &committed,
+            &suffix[..2],
+            "r81",
+        )
+        .unwrap());
+        let mut wrong_seat = suffix.clone();
+        wrong_seat[2].payload.as_mut().unwrap()["seatId"] = serde_json::json!("other-seat");
+        assert!(!panel_wake_recovery_batch_is_exact_v1(
+            &committed,
+            &wrong_seat,
+            "r81",
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn b310_panel_consumption_timeout_recovery_binds_receipt_route_and_paths() {
+        let route_payload = ledger::ReviewSeatRoutedPayloadV1 {
+            schema_version: 1,
+            panel_id: "panel-consumption".to_string(),
+            seat_id: "seat-consumption".to_string(),
+            generation: 1,
+            wake_id: "wake-consumption".to_string(),
+            attempt_id: "B304-A0001".to_string(),
+            attempt_no: 1,
+            role: "nongate".to_string(),
+            agent: "executor-antigravity".to_string(),
+            lineage: "nongate".to_string(),
+            reviewed_head: "a".repeat(40),
+            policy_base_sha: "b".repeat(40),
+            deadline_secs: 3600,
+            retry_eligible: false,
+            route_kind: "initial".to_string(),
+            selected_event_id: "selected-consumption".to_string(),
+            source_seat_id: None,
+            source_generation: None,
+            source_terminal_event_id: None,
+        };
+        let route = ledger::runtime_event_v1(
+            "r81",
+            Some("B304"),
+            ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route_payload.clone()),
+        )
+        .unwrap();
+        let authorization = PanelRouteAuthorizationV1 {
+            task_id: "B304".to_string(),
+            selected_event_id: route_payload.selected_event_id.clone(),
+            route_event_id: route.event_id.clone(),
+            route: route_payload.clone(),
+        };
+        let lease = ledger::event(
+            "WorkspaceLeased",
+            "runtime:orch",
+            Some("B304"),
+            Some("r81"),
+            serde_json::json!({
+                "agent": route_payload.agent,
+                "attemptId": route_payload.attempt_id,
+                // Site generations are independent from panel-seat generations:
+                // this agent already used g01 in the previous attempt.
+                "generation": 2,
+                "paths": {
+                    "worktree": ".worktrees/review-B304-A0001-nongate-executor-antigravity-g02",
+                    "target": "orch/target/review-B304-A0001-nongate-executor-antigravity-g02"
+                },
+                "reviewedHead": route_payload.reviewed_head,
+                "role": route_payload.role,
+                "siteId": "B304-nongate-executor-antigravity-g02",
+                "wakeId": route_payload.wake_id,
+            }),
+        );
+        let continuation = "review:r81:B304:B304-A0001:nongate:executor-antigravity";
+        let mut wake_payload = serde_json::json!({
+            "agent": route_payload.agent,
+            "attemptId": route_payload.attempt_id,
+            "backendState": "pending",
+            "controlWakeId": route_payload.wake_id,
+            "continuationId": continuation,
+            "logPath": "/repo/logs/agy.jsonl",
+            "probeOffset": 0,
+            "providerKind": "agy",
+            "renderedMessageSha256": "d".repeat(64),
+            "requestMessageSha256": "c".repeat(64),
+            "requestSessionId": null,
+            "requestedProvider": "antigravity",
+            "requestedModel": "gemini-3.7-flash-high",
+            "requestedEffort": "high",
+            "wakeId": route_payload.wake_id,
+        });
+        bind_panel_route_event_identity_v1(&mut wake_payload, Some(&authorization));
+        let wake = ledger::event(
+            "WakeIssued",
+            "runtime:orch",
+            Some("B304"),
+            Some("r81"),
+            wake_payload,
+        );
+        let receipt = ledger::event(
+            "AgentEventReceived",
+            "runtime:orch",
+            Some("B304"),
+            Some("r81"),
+            serde_json::json!({
+                "actionId": route_payload.wake_id,
+                "agent": route_payload.agent,
+                "agentEvent": "wake-backend-receipt",
+                "attemptId": route_payload.attempt_id,
+                "backendState": "accepted",
+                "continuationId": continuation,
+                "logPath": "/repo/logs/agy.jsonl",
+                "observedSessionId": null,
+                "probeEnd": 1,
+                "probeOffset": 0,
+                "providerKind": "agy",
+                "receiptKind": "agy",
+                "renderedMessageSha256": "d".repeat(64),
+                "requestMessageSha256": "c".repeat(64),
+                "requestSessionId": null,
+                "requestedProvider": "antigravity",
+                "requestedModel": "gemini-3.7-flash-high",
+                "requestedEffort": "high",
+                "wakeId": route_payload.wake_id,
+                "windowSha256": "e".repeat(64),
+            }),
+        );
+        let escalation = ledger::event(
+            "EscalationRaised",
+            "runtime:orch",
+            Some("B304"),
+            Some("r81"),
+            serde_json::json!({
+                "stage": "review-consumption",
+                "taskId": "B304",
+                "role": route_payload.role,
+                "agent": route_payload.agent,
+                "wakeId": route_payload.wake_id,
+                "logPath": "/repo/logs/agy.jsonl",
+                "worktree": "/repo/.worktrees/review-B304-A0001-nongate-executor-antigravity-g02",
+                "targetDir": "/repo/orch/target/review-B304-A0001-nongate-executor-antigravity-g02",
+                "reason": "agy exact review contract was not consumed after 300s",
+            }),
+        );
+        let committed = vec![route];
+        let suffix = vec![lease, wake, receipt, escalation];
+        assert!(panel_consumption_timeout_recovery_batch_is_exact_v1(
+            &committed, &suffix, "r81"
+        )
+        .unwrap());
+        assert!(panel_backend_receipt_recovery_batch_is_exact_v1(
+            &committed,
+            &suffix[..3],
+            "r81",
+        )
+        .unwrap());
+
+        let mut terminal = ledger::event(
+            "ManagedWakeTerminated",
+            "runtime:orch",
+            Some("B304"),
+            Some("r81"),
+            serde_json::json!({
+                "agent": "executor-antigravity",
+                "wakeId": "wake-consumption",
+                "managedScopeTerminated": true,
+            }),
+        );
+        terminal.event_id = "terminal-consumption".to_string();
+        let release = ledger::event(
+            "WorkspaceReleased",
+            "runtime:orch",
+            Some("B304"),
+            Some("r81"),
+            serde_json::json!({
+                "agent": "executor-antigravity",
+                "wakeId": "wake-consumption",
+                "attemptId": "B304-A0001",
+                "siteId": "B304-nongate-executor-antigravity-g02",
+                "role": "nongate",
+                "generation": 2,
+                "terminationEventId": "terminal-consumption",
+                "completionReceipt": "runtime:orch/managed-wake-terminated",
+            }),
+        );
+        let mut concatenated = suffix.clone();
+        concatenated.extend([terminal, release]);
+        assert!(panel_accounting_recovery_suffix_is_exact_v1(
+            &committed,
+            &concatenated,
+            "r81",
+        )
+        .unwrap());
+        let mut broken_concatenation = concatenated;
+        broken_concatenation
+            .last_mut()
+            .unwrap()
+            .payload
+            .as_mut()
+            .unwrap()["terminationEventId"] = serde_json::json!("wrong-terminal");
+        assert!(!panel_accounting_recovery_suffix_is_exact_v1(
+            &committed,
+            &broken_concatenation,
+            "r81",
+        )
+        .unwrap());
+
+        let mut extra_key = suffix.clone();
+        extra_key[3].payload.as_mut().unwrap()["extra"] = serde_json::json!(true);
+        assert!(!panel_consumption_timeout_recovery_batch_is_exact_v1(
+            &committed,
+            &extra_key,
+            "r81",
+        )
+        .unwrap());
+        let mut wrong_receipt = suffix;
+        wrong_receipt[2].payload.as_mut().unwrap()["wakeId"] = serde_json::json!("other-wake");
+        assert!(panel_consumption_timeout_recovery_batch_is_exact_v1(
+            &committed,
+            &wrong_receipt,
+            "r81",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn b310_multi_terminal_recovery_requires_exact_adjacent_releases() {
+        let wake = |agent: &str, wake_id: &str| {
+            ledger::event(
+                "WakeIssued",
+                "runtime:orch",
+                Some("B306"),
+                Some("r81"),
+                serde_json::json!({"agent": agent, "wakeId": wake_id}),
+            )
+        };
+        let lease = |agent: &str, wake_id: &str, role: &str, site_id: &str| {
+            ledger::event(
+                "WorkspaceLeased",
+                "runtime:orch",
+                Some("B306"),
+                Some("r81"),
+                serde_json::json!({
+                    "agent": agent,
+                    "wakeId": wake_id,
+                    "attemptId": "B306-A0004",
+                    "siteId": site_id,
+                    "role": role,
+                    "generation": 1,
+                }),
+            )
+        };
+        let terminal = |id: &str, agent: &str, wake_id: &str| {
+            let mut event = ledger::event(
+                "ManagedWakeTerminated",
+                "runtime:orch",
+                Some("B306"),
+                Some("r81"),
+                serde_json::json!({
+                    "agent": agent,
+                    "wakeId": wake_id,
+                    "managedScopeTerminated": true,
+                }),
+            );
+            event.event_id = id.to_string();
+            event
+        };
+        let release = |
+            agent: &str,
+            wake_id: &str,
+            role: &str,
+            site_id: &str,
+            terminal_id: &str,
+        | {
+            ledger::event(
+                "WorkspaceReleased",
+                "runtime:orch",
+                Some("B306"),
+                Some("r81"),
+                serde_json::json!({
+                    "agent": agent,
+                    "wakeId": wake_id,
+                    "attemptId": "B306-A0004",
+                    "siteId": site_id,
+                    "role": role,
+                    "generation": 1,
+                    "terminationEventId": terminal_id,
+                    "completionReceipt": "runtime:orch/managed-wake-terminated",
+                }),
+            )
+        };
+        let committed = vec![
+            wake("executor-desktop", "wake-impl"),
+            wake("executor-pi", "wake-pi"),
+            lease("executor-pi", "wake-pi", "secondary", "site-pi"),
+            wake("executor-antigravity", "wake-agy"),
+            lease(
+                "executor-antigravity",
+                "wake-agy",
+                "nongate",
+                "site-agy",
+            ),
+        ];
+        let suffix = vec![
+            terminal("terminal-impl", "executor-desktop", "wake-impl"),
+            terminal("terminal-pi", "executor-pi", "wake-pi"),
+            release(
+                "executor-pi",
+                "wake-pi",
+                "secondary",
+                "site-pi",
+                "terminal-pi",
+            ),
+            terminal("terminal-agy", "executor-antigravity", "wake-agy"),
+            release(
+                "executor-antigravity",
+                "wake-agy",
+                "nongate",
+                "site-agy",
+                "terminal-agy",
+            ),
+        ];
+        assert!(managed_terminal_recovery_batch_is_exact_v1(
+            &committed, &suffix, "r81"
+        ));
+
+        let mut wrong_link = suffix.clone();
+        wrong_link[2].payload.as_mut().unwrap()["terminationEventId"] =
+            serde_json::json!("wrong-terminal");
+        assert!(!managed_terminal_recovery_batch_is_exact_v1(
+            &committed,
+            &wrong_link,
+            "r81",
+        ));
+        let mut missing_release = suffix.clone();
+        missing_release.remove(2);
+        assert!(!managed_terminal_recovery_batch_is_exact_v1(
+            &committed,
+            &missing_release,
+            "r81",
+        ));
+        let mut duplicate_wake = suffix.clone();
+        duplicate_wake.push(suffix[0].clone());
+        assert!(!managed_terminal_recovery_batch_is_exact_v1(
+            &committed,
+            &duplicate_wake,
+            "r81",
+        ));
+    }
+
+    #[test]
+    fn b310_panel_authorization_is_explicit_and_legacy_wake_is_reservation_only() {
+        let route = ledger::ReviewSeatRoutedPayloadV1 {
+            schema_version: 1,
+            panel_id: "panel-explicit".to_string(),
+            seat_id: "seat-primary".to_string(),
+            generation: 1,
+            wake_id: "wake-primary".to_string(),
+            attempt_id: "B900-A0001".to_string(),
+            attempt_no: 1,
+            role: "primary".to_string(),
+            agent: "executor-dsh".to_string(),
+            lineage: "primary".to_string(),
+            reviewed_head: "a".repeat(40),
+            policy_base_sha: "b".repeat(40),
+            deadline_secs: 3600,
+            retry_eligible: true,
+            route_kind: "initial".to_string(),
+            selected_event_id: "selected-explicit".to_string(),
+            source_seat_id: None,
+            source_generation: None,
+            source_terminal_event_id: None,
+        };
+        let authorization = PanelRouteAuthorizationV1 {
+            task_id: "B900".to_string(),
+            selected_event_id: "selected-explicit".to_string(),
+            route_event_id: "route-explicit".to_string(),
+            route: route.clone(),
+        };
+        let mut bound = serde_json::json!({});
+        bind_panel_route_event_identity_v1(&mut bound, Some(&authorization));
+        assert_eq!(bound["panelId"], route.panel_id);
+        assert_eq!(bound["seatId"], route.seat_id);
+        assert_eq!(bound["generation"], route.generation);
+        assert_eq!(bound["routeEventId"], "route-explicit");
+        assert_eq!(bound["policyBaseSha"], route.policy_base_sha);
+        assert_eq!(bound["reviewedHead"], route.reviewed_head);
+
+        let mut legacy = ledger::event(
+            "WakeIssued",
+            "runtime:orch",
+            Some("B900"),
+            Some("r81"),
+            serde_json::json!({
+                "wakeId": route.wake_id,
+                "controlWakeId": route.wake_id,
+                "attemptId": route.attempt_id,
+                "agent": route.agent,
+                "continuationId": "review:r81:B900:B900-A0001:primary:executor-dsh",
+            }),
+        );
+        assert!(legacy_wake_issued_matches_panel_route_reservation_v1(
+            &legacy, "r81", "B900", &route
+        ));
+        assert!(!wake_issued_matches_panel_route_v1(
+            &legacy,
+            "r81",
+            "B900",
+            "route-explicit",
+            &route,
+        ));
+
+        bind_panel_route_event_identity_v1(
+            legacy.payload.as_mut().unwrap(),
+            Some(&authorization),
+        );
+        assert!(wake_issued_matches_panel_route_v1(
+            &legacy,
+            "r81",
+            "B900",
+            "route-explicit",
+            &route,
+        ));
+        assert!(!legacy_wake_issued_matches_panel_route_reservation_v1(
+            &legacy, "r81", "B900", &route
+        ));
+
+        legacy
+            .payload
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("seatId");
+        assert!(!wake_issued_matches_panel_route_v1(
+            &legacy,
+            "r81",
+            "B900",
+            "route-explicit",
+            &route,
+        ));
+        assert!(!legacy_wake_issued_matches_panel_route_reservation_v1(
+            &legacy, "r81", "B900", &route
+        ));
+
+        let rejection = ledger::event(
+            "ActionRejected",
+            "runtime:orch",
+            Some("B900"),
+            Some("r81"),
+            serde_json::json!({
+                "actionId": route.wake_id,
+                "attemptId": null,
+                "operation": "wake-backend-receipt",
+            }),
+        );
+        assert!(backend_receipt_rejection_matches_panel_wake_v1(
+            &rejection, "r81", "B900", &route
+        ));
+    }
+
+    #[test]
+    fn b310_nongate_receipt_does_not_require_a_formal_review_request() {
+        let digest = "a".repeat(64);
+        let nongate = BackendReceiptLedgerState::new(
+            "wake-nongate",
+            "review:r81:B306:B306-A0004:nongate:executor-antigravity",
+            &digest,
+            1,
+            0,
+            0,
+            false,
+        )
+        .expect("a nongate route is authorized by ReviewSeatRouted, not ReviewRequested");
+        assert_eq!(nongate.review_requested_count, 0);
+
+        assert!(
+            BackendReceiptLedgerState::new(
+                "wake-formal",
+                "review:r81:B306:B306-A0004:secondary:executor-pi",
+                &digest,
+                1,
+                0,
+                0,
+                false,
+            )
+            .is_err(),
+            "formal review receipt reconciliation must still require exactly one ReviewRequested"
+        );
+        assert!(
+            BackendReceiptLedgerState::new(
+                "wake-nongate",
+                "review:r81:B306:B306-A0004:nongate:executor-antigravity",
+                &digest,
+                1,
+                1,
+                0,
+                false,
+            )
+            .is_err(),
+            "a forged formal ReviewRequested must not be accepted for a nongate route"
+        );
+    }
+
+    #[test]
+    fn b310_insufficient_nongate_backfill_cannot_hide_lost_primary_lineage() {
+        let make_route = |
+            seat: &str,
+            generation: u32,
+            role: &str,
+            agent: &str,
+            route_kind: &str,
+            source: Option<(&str, u32, &str)>,
+        | {
+            ledger::runtime_event_v1(
+                "r81",
+                Some("B900"),
+                ledger::RuntimeEventPayloadV1::ReviewSeatRouted(
+                    ledger::ReviewSeatRoutedPayloadV1 {
+                        schema_version: 1,
+                        panel_id: "panel-reachability".to_string(),
+                        seat_id: seat.to_string(),
+                        generation,
+                        wake_id: format!("wake-{seat}-g{generation}"),
+                        attempt_id: "B900-A0001".to_string(),
+                        attempt_no: 1,
+                        role: role.to_string(),
+                        agent: agent.to_string(),
+                        lineage: role.to_string(),
+                        reviewed_head: "a".repeat(40),
+                        policy_base_sha: "b".repeat(40),
+                        deadline_secs: 3600,
+                        retry_eligible: route_kind == "initial",
+                        route_kind: route_kind.to_string(),
+                        selected_event_id: "selected-reachability".to_string(),
+                        source_seat_id: source.map(|value| value.0.to_string()),
+                        source_generation: source.map(|value| value.1),
+                        source_terminal_event_id: source.map(|value| value.2.to_string()),
+                    },
+                ),
+            )
+            .unwrap()
+        };
+        let make_terminal = |route: &orch_core::EventRecord, state: &str, id: &str| {
+            let Some(ledger::RuntimeEventPayloadV1::ReviewSeatRouted(route)) =
+                ledger::decode_runtime_event_v1(route).unwrap()
+            else {
+                unreachable!()
+            };
+            let mut event = ledger::runtime_event_v1(
+                "r81",
+                Some("B900"),
+                ledger::RuntimeEventPayloadV1::ReviewSeatTerminated(
+                    ledger::ReviewSeatTerminatedPayloadV1 {
+                        schema_version: 1,
+                        panel_id: route.panel_id,
+                        seat_id: route.seat_id,
+                        generation: route.generation,
+                        wake_id: route.wake_id,
+                        attempt_id: route.attempt_id,
+                        attempt_no: route.attempt_no,
+                        role: route.role,
+                        agent: route.agent,
+                        lineage: route.lineage,
+                        reviewed_head: route.reviewed_head,
+                        policy_base_sha: route.policy_base_sha,
+                        state: state.to_string(),
+                        terminal_event_id: format!("managed-{id}"),
+                        delivery_event_id: None,
+                        reason: "deterministic invalid terminal".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+            event.event_id = id.to_string();
+            event
+        };
+
+        let oc1 = make_route(
+            "oc",
+            1,
+            "primary",
+            "executor-opencode",
+            "initial",
+            None,
+        );
+        let oc1_terminal = make_terminal(&oc1, "business-invalid", "terminal-oc-g1");
+        let oc2 = make_route(
+            "oc",
+            2,
+            "primary",
+            "executor-opencode",
+            "retry",
+            Some(("oc", 1, "terminal-oc-g1")),
+        );
+        let dsh = make_route(
+            "dsh",
+            1,
+            "primary",
+            "executor-dsh",
+            "initial",
+            None,
+        );
+        let pi = make_route(
+            "pi",
+            1,
+            "secondary",
+            "executor-pi",
+            "initial",
+            None,
+        );
+        let events = vec![
+            oc1,
+            oc1_terminal,
+            oc2.clone(),
+            make_terminal(&oc2, "business-invalid", "terminal-oc-g2"),
+            dsh.clone(),
+            make_terminal(&dsh, "business-invalid", "terminal-dsh"),
+            pi.clone(),
+            make_terminal(&pi, "system-terminal-invalid", "terminal-pi"),
+        ];
+        let candidate = |agent: &str, role: &str, retry_eligible: bool| {
+            crate::plan::ReviewPoolCandidateV1 {
+                agent: agent.to_string(),
+                role: role.to_string(),
+                lineage: role.to_string(),
+                retry_eligible,
+                fallback_for: None,
+            }
+        };
+        let policy = crate::plan::ReviewPoolPolicyV1 {
+            schema_version: 1,
+            owner_task: "B310".to_string(),
+            initial_state: "dormant".to_string(),
+            scope: "round".to_string(),
+            minimum_passes: 2,
+            require_primary_pass: true,
+            initial_seat_count: 3,
+            minimum_gate_eligible: 2,
+            maximum_business_retries: 1,
+            nongate_substitutes_role: "secondary".to_string(),
+            candidates: vec![
+                candidate("executor-opencode", "primary", true),
+                candidate("executor-dsh", "primary", true),
+                candidate("executor-pi", "secondary", true),
+                candidate("executor-antigravity", "nongate", false),
+            ],
+            carry_forward: None,
+        };
+        assert!(!review_panel_future_reachable_v1(
+            &events,
+            "panel-reachability",
+            &policy,
+        )
+        .unwrap());
     }
 }

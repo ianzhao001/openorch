@@ -1117,6 +1117,7 @@ pub fn pending_review_expectations(
     ))
 }
 
+#[cfg(test)]
 fn append_review_delivery_once(
     root: &Path,
     round: &str,
@@ -1185,6 +1186,7 @@ fn append_review_delivery_once(
 /// Observe substantive review files and close their exact durable expectation.
 /// Repeated ticks are idempotent because append_checked replays the current
 /// ledger while holding the ledger lock before it decides to append.
+#[cfg(test)]
 fn review_delivery_tick(root: &Path, round: &str) -> Result<usize> {
     let events = read_current_events(root, round)?;
     let pending = pending_review_expectations_from_events(&events, round, 0);
@@ -1385,8 +1387,10 @@ fn append_monitor_verdict(
     Ok(appended)
 }
 
-/// One independent liveness-monitor sample.  The caller owns the sampling
-/// state, which keeps exact wake-log observations separated per attempt.
+/// Run one independent liveness sample and the shared review reconciler.
+/// The caller-owned sampling state keeps wake-log observations separated per
+/// attempt; the returned count includes both emitted liveness actions and
+/// current-attempt review transitions completed during the same monitor tick.
 pub fn liveness_monitor_tick(root: &Path, state: &mut LivenessMonitorState) -> Result<usize> {
     let lock_path = root.join(AUTO_SUCCESSION_LOCK_REL);
     if let Some(parent) = lock_path.parent() {
@@ -1496,7 +1500,9 @@ pub fn liveness_monitor_tick(root: &Path, state: &mut LivenessMonitorState) -> R
             )?;
         }
     }
-    changed += review_delivery_tick(root, &round)?;
+    // B310: daemon, runloop, CLI reconcile, and deadline processing consume
+    // one current-attempt formal+nongate+panel transition path.
+    changed += crate::wake::reconcile_review_transitions(root)?;
     Ok(changed)
 }
 
@@ -2798,6 +2804,7 @@ fn serve_tick_inner(
     // A provider frame may arrive after the original CLI timed out or crashed.
     // Reconcile that exact WakeIssued action before considering any re-wake.
     crate::wake::reconcile_pending_backend_receipts(root, round)?;
+    let _ = crate::wake::reconcile_review_transitions(root)?;
     if reconcile_planner_turn(root)? {
         let pending_inbox = inbox::list_pending_by_priority(root)?.len();
         return Ok((Vec::new(), pending_inbox));

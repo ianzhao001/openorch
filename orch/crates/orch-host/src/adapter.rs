@@ -8,12 +8,11 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::harness::HarnessId;
 use crate::redact;
 
 use anyhow::{bail, Context, Result};
 use wait_timeout::ChildExt;
-
-const BUILTIN_ADAPTERS: [&str; 6] = ["opencode", "codex", "claude", "cursor", "mimo", "codebuddy"];
 
 pub struct RunResult {
     pub exit_code: i32,
@@ -30,7 +29,11 @@ pub struct RunResult {
 /// All Tier S profiles compiled into orch. The dispatcher below uses this list to decide whether
 /// an adapter is built-in; tests then require every listed name to have a command constructor.
 pub fn supported_builtins() -> Vec<&'static str> {
-    BUILTIN_ADAPTERS.to_vec()
+    HarnessId::ALL
+        .iter()
+        .filter(|id| id.is_consult_builtin())
+        .map(HarnessId::as_str)
+        .collect()
 }
 
 /// 内置 Tier S profile（AdapterSpec 声明式格式的硬编码前身；M1 后续外置）

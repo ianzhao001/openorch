@@ -1,6 +1,17 @@
 #!/bin/sh
 # wake-pi-stream.sh <message> -- executor-pi structured proof projection.
 #
+# Reserved wrapper outcomes. Provider-native non-zero codes are preserved as
+# failed exact reasons and therefore deliberately remain outside this manifest.
+# orch-exit-code: 0 answered exact-terminal
+# orch-exit-code: 3 failed launch-failure
+# orch-exit-code: 64 failed invalid-arguments
+# orch-exit-code: 65 failed invalid-workspace
+# orch-exit-code: 66 failed invalid-envelope
+# orch-exit-code: 70 empty zero-frame-eof
+# orch-exit-code: 71 empty truncated-no-terminal
+# orch-exit-code: 72 timedOut hard-deadline
+#
 # WHY THIS LIVES UNDER orch/ AND NOT coordination/scripts/:
 # this is project-specific glue, but `coordination/**` is a frozen path for
 # executors, so a card can never put a wake wrapper there in its writeSet.
@@ -10,9 +21,9 @@
 # both the writeSet mechanism and the registry.
 #
 # Production launch shape matches the legacy wrapper: pi -p MESSAGE --mode json
-# --provider PROVIDER --model MODEL --thinking max, in ORCH_PI_CWD.  The r70
-# default model is intentionally pinned to deepseek-v4-pro rather than the
-# untouched legacy wrapper's flash fallback; the environment override remains.
+# --provider PROVIDER --model MODEL --thinking EFFORT, in ORCH_PI_CWD. Every
+# value is a signed runtime pin; this wrapper deliberately has no local
+# provider/model fallback.
 # This layer emits only lifecycle markers and completed tool output needed by
 # orch's review-consumption proof. Prompt and assistant message frames are never
 # copied to the wake log.
@@ -20,14 +31,7 @@
 msg="$1"
 [ -n "$msg" ] || { echo "usage: wake-pi-stream.sh <message>  (env: ORCH_PI_CWD, ORCH_PI_TIMEOUT)" >&2; exit 64; }
 
-workdir="$ORCH_PI_CWD"
-if [ -z "$workdir" ]; then
-  gitcommon="$(git rev-parse --path-format=absolute --git-common-dir)" || exit 65
-  workdir="$(dirname "$gitcommon")"
-fi
-[ -d "$workdir" ] || { echo "[wake-pi-stream] ORCH_PI_CWD 不是目录: $workdir" >&2; exit 65; }
-
-MSG="$msg" WORKDIR="$workdir" python3 - <<'PY'
+MSG="$msg" python3 - <<'PY'
 import json
 import os
 import subprocess
@@ -38,6 +42,104 @@ import time
 
 def diag(text):
     print("[wake-pi-stream] " + text, file=sys.stderr, flush=True)
+
+
+ENVELOPE_KEYS = (
+    "ORCH_HARNESS_ID",
+    "ORCH_HARNESS_ACTION_ID",
+    "ORCH_HARNESS_WAKE_ID",
+    "ORCH_HARNESS_ROUND",
+    "ORCH_HARNESS_TASK_ID",
+    "ORCH_HARNESS_ATTEMPT_ID",
+    "ORCH_HARNESS_ROLE",
+    "ORCH_HARNESS_CWD",
+    "ORCH_HARNESS_FIXED_HEAD",
+    "ORCH_HARNESS_PROVIDER",
+    "ORCH_HARNESS_MODEL",
+    "ORCH_HARNESS_EFFORT",
+    "ORCH_HARNESS_PROVIDER_BIN",
+    "ORCH_HARNESS_REVIEW_OUTPUT_PATH",
+    "ORCH_HARNESS_ORCH_BIN",
+    "ORCH_HARNESS_DEADLINE_SECS",
+)
+
+
+def exact_executable(value, key):
+    if not isinstance(value, str) or not os.path.isabs(value):
+        diag("%s 必须是绝对可执行路径: %r" % (key, value))
+        sys.exit(66)
+    resolved = os.path.realpath(value)
+    if not os.path.isfile(resolved) or not os.access(resolved, os.X_OK):
+        diag("%s 不存在或不可执行: %s" % (key, value))
+        sys.exit(66)
+    return resolved
+
+
+def legacy_conflict(alias, envelope_key, selected):
+    legacy = os.environ.get(alias)
+    if legacy is not None and legacy != selected:
+        diag("legacy alias conflict: %s ignored; %s wins" % (alias, envelope_key))
+
+
+present_envelope_keys = [key for key in ENVELOPE_KEYS if key in os.environ]
+if present_envelope_keys:
+    missing = [
+        key
+        for key in ENVELOPE_KEYS
+        if not isinstance(os.environ.get(key), str) or not os.environ[key].strip()
+    ]
+    if missing:
+        diag("incomplete invocation envelope; missing/blank: %s" % ",".join(missing))
+        sys.exit(66)
+    if os.environ["ORCH_HARNESS_ID"] != "pi":
+        diag("ORCH_HARNESS_ID 与 pi wrapper 不匹配")
+        sys.exit(66)
+    workdir = os.environ["ORCH_HARNESS_CWD"]
+    provider = os.environ["ORCH_HARNESS_PROVIDER"]
+    model = os.environ["ORCH_HARNESS_MODEL"]
+    effort = os.environ["ORCH_HARNESS_EFFORT"]
+    provider_bin = exact_executable(
+        os.environ["ORCH_HARNESS_PROVIDER_BIN"], "ORCH_HARNESS_PROVIDER_BIN"
+    )
+    timeout_text = os.environ["ORCH_HARNESS_DEADLINE_SECS"]
+    for alias, envelope_key, selected in (
+        ("ORCH_PI_CWD", "ORCH_HARNESS_CWD", workdir),
+        ("ORCH_PI_PROVIDER", "ORCH_HARNESS_PROVIDER", provider),
+        ("ORCH_PI_MODEL", "ORCH_HARNESS_MODEL", model),
+        ("ORCH_PI_EFFORT", "ORCH_HARNESS_EFFORT", effort),
+        ("ORCH_PI_BIN", "ORCH_HARNESS_PROVIDER_BIN", provider_bin),
+        ("ORCH_PI_TIMEOUT", "ORCH_HARNESS_DEADLINE_SECS", timeout_text),
+    ):
+        legacy_conflict(alias, envelope_key, selected)
+else:
+    workdir = os.environ.get("ORCH_PI_CWD")
+    if not workdir:
+        try:
+            git_common = subprocess.check_output(
+                ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                text=True,
+            ).strip()
+        except Exception as exc:
+            diag("无法解析 legacy 工作目录: %s" % exc)
+            sys.exit(65)
+        workdir = os.path.dirname(git_common)
+    provider = os.environ.get("ORCH_PI_PROVIDER")
+    model = os.environ.get("ORCH_PI_MODEL")
+    effort = os.environ.get("ORCH_PI_EFFORT")
+    provider_bin = os.environ.get("ORCH_PI_BIN") or "pi"
+    timeout_text = os.environ.get("ORCH_PI_TIMEOUT") or "7200"
+
+if not os.path.isdir(workdir):
+    diag("ORCH_HARNESS_CWD/ORCH_PI_CWD 不是目录: %s" % workdir)
+    sys.exit(65)
+try:
+    timeout = float(timeout_text)
+except ValueError:
+    diag("调用 deadline 必须是秒数")
+    sys.exit(64)
+if timeout <= 0:
+    diag("调用 deadline 必须大于 0")
+    sys.exit(64)
 
 
 def bounded_tool_result(text, max_bytes=64 * 1024):
@@ -81,12 +183,16 @@ def completed_text(result):
     return "\n".join(chunks) if chunks else None
 
 
-workdir = os.environ["WORKDIR"]
-timeout = float(os.environ.get("ORCH_PI_TIMEOUT") or 7200)
-provider = os.environ.get("ORCH_PI_PROVIDER") or "deepseek"
-model = os.environ.get("ORCH_PI_MODEL") or "deepseek-v4-pro"
+missing = [
+    label
+    for label, value in (("provider", provider), ("model", model), ("effort", effort))
+    if not isinstance(value, str) or not value.strip() or value != value.strip()
+]
+if missing:
+    diag("缺少或无效的 signed pin (%s)，在启动 pi 前拒绝运行" % ",".join(missing))
+    sys.exit(66)
 argv = [
-    "pi",
+    provider_bin,
     "-p",
     os.environ["MSG"],
     "--mode",
@@ -96,10 +202,10 @@ argv = [
     "--model",
     model,
     "--thinking",
-    "max",
+    effort,
 ]
 
-diag("cwd=%s model=%s timeout=%.0fs" % (workdir, model, timeout))
+diag("cwd=%s provider=%s model=%s effort=%s timeout=%.0fs" % (workdir, provider, model, effort, timeout))
 try:
     proc = subprocess.Popen(
         argv,
@@ -194,7 +300,43 @@ for line in proc.stdout:
     elif kind == "agent_settled":
         with state_lock:
             terminal_seen = True
-        emit_stdout('{"type":"agent_settled"}')
+        # Preserve the B225 review-consumption marker and its established
+        # ordering before appending B283's signed backend facts.
+        emit_stdout(stripped)
+        if session_id:
+            emit_stdout(
+                json.dumps(
+                    {
+                        "type": "pi.session",
+                        "sessionId": session_id,
+                        "provider": provider,
+                        "model": model,
+                        "effort": effort,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+        emit_stdout(
+            json.dumps(
+                {
+                    "type": "pi.terminal",
+                    "sessionId": session_id,
+                    "provider": provider,
+                    "model": model,
+                    "effort": effort,
+                    "exactReason": "agent_settled",
+                    "usage": event.get("usage")
+                    if isinstance(event.get("usage"), dict)
+                    else None,
+                    "usageAbsentReason": None
+                    if isinstance(event.get("usage"), dict)
+                    else "pi agent_settled frame omitted usage",
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
         cause = "terminal"
 
 proc.wait()

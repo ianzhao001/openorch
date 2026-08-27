@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use orch_core::{fold, read_ledger};
 
+use super::wake::{reconcile_review_transitions, review_fallback_tick};
 use crate::{close, ledger, verify};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +179,12 @@ pub fn run_loop(root: &Path, once: bool) -> Result<LoopOutcome> {
 
 fn run_tick(root: &Path) -> Result<LoopOutcome> {
     let round = crate::current_round(root)?;
+    let _nongate_deliveries = reconcile_review_transitions(root)?;
+    // Review fallback is a production transition, not a legacy serve-only
+    // policy hook. Both `orch step` and `orch serve` reach this exact tick;
+    // the wake layer serializes repeated/concurrent ticks and reuses the same
+    // `ReviewFallbackSelected + WakeIssued + ReviewRequested` effect.
+    let review_fallbacks = review_fallback_tick(root)?;
     let ledger_path = root.join(format!("coordination/rounds/{round}/events.jsonl"));
     let ledger = read_ledger(&ledger_path)
         .with_context(|| format!("读取运行循环账本失败: {}", ledger_path.display()))?;
@@ -303,7 +310,7 @@ fn run_tick(root: &Path) -> Result<LoopOutcome> {
         ledger::append(root, &round, &escalation_events)?;
     }
     let (actions, awaiting_root) = next_actions_for_mode(&tasks, &inflight, root_manual);
-    let mut executed = 0;
+    let mut executed = review_fallbacks;
 
     for action in &actions {
         match action {

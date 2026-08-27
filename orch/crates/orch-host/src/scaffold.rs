@@ -360,7 +360,7 @@ commands:
     argv: ["cargo", "test", "--workspace", "--locked"]
     timeoutSeconds: 600
   check:
-    argv: ["cargo", "check", "--workspace", "--locked"]
+    argv: ["cargo", "check", "--workspace", "--all-targets", "--locked"]
     timeoutSeconds: 600
 gates:
   fast: [testFast, check]
@@ -384,7 +384,7 @@ gates:
     argv: ["cargo", "test", "--workspace", "--locked"]
     timeoutSeconds: 600
   rustCheck:
-    argv: ["cargo", "check", "--workspace", "--locked"]
+    argv: ["cargo", "check", "--workspace", "--all-targets", "--locked"]
     timeoutSeconds: 600
   nodeTest:
     argv: ["npx", "vitest", "run"]
@@ -679,9 +679,9 @@ mod tests {
         assert!(proposal
             .yaml
             .contains("argv: [\"cargo\", \"test\", \"--workspace\", \"--locked\"]"));
-        assert!(proposal
-            .yaml
-            .contains("argv: [\"cargo\", \"check\", \"--workspace\", \"--locked\"]"));
+        assert!(proposal.yaml.contains(
+            "argv: [\"cargo\", \"check\", \"--workspace\", \"--all-targets\", \"--locked\"]"
+        ));
         assert!(proposal
             .yaml
             .contains("protectedPaths: [\"coordination/**\"]"));

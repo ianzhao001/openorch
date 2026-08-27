@@ -680,6 +680,77 @@ fn validate_archived_record_chain_for_close(
     }
 }
 
+fn close_active_task_states(
+    events: &[orch_core::EventRecord],
+    round: &str,
+    ir_tasks: &std::collections::BTreeSet<String>,
+    projection: &orch_core::RoundProjection,
+) -> Result<std::collections::BTreeMap<String, Option<TaskState>>> {
+    let validation_position = events
+        .iter()
+        .rposition(|event| event.kind == "TaskValidated" && event.round.as_deref() == Some(round))
+        .context("round close 缺 current TaskValidated")?;
+    let validation_projection = fold(&events[..=validation_position]);
+    let terminal_cleanup = |kind: &str| {
+        matches!(
+            kind,
+            "ManagedWakeTerminated"
+                | "ManagedWakeAttachState"
+                | "WorkspaceReleased"
+                | "SiteRetired"
+                | "CostSampled"
+        )
+    };
+
+    for (task_id, current) in &projection.tasks {
+        if ir_tasks.contains(task_id) {
+            continue;
+        }
+        let signed_out_state = validation_projection
+            .tasks
+            .get(task_id)
+            .and_then(|task| task.state)
+            .with_context(|| {
+                format!("round close ledger extra task {task_id} 在 current validation 前没有状态")
+            })?;
+        if !matches!(
+            signed_out_state,
+            TaskState::Blocked | TaskState::ChangesRequested
+        ) {
+            bail!(
+                "round close ledger extra task {task_id} 未在 current validation 前终态化: {signed_out_state}"
+            );
+        }
+        if let Some(event) = events[validation_position + 1..].iter().find(|event| {
+            event.round.as_deref() == Some(round)
+                && event.task_id.as_deref() == Some(task_id.as_str())
+                && !terminal_cleanup(&event.kind)
+        }) {
+            bail!(
+                "round close ledger extra task {task_id} 在 current validation 后出现非清理事件 {}:{}",
+                event.kind,
+                event.event_id
+            );
+        }
+        if current.state != Some(signed_out_state) {
+            bail!("round close ledger extra task {task_id} 在 current validation 后状态漂移");
+        }
+    }
+
+    ir_tasks
+        .iter()
+        .map(|task_id| {
+            projection
+                .tasks
+                .get(task_id)
+                .map(|task| (task_id.clone(), task.state))
+                .with_context(|| {
+                    format!("round close active IR task {task_id} 缺 ledger projection")
+                })
+        })
+        .collect()
+}
+
 fn run_close_locked(root: &Path, force: bool, note: Option<&str>) -> Result<CloseOutcome> {
     if force && note.is_none_or(|value| value.trim().is_empty()) {
         bail!("round close --force 必须提供非空 note，逐条记录 FORCE-POLICY 五问结论");
@@ -689,6 +760,8 @@ fn run_close_locked(root: &Path, force: bool, note: Option<&str>) -> Result<Clos
     if !lr.bad_lines.is_empty() {
         bail!("round close 拒绝坏账本");
     }
+    crate::ledger::validate_runtime_event_history_v1_at_root(root, &lr.events, &round)
+        .context("round close runtime V1 event contract 非 canonical")?;
     let active = crate::plan::require_active_round_ir(root, &round, &lr.events)?;
     let p = fold(&lr.events);
     if p.round_closed {
@@ -700,26 +773,14 @@ fn run_close_locked(root: &Path, force: bool, note: Option<&str>) -> Result<Clos
         .candidate
         .tasks
         .iter()
-        .map(|task| task.id.as_str())
+        .map(|task| task.id.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    let projected_tasks = p
-        .tasks
-        .keys()
-        .map(String::as_str)
-        .collect::<std::collections::BTreeSet<_>>();
-    if ir_tasks != projected_tasks {
-        bail!("round close 要求 active IR task set 与 ledger task set 精确一致");
-    }
+    let task_states = close_active_task_states(&lr.events, &round, &ir_tasks, &p)?;
     let total = ir_tasks.len();
-    let task_states = p
-        .tasks
-        .iter()
-        .map(|(id, task)| (id.clone(), task.state))
-        .collect::<std::collections::BTreeMap<_, _>>();
     let unrecorded: Vec<String> = p
         .tasks
         .iter()
-        .filter(|(_, t)| t.state != Some(TaskState::Recorded))
+        .filter(|(id, t)| ir_tasks.contains(*id) && t.state != Some(TaskState::Recorded))
         .map(|(id, t)| {
             format!(
                 "{id}({})",
@@ -740,10 +801,19 @@ fn run_close_locked(root: &Path, force: bool, note: Option<&str>) -> Result<Clos
         .filter(|(_, state)| **state == Some(TaskState::Recorded))
         .map(|(task_id, _)| task_id.as_str())
         .collect::<Vec<_>>();
+    let unresolved_panels = crate::ledger::unresolved_review_panels_v1(&lr.events, &round)?;
+    if let Some((panel, task, attempt)) = unresolved_panels.first() {
+        bail!(
+            "round close 拒绝未闭合 review panel（--force 不豁免活审查）: panel={panel} task={task} attempt={attempt}"
+        );
+    }
     for task_id in &recorded_tasks {
         validate_archived_record_chain_for_close(root, &round, task_id, &lr.events)
             .with_context(|| format!("round close task {task_id} archived record chain 非法"))?;
     }
+    let frozen_contract_supersessions_by_initiator =
+        crate::verify::validated_frozen_contract_supersession_counts(root, &round, &lr.events)
+            .context("round close FrozenContractSuperseded effective chain 非法")?;
 
     // Immediately before the first close side effect, re-read the permit and
     // exact terminal task set.  CLI preflight is not a durable host permit.
@@ -751,6 +821,8 @@ fn run_close_locked(root: &Path, force: bool, note: Option<&str>) -> Result<Clos
     if !before_done.bad_lines.is_empty() {
         bail!("写 DONE 前账本出现坏行");
     }
+    crate::ledger::validate_runtime_event_history_v1_at_root(root, &before_done.events, &round)
+        .context("写 DONE 前 runtime V1 event contract 漂移")?;
     let fresh_active = crate::plan::require_active_round_ir(root, &round, &before_done.events)?;
     if fresh_active.persisted_revision != active.persisted_revision
         || fresh_active.persisted_digest != active.persisted_digest
@@ -758,17 +830,26 @@ fn run_close_locked(root: &Path, force: bool, note: Option<&str>) -> Result<Clos
         bail!("写 DONE 前 active IR 漂移");
     }
     let fresh_projection = fold(&before_done.events);
-    let fresh_states = fresh_projection
-        .tasks
-        .iter()
-        .map(|(id, task)| (id.clone(), task.state))
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let fresh_states =
+        close_active_task_states(&before_done.events, &round, &ir_tasks, &fresh_projection)?;
     if fresh_states != task_states {
         bail!("写 DONE 前 task set/state 漂移");
+    }
+    if crate::ledger::unresolved_review_panels_v1(&before_done.events, &round)? != unresolved_panels
+    {
+        bail!("写 DONE 前 review panel closure 漂移");
     }
     for task_id in &recorded_tasks {
         validate_archived_record_chain_for_close(root, &round, task_id, &before_done.events)
             .with_context(|| format!("写 DONE 前 task {task_id} archived record chain 非法"))?;
+    }
+    let fresh_frozen_counts = crate::verify::validated_frozen_contract_supersession_counts(
+        root,
+        &round,
+        &before_done.events,
+    )?;
+    if fresh_frozen_counts != frozen_contract_supersessions_by_initiator {
+        bail!("写 DONE 前 FrozenContractSuperseded effective counts 漂移");
     }
 
     // 步骤 2：轮终信号 DONE.md（design/03 §4.2 步骤 8 + O4 小结落盘路径；已在=崩溃窗恢复，跳过重写）
@@ -787,13 +868,20 @@ fn run_close_locked(root: &Path, force: bool, note: Option<&str>) -> Result<Clos
     }
 
     // 步骤 3：落账（动作成功后写真值——E8；finalMain 存全 SHA）
+    let frozen_contract_supersession_count = frozen_contract_supersessions_by_initiator
+        .values()
+        .sum::<u64>();
     let close_payload = serde_json::json!({
         "finalMain": final_main,
         "note": note.unwrap_or(""),
         "unrecorded": unrecorded,
-        "forced": force
+        "forced": force,
+        "frozenContractSupersessionsByInitiator": frozen_contract_supersessions_by_initiator.clone(),
+        "frozenContractSupersessionCount": frozen_contract_supersession_count
     });
     ledger::append_checked(root, &round, |events| {
+        crate::ledger::validate_runtime_event_history_v1_at_root(root, events, &round)
+            .context("RoundClosed append 前 runtime V1 event contract 漂移")?;
         let current = crate::plan::require_active_round_ir(root, &round, events)?;
         if current.persisted_revision != active.persisted_revision
             || current.persisted_digest != active.persisted_digest
@@ -802,18 +890,22 @@ fn run_close_locked(root: &Path, force: bool, note: Option<&str>) -> Result<Clos
             bail!("RoundClosed append 前 active IR/main 漂移");
         }
         let projection = fold(events);
-        let current_states = projection
-            .tasks
-            .iter()
-            .map(|(id, task)| (id.clone(), task.state))
-            .collect::<std::collections::BTreeMap<_, _>>();
+        let current_states = close_active_task_states(events, &round, &ir_tasks, &projection)?;
         if current_states != task_states {
             bail!("RoundClosed append 前 task set/state 漂移");
+        }
+        if crate::ledger::unresolved_review_panels_v1(events, &round)? != unresolved_panels {
+            bail!("RoundClosed append 前 review panel closure 漂移");
         }
         for task_id in &recorded_tasks {
             validate_archived_record_chain_for_close(root, &round, task_id, events).with_context(
                 || format!("RoundClosed append 前 task {task_id} archived record chain 非法"),
             )?;
+        }
+        let current_frozen_counts =
+            crate::verify::validated_frozen_contract_supersession_counts(root, &round, events)?;
+        if current_frozen_counts != frozen_contract_supersessions_by_initiator {
+            bail!("RoundClosed append 前 FrozenContractSuperseded effective counts 漂移");
         }
         if projection.round_closed {
             return Ok(Vec::new());
@@ -915,5 +1007,76 @@ mod tests {
             &validations
         ));
         assert!(!archived_binding_ok(1, &new_digest, &validations));
+    }
+
+    fn close_event(kind: &str, task_id: Option<&str>) -> orch_core::EventRecord {
+        let payload = match kind {
+            "DispatchIssued" => serde_json::json!({
+                "agent": "executor-desktop",
+                "attemptId": format!("{}-A0001", task_id.unwrap()),
+                "attemptNo": 1,
+                "baseSha": "a".repeat(40)
+            }),
+            "AttemptBlocked" => serde_json::json!({
+                "agent": "executor-desktop",
+                "attemptId": format!("{}-A0001", task_id.unwrap()),
+                "attemptNo": 1
+            }),
+            _ => serde_json::json!({}),
+        };
+        ledger::event(kind, "runtime:orch", task_id, Some("r-close"), payload)
+    }
+
+    fn replacement_events(post_validation_kind: Option<&str>) -> Vec<orch_core::EventRecord> {
+        let mut events = vec![
+            close_event("DispatchIssued", Some("B-old")),
+            close_event("AttemptBlocked", Some("B-old")),
+            close_event("TaskPlanned", Some("B-new")),
+            close_event("TaskValidated", None),
+        ];
+        if let Some(kind) = post_validation_kind {
+            events.push(close_event(kind, Some("B-old")));
+        }
+        events
+    }
+
+    #[test]
+    fn close_accepts_only_terminal_signed_out_replacements() {
+        let events = replacement_events(Some("ManagedWakeTerminated"));
+        let projection = fold(&events);
+        let active = std::collections::BTreeSet::from(["B-new".to_string()]);
+        let states = close_active_task_states(&events, "r-close", &active, &projection).unwrap();
+        assert_eq!(states.len(), 1);
+        assert!(states.contains_key("B-new"));
+        assert!(!states.contains_key("B-old"));
+    }
+
+    #[test]
+    fn close_rejects_a_signed_out_task_that_runs_again() {
+        let events = replacement_events(Some("DispatchIssued"));
+        let projection = fold(&events);
+        let active = std::collections::BTreeSet::from(["B-new".to_string()]);
+        let error = close_active_task_states(&events, "r-close", &active, &projection)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("非清理事件 DispatchIssued"), "{error}");
+    }
+
+    #[test]
+    fn close_rejects_a_nonterminal_ledger_extra() {
+        let events = vec![
+            close_event("DispatchIssued", Some("B-old")),
+            close_event("TaskPlanned", Some("B-new")),
+            close_event("TaskValidated", None),
+        ];
+        let projection = fold(&events);
+        let active = std::collections::BTreeSet::from(["B-new".to_string()]);
+        let error = close_active_task_states(&events, "r-close", &active, &projection)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("未在 current validation 前终态化"),
+            "{error}"
+        );
     }
 }

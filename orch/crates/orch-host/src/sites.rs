@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use orch_core::EventRecord;
@@ -1191,8 +1192,102 @@ fn quarantine_entries(
 
 enum ReapOne {
     Removed,
+    AlreadyComplete,
     Refused(String),
     TargetFailed(String),
+}
+
+fn reclaim_boundary_bytes(worktree: &Path, target: &Path) -> Result<u64> {
+    let paths = if target.starts_with(worktree) {
+        vec![worktree]
+    } else if worktree.starts_with(target) {
+        vec![target]
+    } else {
+        vec![worktree, target]
+    };
+    paths.into_iter().try_fold(0_u64, |total, path| {
+        let bytes = match fs::symlink_metadata(path) {
+            Ok(_) => crate::buildcache::apparent_tree_bytes(path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("测量 site 回收边界失败: {}", path.display()))
+            }
+        };
+        Ok(total.saturating_add(bytes))
+    })
+}
+
+fn add_measured_reclaim_delta(
+    worktree: &Path,
+    target: &Path,
+    bytes_before: u64,
+    freed_bytes: &mut u64,
+) -> Result<()> {
+    let bytes_after = reclaim_boundary_bytes(worktree, target)?;
+    *freed_bytes = freed_bytes.saturating_add(bytes_before.saturating_sub(bytes_after));
+    Ok(())
+}
+
+fn prune_released_registry_batch(
+    root: &Path,
+    events: &[EventRecord],
+    released: &[Site],
+) -> Result<()> {
+    let registry = gitx::worktree_registry(root)?;
+    let prunable = registry
+        .iter()
+        .filter(|entry| entry.prunable)
+        .map(|entry| entry.path.clone())
+        .collect::<BTreeSet<_>>();
+    if prunable.len() < 2 {
+        return Ok(());
+    }
+
+    let active_paths = active_sites(events)
+        .into_iter()
+        .map(|site| site.worktree)
+        .collect::<BTreeSet<_>>();
+    let mut eligible = BTreeSet::new();
+    for site in released {
+        if !site.has_production_path_contract() || active_paths.contains(&site.worktree) {
+            continue;
+        }
+        let worktree = no_symlink_ancestors(root, &site.worktree)?;
+        let _target = no_symlink_ancestors(root, &site.target)?;
+        if !worktree.exists() {
+            eligible.insert(worktree);
+        }
+    }
+    if !prunable.is_subset(&eligible) {
+        // Git exposes only a global prune operation.  Leave the registry
+        // untouched unless every candidate belongs to this exact released set;
+        // reap_one will surface the per-site refusal and the invariant stays red.
+        return Ok(());
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["worktree", "prune", "--expire", "now"])
+        .output()
+        .context("启动 exact released worktree registry prune 失败")?;
+    if !output.status.success() {
+        bail!(
+            "exact released worktree registry prune 失败({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let remaining = gitx::worktree_registry(root)?
+        .into_iter()
+        .filter(|entry| prunable.contains(&entry.path))
+        .map(|entry| entry.path)
+        .collect::<Vec<_>>();
+    if !remaining.is_empty() {
+        bail!("released registry batch prune 后仍有注册项: {remaining:?}");
+    }
+    Ok(())
 }
 
 fn reap_one(
@@ -1242,9 +1337,19 @@ fn reap_one(
         note: None,
     });
     if journal.phase == "complete" {
-        return Ok(ReapOne::Removed);
+        let still_registered = gitx::worktree_registry(root)?
+            .iter()
+            .any(|entry| entry.path == worktree);
+        if worktree.exists() || target.exists() || still_registered {
+            bail!(
+                "complete site cleanup journal 与物理/registry 状态冲突: {}",
+                site.site_id
+            );
+        }
+        return Ok(ReapOne::AlreadyComplete);
     }
     write_journal(root, round, &journal)?;
+    let bytes_before = reclaim_boundary_bytes(&worktree, &target)?;
 
     if worktree.exists() {
         if site.role != SiteRole::Implement {
@@ -1280,33 +1385,35 @@ fn reap_one(
                 )))
             }
         }
-        let worktree_bytes = crate::buildcache::apparent_tree_bytes(&worktree).unwrap_or(0);
         if let Err(error) = gitx::worktree_remove(root, &worktree) {
+            add_measured_reclaim_delta(&worktree, &target, bytes_before, freed_bytes)?;
             journal.note = Some(format!("worktree remove failed: {error:#}"));
             write_journal(root, round, &journal)?;
             return Ok(ReapOne::Refused(
                 "worktree remove 失败；按契约不触碰 target".to_string(),
             ));
         }
-        *freed_bytes = freed_bytes.saturating_add(worktree_bytes);
     }
-    gitx::worktree_prune_exact(root, &worktree)?;
+    if let Err(error) = gitx::worktree_prune_exact(root, &worktree) {
+        add_measured_reclaim_delta(&worktree, &target, bytes_before, freed_bytes)?;
+        return Err(error);
+    }
     journal.phase = "worktree-removed".to_string();
-    write_journal(root, round, &journal)?;
+    if let Err(error) = write_journal(root, round, &journal) {
+        add_measured_reclaim_delta(&worktree, &target, bytes_before, freed_bytes)?;
+        return Err(error);
+    }
 
     let target_failure = if target.exists() {
-        let target_bytes = crate::buildcache::apparent_tree_bytes(&target).unwrap_or(0);
         match crate::util::remove_dir_all_with_enotempty_retry(&target) {
-            Ok(()) => {
-                *freed_bytes = freed_bytes.saturating_add(target_bytes);
-                None
-            }
+            Ok(()) => None,
             Err(error) => Some(format!("target remove failed: {error}")),
         }
     } else {
         None
     };
     if let Some(note) = target_failure {
+        add_measured_reclaim_delta(&worktree, &target, bytes_before, freed_bytes)?;
         journal.phase = "target-remove-failed".to_string();
         journal.note = Some(note.clone());
         write_journal(root, round, &journal)?;
@@ -1314,7 +1421,11 @@ fn reap_one(
     }
     journal.phase = "complete".to_string();
     journal.note = None;
-    write_journal(root, round, &journal)?;
+    if let Err(error) = write_journal(root, round, &journal) {
+        add_measured_reclaim_delta(&worktree, &target, bytes_before, freed_bytes)?;
+        return Err(error);
+    }
+    add_measured_reclaim_delta(&worktree, &target, bytes_before, freed_bytes)?;
     Ok(ReapOne::Removed)
 }
 
@@ -1450,7 +1561,9 @@ where
     ledger::append_checked(root, round, |events| {
         before_reap()?;
         let mut escalations = Vec::new();
-        for site in reclaimable_sites(events) {
+        let released = reclaimable_sites(events);
+        prune_released_registry_batch(root, events, &released)?;
+        for site in released {
             // A second fold at the point of use makes the destructive arm
             // explicit.  A newly appended generation cannot enter this locked
             // region until the current decision and deletion have completed.
@@ -1465,6 +1578,7 @@ where
             outcome.freed_bytes = outcome.freed_bytes.saturating_add(freed_bytes);
             match result {
                 Ok(ReapOne::Removed) => outcome.removed.push(site.site_id.clone()),
+                Ok(ReapOne::AlreadyComplete) => {}
                 Ok(ReapOne::Refused(reason)) => {
                     outcome.refused.push(format!("{}: {reason}", site.site_id));
                     outcome

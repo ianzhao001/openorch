@@ -158,6 +158,72 @@ pub fn merge_base(root: &Path, a: &str, b: &str) -> Result<String> {
     run_str(root, &["merge-base", a, b])
 }
 
+/// Materialize Git's recursive merge result as an unreferenced tree object.
+///
+/// A conflict or malformed object id is a hard error; callers must not run a
+/// final gate against a partially merged index or guess at the first parent.
+pub(crate) fn write_merge_tree(root: &Path, main_sha: &str, candidate_sha: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["merge-tree", "--write-tree", main_sha, candidate_sha])
+        .output()
+        .context("git merge-tree --write-tree 启动失败")?;
+    if !output.status.success() {
+        bail!(
+            "synthetic merge-tree 冲突或失败({}): stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8(output.stdout).context("merge-tree stdout 非 UTF-8")?;
+    let tree = stdout
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|value| {
+            value.len() == 40
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .context("merge-tree 未返回 canonical full tree SHA")?
+        .to_string();
+    if rev_parse(root, &format!("{tree}^{{tree}}"))? != tree {
+        bail!("merge-tree 返回对象不是 exact tree");
+    }
+    Ok(tree)
+}
+
+/// Wrap an already computed tree in an unreferenced two-parent commit so a
+/// clean detached worktree can execute gates without moving any branch ref.
+pub(crate) fn commit_synthetic_merge_tree(
+    root: &Path,
+    tree_sha: &str,
+    main_sha: &str,
+    candidate_sha: &str,
+    message: &str,
+) -> Result<String> {
+    let commit = run_str(
+        root,
+        &[
+            "commit-tree",
+            tree_sha,
+            "-p",
+            main_sha,
+            "-p",
+            candidate_sha,
+            "-m",
+            message,
+        ],
+    )?;
+    if rev_parse(root, &format!("{commit}^{{tree}}"))? != tree_sha {
+        bail!("synthetic merge commit tree 漂移");
+    }
+    Ok(commit)
+}
+
 /// Return whether `ancestor` is an ancestor of (or equal to) `descendant`.
 ///
 /// Unlike [`run`], exit status 1 is a normal negative answer for

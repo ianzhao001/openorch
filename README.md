@@ -6,7 +6,7 @@ OpenOrch 是一个由 Git 驱动的多智能体协作运行时。命令行程序
 
 > 当前版本：`0.1.0` alpha
 >
-> 当前预发布：[`v0.1.0-alpha.1`](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.1)
+> 当前预发布：[`v0.1.0-alpha.2`](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.2)
 
 ---
 
@@ -32,7 +32,7 @@ OpenOrch 在本地 Git 项目中组织多个 AI 编程智能体，把计划、�
 
 ### 预发布状态
 
-`v0.1.0-alpha.1` 是产品快照，不是稳定版。
+`v0.1.0-alpha.2` 是产品快照，不是稳定版。
 
 - `orch --version` 输出 `orch 0.1.0`
 - CLI、配置格式和事件结构仍可能变化
@@ -45,7 +45,7 @@ OpenOrch 在本地 Git 项目中组织多个 AI 编程智能体，把计划、�
 
 - Apple Silicon macOS
 - 架构：`aarch64` / `arm64`
-- 产物：`openorch-v0.1.0-alpha.1-aarch64-apple-darwin.tar.gz`
+- 产物：`openorch-v0.1.0-alpha.2-aarch64-apple-darwin.tar.gz`
 
 Intel Mac、Linux 和 Windows 没有本次预编译产物，也不在本次发布的已验证支持范围内。
 
@@ -56,8 +56,8 @@ Intel Mac、Linux 和 Windows 没有本次预编译产物，也不在本次发�
 在一个新目录中下载归档及其校验文件：
 
 ```sh
-release=v0.1.0-alpha.1
-archive=openorch-v0.1.0-alpha.1-aarch64-apple-darwin.tar.gz
+release=v0.1.0-alpha.2
+archive=openorch-v0.1.0-alpha.2-aarch64-apple-darwin.tar.gz
 base=https://github.com/ianzhao001/openorch/releases/download/$release
 
 curl -fLO "$base/$archive"
@@ -90,7 +90,7 @@ codesign -dv --verbose=4 ./orch
 ```sh
 git clone https://github.com/ianzhao001/openorch.git
 cd openorch
-git checkout v0.1.0-alpha.1
+git checkout v0.1.0-alpha.2
 
 cargo build --release --locked \
   --manifest-path orch/Cargo.toml \
@@ -212,7 +212,7 @@ It is not an AI model or a hosted service. OpenOrch invokes locally available ag
 
 ### Prerelease status
 
-`v0.1.0-alpha.1` is a product snapshot, not a stable release.
+`v0.1.0-alpha.2` is a product snapshot, not a stable release.
 
 - `orch --version` reports `orch 0.1.0`
 - CLI behavior, configuration formats, and event structures may still change
@@ -225,7 +225,7 @@ This Release provides one prebuilt artifact:
 
 - Apple Silicon macOS
 - Architecture: `aarch64` / `arm64`
-- Artifact: `openorch-v0.1.0-alpha.1-aarch64-apple-darwin.tar.gz`
+- Artifact: `openorch-v0.1.0-alpha.2-aarch64-apple-darwin.tar.gz`
 
 Intel macOS, Linux, and Windows binaries are not provided or claimed as validated for this release.
 
@@ -236,8 +236,8 @@ The binary is **ad-hoc signed**. It is not signed with an Apple Developer ID and
 Download the archive and checksum file into a new directory:
 
 ```sh
-release=v0.1.0-alpha.1
-archive=openorch-v0.1.0-alpha.1-aarch64-apple-darwin.tar.gz
+release=v0.1.0-alpha.2
+archive=openorch-v0.1.0-alpha.2-aarch64-apple-darwin.tar.gz
 base=https://github.com/ianzhao001/openorch/releases/download/$release
 
 curl -fLO "$base/$archive"
@@ -270,7 +270,7 @@ Git, Rust, and Cargo are required. This snapshot was verified with Rust/Cargo 1.
 ```sh
 git clone https://github.com/ianzhao001/openorch.git
 cd openorch
-git checkout v0.1.0-alpha.1
+git checkout v0.1.0-alpha.2
 
 cargo build --release --locked \
   --manifest-path orch/Cargo.toml \

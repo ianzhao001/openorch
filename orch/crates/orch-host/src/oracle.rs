@@ -8,12 +8,31 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
-use orch_core::read_ledger;
+use orch_core::{read_ledger, EventRecord};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::{binding, card, gate, gitx, ledger};
 
+const GATE_EXECUTED_SCHEMA: (&str, &[&str]) = (
+    "GateExecuted",
+    &[
+        "commandRef",
+        "phase",
+        "gateRunId",
+        "exitCode",
+        "durationMs",
+        "subjectTreeSha",
+        "logSha256",
+        "logBytes",
+        "toolchainDigest",
+        "environmentDigest",
+    ],
+);
 /// vitest 汇总行计数（`Tests  5 failed | 33 passed (38)` / `Tests  43 passed (43)`）
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SuiteCounts {
@@ -187,6 +206,1764 @@ pub(crate) fn read_bound_seed_bytes(root: &Path, source: &str) -> Result<Vec<u8>
     read_checked_seed(&canonical_root, &relative, source).map(|(bytes, _)| bytes)
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_full_commit_oid(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Prove that two texts differ by exactly one canonical SHA-256 literal.
+///
+/// The accepted window is an exactly quoted, 64-byte lowercase hexadecimal
+/// string at the same byte offset in both inputs.  Bytes outside that window
+/// must be identical.  Enumerating literal windows instead of counting changed
+/// nibbles matters because two distinct hashes may share positions.
+pub fn single_hash_literal_swap(before: &str, after: &str) -> Option<(String, String)> {
+    let before = before.as_bytes();
+    let after = after.as_bytes();
+    if before.len() != after.len() || before == after || before.len() < 66 {
+        return None;
+    }
+
+    let mut accepted = None;
+    for start in 1..=before.len().saturating_sub(65) {
+        let end = start + 64;
+        if before[start - 1] != b'"'
+            || before.get(end) != Some(&b'"')
+            || after[start - 1] != b'"'
+            || after.get(end) != Some(&b'"')
+        {
+            continue;
+        }
+        let old = std::str::from_utf8(&before[start..end]).ok()?;
+        let new = std::str::from_utf8(&after[start..end]).ok()?;
+        if !is_canonical_sha256(old)
+            || !is_canonical_sha256(new)
+            || old == new
+            || before[..start] != after[..start]
+            || before[end..] != after[end..]
+        {
+            continue;
+        }
+        if accepted.is_some() {
+            return None;
+        }
+        accepted = Some((old.to_string(), new.to_string()));
+    }
+    accepted
+}
+
+/// Check the four authorization anchors for a frozen-contract supersession.
+///
+/// This is deliberately a pure authorization primitive.  The caller remains
+/// responsible for sourcing the actor/TaskRecorded/original relocation facts
+/// from the durable ledger and for emitting any lifecycle event.
+pub fn frozen_contract_supersession_authorized(
+    actor: &str,
+    superseding_task_recorded: bool,
+    original_seed_relocated_sha256: Option<&str>,
+    declared_old_sha256: &str,
+    current_landed_sha256: &str,
+) -> std::result::Result<(), String> {
+    if actor != "runtime:orch" {
+        return Err("frozen-contract supersession 只允许 actor=runtime:orch".to_string());
+    }
+    if !superseding_task_recorded {
+        return Err("替代合同尚无 TaskRecorded，拒绝 supersession".to_string());
+    }
+    frozen_contract_anchor_digests_match(
+        original_seed_relocated_sha256,
+        declared_old_sha256,
+        current_landed_sha256,
+    )
+}
+
+fn frozen_contract_anchor_digests_match(
+    original_seed_relocated_sha256: Option<&str>,
+    declared_old_sha256: &str,
+    current_landed_sha256: &str,
+) -> std::result::Result<(), String> {
+    if !is_canonical_sha256(declared_old_sha256) || !is_canonical_sha256(current_landed_sha256) {
+        return Err("supersession 摘要必须是规范的小写 SHA-256".to_string());
+    }
+    let original = original_seed_relocated_sha256
+        .ok_or_else(|| "缺少原始 SeedRelocated.sha256 锚点".to_string())?;
+    if !is_canonical_sha256(original) {
+        return Err("原始 SeedRelocated.sha256 不是规范的小写 SHA-256".to_string());
+    }
+    if declared_old_sha256 != current_landed_sha256 {
+        return Err("declared old 摘要与当前落位字节不一致".to_string());
+    }
+    if declared_old_sha256 != original {
+        return Err("declared old 摘要与原始 SeedRelocated.sha256 不一致".to_string());
+    }
+    Ok(())
+}
+
+fn current_landed_digest(canonical_root: &Path, target: &str) -> Result<Option<String>> {
+    let relative = canonical_repo_relative(target, "landed target")?;
+    inspect_target_path(canonical_root, &relative, target)?;
+    match fs::symlink_metadata(canonical_root.join(&relative)) {
+        Ok(_) => {
+            let (bytes, _) = read_checked_seed(canonical_root, &relative, target)?;
+            Ok(Some(sha256_hex(&bytes)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("读取 landed seed target 失败: {target}")),
+    }
+}
+
+fn tree_landed_digest(root: &Path, treeish: &str, target: &str) -> Result<Option<String>> {
+    if !gitx::tree_path_exists(root, treeish, target)? {
+        return Ok(None);
+    }
+    gitx::show_bytes(root, treeish, target).map(|bytes| Some(sha256_hex(&bytes)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BaselineManifest {
+    schema_version: u32,
+    baseline_tree_sha: String,
+    scope: BaselineScope,
+    counts: BaselineCounts,
+    excluded_unrecorded_missing_targets: Vec<String>,
+    targets: Vec<BaselineTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BaselineScope {
+    declared_pair_audit_through: String,
+    effective_baseline_through: String,
+    selection: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BaselineCounts {
+    declared_pairs_through_r70: usize,
+    drifted_declared_pairs_through_r70: usize,
+    missing_declared_pairs_through_r70: usize,
+    unique_effective_targets_through_b269: usize,
+    present_effective_targets: usize,
+    effective_tombstones: usize,
+    excluded_unrecorded_missing_targets: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BaselineTarget {
+    target: String,
+    state: String,
+    effective_sha256: Option<String>,
+    effective_anchor: BaselineAnchor,
+    grandfathered_drift: bool,
+    sources: Vec<BaselineSource>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BaselineAnchor {
+    kind: String,
+    #[serde(default)]
+    event_id: Option<String>,
+    #[serde(default)]
+    baseline_tree_sha: Option<String>,
+    #[serde(default)]
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BaselineSource {
+    round: String,
+    task_id: String,
+    card_path: String,
+    seed_src: String,
+    declared_sha256: String,
+    source_sha256: String,
+    source_matches_declared: bool,
+    drifted_from_source: bool,
+    seed_relocated: Vec<BaselineRelocation>,
+    task_recorded_event_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BaselineRelocation {
+    event_id: String,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SeedRelocatedPayload {
+    cmp: String,
+    sha256: String,
+    target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LandedAnchor {
+    digest: Option<String>,
+    effective: card::FrozenEffectiveAnchor,
+    original_event_id: String,
+    original_sha256: String,
+    grandfathered_drift: bool,
+}
+
+fn round_ledger_sort_key(path: &str) -> (u64, &str) {
+    let round = path
+        .strip_prefix("coordination/rounds/r")
+        .and_then(|tail| tail.split('/').next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    (round, path)
+}
+
+/// Read ledger events from one immutable tree, preserving line order inside
+/// every ledger.  Cross-ledger order is numeric round order, never timestamp
+/// or event-id order (both are presentation data, not canonical sequencing).
+fn committed_tree_events(root: &Path, tree_oid: &str) -> Result<Vec<EventRecord>> {
+    if !is_full_commit_oid(tree_oid) {
+        bail!("ledger census 需要完整 commit OID: {tree_oid:?}");
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-tree",
+            "-r",
+            "--full-tree",
+            "--name-only",
+            "-z",
+            tree_oid,
+            "--",
+            "coordination/rounds",
+        ])
+        .output()
+        .context("git ls-tree landed-seed ledgers 启动失败")?;
+    if !output.status.success() {
+        bail!(
+            "git ls-tree landed-seed ledgers 失败({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut paths = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|bytes| !bytes.is_empty())
+        .map(|bytes| std::str::from_utf8(bytes).map(str::to_owned))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("ledger tree 含非 UTF-8 路径")?;
+    paths.retain(|path| path.ends_with("/events.jsonl"));
+    paths.sort_by(|left, right| round_ledger_sort_key(left).cmp(&round_ledger_sort_key(right)));
+
+    let mut events = Vec::new();
+    for path in paths {
+        let bytes = gitx::show_bytes(root, tree_oid, &path)?;
+        let text = std::str::from_utf8(&bytes)
+            .with_context(|| format!("committed ledger 非 UTF-8: {path}"))?;
+        for (index, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            events.push(
+                serde_json::from_str::<EventRecord>(line)
+                    .with_context(|| format!("committed ledger 坏行: {path}:{}", index + 1))?,
+            );
+        }
+    }
+    Ok(events)
+}
+
+fn event_by_id<'a>(events: &'a [EventRecord], event_id: &str) -> Result<&'a EventRecord> {
+    let mut matches = events.iter().filter(|event| event.event_id == event_id);
+    let event = matches
+        .next()
+        .with_context(|| format!("landed baseline 引用不存在的 eventId: {event_id}"))?;
+    if matches.next().is_some() {
+        bail!("landed baseline eventId 非全局唯一: {event_id}");
+    }
+    Ok(event)
+}
+
+fn unique_event_position(events: &[EventRecord], event_id: &str) -> Result<usize> {
+    let positions = events
+        .iter()
+        .enumerate()
+        .filter_map(|(position, event)| (event.event_id == event_id).then_some(position))
+        .collect::<Vec<_>>();
+    match positions.as_slice() {
+        [position] => Ok(*position),
+        [] => bail!("landed baseline 引用不存在的 eventId: {event_id}"),
+        _ => bail!("landed baseline eventId 非全局唯一: {event_id}"),
+    }
+}
+
+fn seed_oracle_precedes(
+    events: &[EventRecord],
+    position: usize,
+    round: &str,
+    task_id: &str,
+    target: &str,
+    digest: &str,
+) -> bool {
+    events[..position].iter().rev().any(|event| {
+        event.kind == "SeedOracleVerified"
+            && event.round.as_deref() == Some(round)
+            && event.task_id.as_deref() == Some(task_id)
+            && event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("seeds"))
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|seeds| {
+                    seeds.iter().any(|seed| {
+                        seed.get("target").and_then(serde_json::Value::as_str) == Some(target)
+                            && seed.get("sha256").and_then(serde_json::Value::as_str)
+                                == Some(digest)
+                    })
+                })
+    })
+}
+
+/// Reconstruct the active, user-signed ROUND-IR from one immutable main tree.
+///
+/// This deliberately does not use `require_active_round_ir`: that helper reads
+/// live worktree files and would recurse through seed validation.  The landed
+/// guard must bind the exact main object captured by `mech::check` instead.
+fn exact_main_signed_ir_with_binding_policy(
+    root: &Path,
+    main_oid: &str,
+    binding_bytes: &[u8],
+    events: &[EventRecord],
+    require_current_binding_match: bool,
+) -> Result<(String, crate::plan::RoundIr)> {
+    // CURRENT-ROUND is runtime state and intentionally not committed.  In an
+    // immutable tree, the highest numeric ROUND-IR is the durable active-round
+    // projection; its production validation/sign-off below is the authority.
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-tree",
+            "-r",
+            "--full-tree",
+            "--name-only",
+            main_oid,
+            "--",
+            "coordination/rounds",
+        ])
+        .output()
+        .context("git ls-tree exact-main ROUND-IR 启动失败")?;
+    if !output.status.success() {
+        bail!(
+            "git ls-tree exact-main ROUND-IR 失败({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let round = String::from_utf8(output.stdout)
+        .context("exact-main ROUND-IR 路径非 UTF-8")?
+        .lines()
+        .filter_map(|path| {
+            path.strip_prefix("coordination/rounds/r")
+                .and_then(|tail| tail.strip_suffix("/ROUND-IR.yaml"))
+                .and_then(|number| number.parse::<u64>().ok())
+                .map(|number| (number, format!("r{number}")))
+        })
+        .max_by_key(|(number, _)| *number)
+        .map(|(_, round)| round)
+        .context("精确 main 缺 signed ROUND-IR")?;
+    let ir_rel = format!("coordination/rounds/{round}/ROUND-IR.yaml");
+    let ir_bytes = gitx::show_bytes(root, main_oid, &ir_rel)
+        .with_context(|| format!("从精确 main 读取 signed ROUND-IR 失败: {ir_rel}"))?;
+    let ir_text = std::str::from_utf8(&ir_bytes).context("精确 main ROUND-IR 非 UTF-8")?;
+    let ir = crate::plan::parse_signed_round_ir(ir_text).map_err(anyhow::Error::msg)?;
+    if ir.round != round {
+        bail!(
+            "精确 main ROUND-IR round={} 与 CURRENT-ROUND {round} 不一致",
+            ir.round
+        );
+    }
+    let digest = crate::plan::validation_digest(&ir);
+
+    let mut high_water: Option<(u32, String)> = None;
+    for event in events.iter().filter(|event| {
+        event.kind == "TaskValidated"
+            && event.actor == "runtime:orch"
+            && event.task_id.is_none()
+            && event.round.as_deref() == Some(round.as_str())
+    }) {
+        let payload = crate::plan::decode_runtime_task_validated(event, &round)?;
+        if let Some((revision, prior_digest)) = &high_water {
+            if payload.ir_revision < *revision
+                || (payload.ir_revision == *revision && payload.validation_digest != *prior_digest)
+            {
+                bail!("精确 main TaskValidated high-water 非单调或同 revision 分叉");
+            }
+        }
+        high_water = Some((payload.ir_revision, payload.validation_digest));
+    }
+    if high_water.as_ref() != Some(&(ir.revision, digest.clone())) {
+        bail!(
+            "精确 main ROUND-IR 不是最高 production TaskValidated: ir=({}, {}) high={high_water:?}",
+            ir.revision,
+            digest
+        );
+    }
+    if crate::plan::matching_user_plan_signoff_position(events, &round, ir.revision, &digest)?
+        .is_none()
+    {
+        bail!("精确 main ROUND-IR 缺 matching user PlanSignedOff");
+    }
+    if require_current_binding_match
+        && ir.source_bindings.binding_sha256 != sha256_hex(binding_bytes)
+    {
+        bail!("精确 main PROJECT-BINDING bytes 未绑定 signed ROUND-IR");
+    }
+    Ok((round, ir))
+}
+
+fn exact_main_signed_ir(
+    root: &Path,
+    main_oid: &str,
+    binding_bytes: &[u8],
+    events: &[EventRecord],
+) -> Result<(String, crate::plan::RoundIr)> {
+    exact_main_signed_ir_with_binding_policy(root, main_oid, binding_bytes, events, true)
+}
+
+/// Find the ancestor version of one path whose complete bytes match a digest
+/// already carried by a signed ROUND-IR.  This is used only while authorizing
+/// the *next* plan: unrelated planner-owned binding edits are not signed yet,
+/// but the immutable landed-seed descriptor still has to come from signed
+/// history rather than from the mutable worktree.
+fn ancestor_path_bytes_by_sha256(
+    root: &Path,
+    main_oid: &str,
+    path: &str,
+    expected_sha256: &str,
+) -> Result<Vec<u8>> {
+    if !is_canonical_sha256(expected_sha256) {
+        bail!("signed historical path digest 非 canonical SHA-256");
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-list", main_oid, "--", path])
+        .output()
+        .context("git rev-list historical binding 启动失败")?;
+    if !output.status.success() {
+        bail!(
+            "git rev-list historical binding 失败({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    for commit in String::from_utf8(output.stdout)
+        .context("historical binding rev-list 非 UTF-8")?
+        .lines()
+    {
+        let bytes = gitx::show_bytes(root, commit, path)
+            .with_context(|| format!("读取 historical binding 失败: {commit}:{path}"))?;
+        if sha256_hex(&bytes) == expected_sha256 {
+            return Ok(bytes);
+        }
+    }
+    bail!("找不到 signed ROUND-IR 绑定的 historical PROJECT-BINDING bytes")
+}
+
+fn validate_pending_binding_baseline_descriptor(
+    current: &binding::LandedSeedBaselineDescriptor,
+    signed_binding_bytes: &[u8],
+) -> Result<()> {
+    let signed = binding::parse_binding_bytes(signed_binding_bytes).map_err(anyhow::Error::msg)?;
+    if signed.oracle.landed_seed_baseline.as_ref() != Some(current) {
+        bail!("首次 plan 前 landedSeedBaseline descriptor 漂移；必须先由既有签名授权")
+    }
+    Ok(())
+}
+
+fn round_ordinal(round: &str) -> Option<u64> {
+    let number = round.strip_prefix('r')?;
+    if number.is_empty()
+        || number.starts_with('0')
+        || !number.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    number.parse().ok()
+}
+
+/// The only unsigned-binding window admitted by landed census is the first
+/// plan of the immediately following round: `RoundOpened` is durable, but no
+/// `TaskValidated` exists yet because this very command is producing it.
+fn validate_first_plan_pending_round(events: &[EventRecord], signed_round: &str) -> Result<String> {
+    let signed = round_ordinal(signed_round).context("signed ROUND-IR round 非 canonical")?;
+    let mut pending = BTreeSet::new();
+    for event in events {
+        let Some(round) = event.round.as_deref() else {
+            continue;
+        };
+        let Some(number) = round_ordinal(round) else {
+            continue;
+        };
+        if number <= signed {
+            continue;
+        }
+        if event.kind == "RoundOpened"
+            && event.actor == "runtime:orch"
+            && event.task_id.is_none()
+        {
+            pending.insert(round.to_string());
+        }
+    }
+    let expected = format!("r{}", signed + 1);
+    if pending.len() != 1 || !pending.contains(&expected) {
+        bail!(
+            "精确 main PROJECT-BINDING bytes 未绑定 signed ROUND-IR；unsigned binding 只允许紧邻 signed round 的首次 plan 窗口"
+        )
+    }
+    if events.iter().any(|event| {
+        event.round.as_deref() == Some(expected.as_str()) && event.kind == "TaskValidated"
+    }) {
+        bail!(
+            "精确 main PROJECT-BINDING bytes 未绑定 signed ROUND-IR；pending round 已有 TaskValidated"
+        )
+    }
+    Ok(expected)
+}
+
+#[cfg(test)]
+mod pending_binding_baseline_tests {
+    use super::*;
+
+    fn descriptor() -> binding::LandedSeedBaselineDescriptor {
+        binding::LandedSeedBaselineDescriptor {
+            schema_version: 1,
+            path: "coordination/frozen-contract-baseline-v1.json".to_string(),
+            sha256: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn unrelated_pending_binding_fields_keep_the_signed_baseline_authority() {
+        let bytes = br#"
+oracle:
+  landedSeedBaseline:
+    schemaVersion: 1
+    path: coordination/frozen-contract-baseline-v1.json
+    sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+runtimePolicies:
+  ignoredByOldBinary: true
+"#;
+        validate_pending_binding_baseline_descriptor(&descriptor(), bytes).unwrap();
+    }
+
+    #[test]
+    fn a_pending_baseline_descriptor_change_is_still_rejected() {
+        let bytes = br#"
+oracle:
+  landedSeedBaseline:
+    schemaVersion: 1
+    path: coordination/other.json
+    sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+"#;
+        assert!(validate_pending_binding_baseline_descriptor(&descriptor(), bytes).is_err());
+    }
+
+    #[test]
+    fn unsigned_binding_is_only_admitted_during_the_next_rounds_first_plan() {
+        let opened = ledger::event(
+            "RoundOpened",
+            "runtime:orch",
+            None,
+            Some("r81"),
+            serde_json::json!({"purpose": "fixture"}),
+        );
+        assert_eq!(
+            validate_first_plan_pending_round(&[opened.clone()], "r80").unwrap(),
+            "r81"
+        );
+        assert!(validate_first_plan_pending_round(&[], "r80").is_err());
+        let validated = ledger::event(
+            "TaskValidated",
+            "runtime:orch",
+            None,
+            Some("r81"),
+            serde_json::json!({"irRevision": 1, "validationDigest": "a".repeat(64)}),
+        );
+        assert!(validate_first_plan_pending_round(&[opened, validated], "r80").is_err());
+    }
+}
+
+/// Load the exact-main task card whenever a caller presents a supersession.
+/// Returning the parsed committed card lets the whole mechanical check consume
+/// signed write-set/seed/gate data instead of trusting a caller-built `Card`.
+pub(crate) fn load_exact_main_signed_card(
+    root: &Path,
+    supplied: &card::Card,
+    main_oid: &str,
+) -> Result<Option<card::Card>> {
+    if supplied.meta.frozen_contract_supersessions.is_empty() {
+        return Ok(None);
+    }
+    let round = supplied
+        .meta
+        .round
+        .as_deref()
+        .context("supersession card 缺 round")?;
+    let task_id = supplied.meta.task_id.as_str();
+    card::validate_task_id(task_id)?;
+    let card_rel = format!("coordination/rounds/{round}/tasks/{task_id}.md");
+    if supplied.rel_path != card_rel {
+        bail!(
+            "supersession caller card path 未绑定 canonical task path: {}",
+            supplied.rel_path
+        );
+    }
+
+    let binding_rel = "coordination/PROJECT-BINDING.yaml";
+    let binding_bytes = gitx::show_bytes(root, main_oid, binding_rel)
+        .context("从精确 main 读取 PROJECT-BINDING 失败")?;
+    binding::parse_binding_bytes(&binding_bytes).map_err(anyhow::Error::msg)?;
+    let events = committed_tree_events(root, main_oid)?;
+    let (active_round, ir) = exact_main_signed_ir(root, main_oid, &binding_bytes, &events)?;
+    if active_round != round {
+        bail!("supersession card round={round} 不是 active signed round={active_round}");
+    }
+    if ir.tasks.iter().filter(|task| task.id == task_id).count() != 1 {
+        bail!("signed ROUND-IR 必须恰好包含一次 supersession task: {task_id}");
+    }
+    let expected = ir
+        .source_bindings
+        .task_cards
+        .get(&card_rel)
+        .with_context(|| format!("signed ROUND-IR 未绑定 supersession card: {card_rel}"))?;
+    let card_bytes = gitx::show_bytes(root, main_oid, &card_rel)
+        .context("从精确 main 读取 supersession task card 失败")?;
+    if sha256_hex(&card_bytes) != *expected {
+        bail!("精确 main supersession card bytes 未绑定 signed ROUND-IR");
+    }
+    let card_text = std::str::from_utf8(&card_bytes).context("supersession card 非 UTF-8")?;
+    let exact = card::parse(&card_rel, task_id, card_text)?;
+    if exact.meta.round.as_deref() != Some(round)
+        || exact.meta.frozen_contract_supersessions != supplied.meta.frozen_contract_supersessions
+    {
+        bail!("caller supersession declaration 与 exact signed card 不一致");
+    }
+    Ok(Some(exact))
+}
+
+fn payload_string<'a>(event: &'a EventRecord, key: &str) -> Result<&'a str> {
+    event
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get(key))
+        .and_then(serde_json::Value::as_str)
+        .with_context(|| format!("{}({}) 缺 payload.{key}", event.kind, event.event_id))
+}
+
+fn validate_relocation_event(
+    events: &[EventRecord],
+    event_id: &str,
+    round: &str,
+    task_id: &str,
+    target: &str,
+    digest: &str,
+) -> Result<()> {
+    let position = unique_event_position(events, event_id)?;
+    let event = &events[position];
+    let payload: SeedRelocatedPayload =
+        serde_json::from_value(event.payload.clone().context("SeedRelocated 缺 payload")?)
+            .context("SeedRelocated payload 非 closed schema")?;
+    if event.kind != "SeedRelocated"
+        || event.actor != "runtime:orch"
+        || event.round.as_deref() != Some(round)
+        || event.task_id.as_deref() != Some(task_id)
+        || payload.cmp != "identical"
+        || payload.target != target
+        || payload.sha256 != digest
+        || !is_canonical_sha256(&payload.sha256)
+        || !seed_oracle_precedes(events, position, round, task_id, target, digest)
+    {
+        bail!("SeedRelocated provenance 不匹配: {event_id}");
+    }
+    Ok(())
+}
+
+fn validate_recorded_event(
+    events: &[EventRecord],
+    event_id: &str,
+    round: &str,
+    task_id: &str,
+) -> Result<()> {
+    let event = event_by_id(events, event_id)?;
+    if event.kind != "TaskRecorded"
+        || event.actor != "runtime:orch"
+        || event.round.as_deref() != Some(round)
+        || event.task_id.as_deref() != Some(task_id)
+        || payload_string(event, "postMergeGates")? != "all-green"
+    {
+        bail!("TaskRecorded provenance 不匹配或非 all-green: {event_id}");
+    }
+    Ok(())
+}
+
+fn baseline_anchor_as_card(anchor: &BaselineAnchor) -> card::FrozenEffectiveAnchor {
+    card::FrozenEffectiveAnchor {
+        kind: anchor.kind.clone(),
+        event_id: anchor.event_id.clone(),
+        baseline_tree_sha: anchor.baseline_tree_sha.clone(),
+        sha256: anchor.sha256.clone(),
+    }
+}
+
+fn load_signed_baseline(
+    root: &Path,
+    main_oid: &str,
+) -> Result<(BTreeMap<String, LandedAnchor>, Vec<EventRecord>)> {
+    if !is_full_commit_oid(main_oid) {
+        bail!("landed baseline 需要完整 main commit OID: {main_oid:?}");
+    }
+    let binding_path = "coordination/PROJECT-BINDING.yaml";
+    if !gitx::tree_path_exists(root, main_oid, binding_path)? {
+        return Ok((BTreeMap::new(), Vec::new()));
+    }
+    let binding_bytes = gitx::show_bytes(root, main_oid, binding_path)?;
+    let bound = binding::parse_binding_bytes(&binding_bytes).map_err(anyhow::Error::msg)?;
+    let Some(descriptor) = bound.oracle.landed_seed_baseline.as_ref() else {
+        return Ok((BTreeMap::new(), Vec::new()));
+    };
+    let events = committed_tree_events(root, main_oid)?;
+    let (_, signed_ir) =
+        exact_main_signed_ir_with_binding_policy(root, main_oid, &binding_bytes, &events, false)
+            .context("landed baseline descriptor 未被 signed round 覆盖")?;
+    if signed_ir.source_bindings.binding_sha256 != sha256_hex(&binding_bytes) {
+        validate_first_plan_pending_round(&events, &signed_ir.round)?;
+        let signed_binding_bytes = ancestor_path_bytes_by_sha256(
+            root,
+            main_oid,
+            binding_path,
+            &signed_ir.source_bindings.binding_sha256,
+        )?;
+        validate_pending_binding_baseline_descriptor(descriptor, &signed_binding_bytes)?;
+    }
+    if descriptor.schema_version != 1
+        || !is_canonical_sha256(&descriptor.sha256)
+        || canonical_repo_relative(&descriptor.path, "landed baseline path")?.to_string_lossy()
+            != descriptor.path
+    {
+        bail!("oracle.landedSeedBaseline descriptor 非规范");
+    }
+    let manifest_bytes = gitx::show_bytes(root, main_oid, &descriptor.path)
+        .context("从精确 main 读取 landed baseline manifest 失败")?;
+    // The binding module owns the closed project-data schema.  The local
+    // projection below adds ledger provenance and effective-delta checks.
+    binding::parse_landed_seed_baseline(descriptor, &manifest_bytes).map_err(anyhow::Error::msg)?;
+    let actual_manifest_sha = sha256_hex(&manifest_bytes);
+    if actual_manifest_sha != descriptor.sha256 {
+        bail!(
+            "landed baseline manifest digest 不匹配: descriptor={} actual={}",
+            descriptor.sha256,
+            actual_manifest_sha
+        );
+    }
+    let manifest: BaselineManifest =
+        serde_json::from_slice(&manifest_bytes).context("landed baseline manifest 严格解析失败")?;
+    let declared_through = manifest
+        .scope
+        .declared_pair_audit_through
+        .strip_prefix('r')
+        .and_then(|value| value.parse::<u64>().ok())
+        .context("landed baseline declaredPairAuditThrough 非 canonical round")?;
+    let effective_through = manifest
+        .scope
+        .effective_baseline_through
+        .split_once('/')
+        .context("landed baseline effectiveBaselineThrough 非 rN/taskId")?;
+    if manifest.schema_version != 1
+        || !is_full_commit_oid(&manifest.baseline_tree_sha)
+        || effective_through
+            .0
+            .strip_prefix('r')
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_none()
+        || card::validate_task_id(effective_through.1).is_err()
+        || manifest.scope.selection
+            != "targets with a durable SeedRelocated fact; later SeedRelocated/FrozenContractSuperseded facts are deltas"
+    {
+        bail!("landed baseline manifest schema/scope 非 canonical v1");
+    }
+    let mut exclusions = BTreeSet::new();
+    let mut previous_exclusion: Option<&str> = None;
+    for target in &manifest.excluded_unrecorded_missing_targets {
+        canonical_repo_relative(target, "excluded landed target")?;
+        if previous_exclusion.is_some_and(|previous| previous >= target.as_str())
+            || !exclusions.insert(target.clone())
+        {
+            bail!("excluded landed targets 必须严格排序且唯一");
+        }
+        previous_exclusion = Some(target);
+    }
+
+    let mut anchors = BTreeMap::new();
+    let mut previous_target: Option<&str> = None;
+    let mut through_r70 = 0usize;
+    let mut drifted_through_r70 = 0usize;
+    let mut present = 0usize;
+    let mut tombstones = 0usize;
+    let mut genesis_relocation_ids = BTreeSet::new();
+    for target in &manifest.targets {
+        canonical_repo_relative(&target.target, "baseline target")?;
+        if previous_target.is_some_and(|previous| previous >= target.target.as_str())
+            || exclusions.contains(&target.target)
+        {
+            bail!("baseline targets 必须严格排序、唯一且不得命中 exclusions");
+        }
+        previous_target = Some(&target.target);
+        if target.sources.is_empty() {
+            bail!("baseline target 缺 provenance sources: {}", target.target);
+        }
+        let mut original: Option<(String, String)> = None;
+        let mut source_drift = false;
+        for source in &target.sources {
+            canonical_repo_relative(&source.card_path, "baseline cardPath")?;
+            canonical_repo_relative(&source.seed_src, "baseline seedSrc")?;
+            if source.card_path
+                != format!(
+                    "coordination/rounds/{}/tasks/{}.md",
+                    source.round, source.task_id
+                )
+                || !is_canonical_sha256(&source.declared_sha256)
+                || !is_canonical_sha256(&source.source_sha256)
+                || source.source_matches_declared
+                    != (source.declared_sha256 == source.source_sha256)
+            {
+                bail!("baseline source binding 非规范: {}", target.target);
+            }
+            let number = source
+                .round
+                .strip_prefix('r')
+                .and_then(|value| value.parse::<u64>().ok())
+                .context("baseline source round 非 r<数字>")?;
+            if number <= declared_through {
+                through_r70 += 1;
+                if source.drifted_from_source {
+                    drifted_through_r70 += 1;
+                }
+            }
+            source_drift |= source.drifted_from_source;
+            for relocation in &source.seed_relocated {
+                if !is_canonical_sha256(&relocation.sha256) {
+                    bail!("baseline SeedRelocated sha256 非规范");
+                }
+                if !genesis_relocation_ids.insert(relocation.event_id.clone()) {
+                    bail!(
+                        "baseline SeedRelocated eventId 重复: {}",
+                        relocation.event_id
+                    );
+                }
+                validate_relocation_event(
+                    &events,
+                    &relocation.event_id,
+                    &source.round,
+                    &source.task_id,
+                    &target.target,
+                    &relocation.sha256,
+                )?;
+                original.get_or_insert_with(|| {
+                    (relocation.event_id.clone(), relocation.sha256.clone())
+                });
+            }
+            for event_id in &source.task_recorded_event_ids {
+                validate_recorded_event(&events, event_id, &source.round, &source.task_id)?;
+            }
+        }
+        let (original_event_id, original_sha256) = original.with_context(|| {
+            format!(
+                "baseline target 缺 target-level SeedRelocated: {}",
+                target.target
+            )
+        })?;
+        let effective = baseline_anchor_as_card(&target.effective_anchor);
+        match target.effective_anchor.kind.as_str() {
+            "seed-relocated" => {
+                present += 1;
+                if target.effective_anchor.event_id.is_none()
+                    || target.effective_anchor.baseline_tree_sha.is_some()
+                    || target.effective_anchor.sha256.as_deref()
+                        != target.effective_sha256.as_deref()
+                    || target.effective_sha256.as_deref() != Some(&original_sha256)
+                    || target.grandfathered_drift
+                    || source_drift
+                {
+                    bail!("seed-relocated effective anchor 非规范: {}", target.target);
+                }
+                let event_id = target.effective_anchor.event_id.as_deref().unwrap();
+                let event = event_by_id(&events, event_id)?;
+                if event.kind != "SeedRelocated"
+                    || event.actor != "runtime:orch"
+                    || payload_string(event, "target")? != target.target
+                    || payload_string(event, "sha256")?
+                        != target.effective_sha256.as_deref().unwrap()
+                {
+                    bail!("effective SeedRelocated anchor 不匹配: {event_id}");
+                }
+            }
+            "migration-baseline" => {
+                present += 1;
+                if target.effective_anchor.event_id.is_some()
+                    || target.effective_anchor.baseline_tree_sha.as_deref()
+                        != Some(&manifest.baseline_tree_sha)
+                    || target.effective_anchor.sha256.as_deref()
+                        != target.effective_sha256.as_deref()
+                    || target
+                        .effective_sha256
+                        .as_deref()
+                        .is_none_or(|value| !is_canonical_sha256(value))
+                    || !target.grandfathered_drift
+                    || !source_drift
+                {
+                    bail!("migration-baseline anchor 非规范: {}", target.target);
+                }
+            }
+            "migration-tombstone" => {
+                tombstones += 1;
+                if target.effective_anchor.event_id.is_some()
+                    || target.effective_anchor.baseline_tree_sha.as_deref()
+                        != Some(&manifest.baseline_tree_sha)
+                    || target.effective_anchor.sha256.is_some()
+                    || target.effective_sha256.is_some()
+                    || target.grandfathered_drift
+                {
+                    bail!("migration-tombstone anchor 非规范: {}", target.target);
+                }
+            }
+            other => bail!("baseline effectiveAnchor.kind 非闭枚举: {other}"),
+        }
+        if (target.state == "present") != target.effective_sha256.is_some()
+            || (target.state == "tombstone") != target.effective_sha256.is_none()
+        {
+            bail!("baseline target state/digest 不一致: {}", target.target);
+        }
+        anchors.insert(
+            target.target.clone(),
+            LandedAnchor {
+                digest: target.effective_sha256.clone(),
+                effective,
+                original_event_id,
+                original_sha256,
+                grandfathered_drift: target.grandfathered_drift,
+            },
+        );
+    }
+    let counts = &manifest.counts;
+    if counts.declared_pairs_through_r70 != through_r70 + exclusions.len()
+        || counts.drifted_declared_pairs_through_r70 != drifted_through_r70
+        || counts.missing_declared_pairs_through_r70 != exclusions.len() + tombstones
+        || counts.unique_effective_targets_through_b269 != anchors.len()
+        || counts.present_effective_targets != present
+        || counts.effective_tombstones != tombstones
+        || counts.excluded_unrecorded_missing_targets != exclusions.len()
+    {
+        bail!("landed baseline manifest counts 不匹配");
+    }
+
+    // The manifest is immutable genesis.  Only durable, canonical events may
+    // extend it: recorded later relocations add new targets; supersessions
+    // advance one existing target's explicit effective-anchor chain.
+    for (position, event) in events.iter().enumerate() {
+        if event.kind == "SeedRelocated" {
+            if genesis_relocation_ids.contains(&event.event_id) {
+                continue;
+            }
+            let payload: SeedRelocatedPayload = serde_json::from_value(
+                event
+                    .payload
+                    .clone()
+                    .context("dynamic SeedRelocated 缺 payload")?,
+            )
+            .context("dynamic SeedRelocated payload 非 closed schema")?;
+            let (Some(round), Some(task_id)) = (event.round.as_deref(), event.task_id.as_deref())
+            else {
+                bail!("dynamic SeedRelocated 缺 round/taskId: {}", event.event_id);
+            };
+            if payload.cmp != "identical"
+                || !is_canonical_sha256(&payload.sha256)
+                || event.actor != "runtime:orch"
+            {
+                bail!(
+                    "dynamic SeedRelocated envelope/payload 非 canonical: {}",
+                    event.event_id
+                );
+            }
+            canonical_repo_relative(&payload.target, "dynamic landed target")?;
+            if !seed_oracle_precedes(
+                &events,
+                position,
+                round,
+                task_id,
+                &payload.target,
+                &payload.sha256,
+            ) {
+                bail!(
+                    "dynamic SeedRelocated 缺 earlier matching SeedOracleVerified: {}",
+                    event.event_id
+                );
+            }
+            let recorded = events[position + 1..].iter().any(|candidate| {
+                candidate.kind == "TaskRecorded"
+                    && candidate.actor == "runtime:orch"
+                    && candidate.round.as_deref() == Some(round)
+                    && candidate.task_id.as_deref() == Some(task_id)
+                    && candidate
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("postMergeGates"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("all-green")
+            });
+            if !recorded {
+                continue;
+            }
+            if let Some(existing) = anchors.get_mut(&payload.target) {
+                if existing.digest.as_deref() != Some(&payload.sha256) {
+                    bail!(
+                        "dynamic SeedRelocated 不得覆盖既有 frozen anchor（须 FrozenContractSuperseded）: {}",
+                        payload.target
+                    );
+                }
+                if existing.effective.kind == "seed-relocated" {
+                    existing.effective.event_id = Some(event.event_id.clone());
+                }
+                continue;
+            }
+            anchors.insert(
+                payload.target.clone(),
+                LandedAnchor {
+                    digest: Some(payload.sha256.clone()),
+                    effective: card::FrozenEffectiveAnchor {
+                        kind: "seed-relocated".to_string(),
+                        event_id: Some(event.event_id.clone()),
+                        baseline_tree_sha: None,
+                        sha256: Some(payload.sha256.clone()),
+                    },
+                    original_event_id: event.event_id.clone(),
+                    original_sha256: payload.sha256,
+                    grandfathered_drift: false,
+                },
+            );
+        } else if event.kind == "FrozenContractSuperseded" {
+            let payload = crate::verify::validate_frozen_contract_supersession_delta_for_replay(
+                root, main_oid, &events, position,
+            )
+            .context("FrozenContractSuperseded delta 非 canonical signed Effective fact")?;
+            if !is_canonical_sha256(&payload.new_file_sha256) {
+                bail!("FrozenContractSuperseded newFileSha256 非规范");
+            }
+            let anchor = anchors.get_mut(&payload.target).with_context(|| {
+                format!(
+                    "FrozenContractSuperseded target 无 genesis: {}",
+                    payload.target
+                )
+            })?;
+            if anchor.effective != payload.effective_anchor
+                || anchor.digest.as_deref() != Some(&payload.old_file_sha256)
+            {
+                bail!(
+                    "FrozenContractSuperseded effective-anchor chain fork/backward: {}",
+                    payload.target
+                );
+            }
+            anchor.digest = Some(payload.new_file_sha256.clone());
+            anchor.effective = card::FrozenEffectiveAnchor {
+                kind: "frozen-contract-superseded".to_string(),
+                event_id: Some(event.event_id.clone()),
+                baseline_tree_sha: None,
+                sha256: Some(payload.new_file_sha256),
+            };
+        }
+    }
+    if let Some((authorization, card)) =
+        crate::verify::pending_frozen_record_context_from_committed_main(
+            root, main_oid, &events,
+        )?
+    {
+        let mut declarations = card.meta.frozen_contract_supersessions;
+        declarations.sort_by(|left, right| left.target.cmp(&right.target));
+        for declaration in declarations {
+            if !crate::verify::declared_reviews_match_bindings(
+                &declaration.reviews,
+                &authorization.reviews,
+            ) {
+                bail!("pending FrozenContractSuperseded reviews 未绑定 root PASS");
+            }
+            let anchor = anchors.get(&declaration.target).with_context(|| {
+                format!(
+                    "pending supersession target 无 landed genesis: {}",
+                    declaration.target
+                )
+            })?;
+            validate_declaration_against_snapshots(
+                root,
+                &declaration,
+                &authorization.expected_main_sha,
+                main_oid,
+                anchor,
+                &events,
+            )?;
+            anchors
+                .get_mut(&declaration.target)
+                .context("pending supersession target disappeared")?
+                .digest = Some(declaration.new_file_sha256);
+        }
+    }
+    Ok((anchors, events))
+}
+
+/// Collect every landed frozen target intersected by a candidate write set.
+///
+/// `main_oid` must be an already captured full commit OID; this helper never
+/// resolves `main`, `HEAD`, or a task ref. Exact paths and trailing `dir/**`
+/// globs use the task-card matcher. Only an exact target in
+/// `superseded_targets` is exempt, so a parent glob or misspelling cannot
+/// silently authorize a landed contract. Production callers derive that set
+/// only from `CardMeta` already accepted by `card::parse`; this low-level
+/// helper does not promote arbitrary strings into schema-valid declarations.
+/// The returned targets are strictly sorted and duplicate-free.
+pub fn collect_landed_write_set_conflicts(
+    root: &Path,
+    main_oid: &str,
+    write_set: &[String],
+    superseded_targets: &BTreeSet<String>,
+) -> Result<Vec<String>> {
+    if !is_full_commit_oid(main_oid) {
+        bail!("landed writeSet guard 只接受完整 main commit OID");
+    }
+    let (anchors, _) = load_signed_baseline(root, main_oid)?;
+    Ok(anchors
+        .keys()
+        .filter(|target| {
+            card::path_matches(write_set, target)
+                && !superseded_targets.contains(target.as_str())
+        })
+        .cloned()
+        .collect())
+}
+
+/// Remove only byte-identical replay of a task's own recorded seed target.
+///
+/// This is not a write authorization or a supersession exemption: the caller
+/// must already have proved that every materialized target matches its
+/// immutable seed source. A target is recognized only when it is named by the
+/// same parsed card and its landed genesis `SeedRelocated` event belongs to
+/// that exact task. Anchors created by any other task remain conflicts.
+pub(crate) fn remove_exact_own_landed_seed_replays(
+    root: &Path,
+    main_oid: &str,
+    task_id: &str,
+    seed_targets: &BTreeSet<String>,
+    conflicts: Vec<String>,
+) -> Result<Vec<String>> {
+    if conflicts.is_empty() {
+        return Ok(conflicts);
+    }
+    if !is_full_commit_oid(main_oid) {
+        bail!("own-seed replay filter 只接受完整 main commit OID");
+    }
+    let (anchors, events) = load_signed_baseline(root, main_oid)?;
+    let mut retained = Vec::new();
+    for target in conflicts {
+        let own_replay = if seed_targets.contains(&target) {
+            let anchor = anchors
+                .get(&target)
+                .with_context(|| format!("landed conflict target 缺 anchor: {target}"))?;
+            let event = event_by_id(&events, &anchor.original_event_id)?;
+            event.kind == "SeedRelocated"
+                && event.actor == "runtime:orch"
+                && event.task_id.as_deref() == Some(task_id)
+        } else {
+            false
+        };
+        if !own_replay {
+            retained.push(target);
+        }
+    }
+    Ok(retained)
+}
+
+fn planner_adjudication_round(path: &str) -> Result<&str> {
+    canonical_repo_relative(path, "planner adjudication path")?;
+    let mut parts = path.split('/');
+    match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (
+            Some("coordination"),
+            Some("rounds"),
+            Some(round),
+            Some("planning"),
+            Some(file_name),
+            None,
+        ) if round.strip_prefix('r').is_some_and(|number| {
+            !number.is_empty()
+                && !number.starts_with('0')
+                && number.bytes().all(|byte| byte.is_ascii_digit())
+        }) && !file_name.trim().is_empty() =>
+        {
+            Ok(round)
+        }
+        _ => bail!(
+            "planner adjudication path 必须精确位于 coordination/rounds/<round>/planning/: {path:?}"
+        ),
+    }
+}
+
+fn committed_regular_blob_bytes(
+    root: &Path,
+    commit_oid: &str,
+    path: &str,
+    label: &str,
+) -> Result<Vec<u8>> {
+    if !is_full_commit_oid(commit_oid) {
+        bail!("{label} 只接受完整 commit OID");
+    }
+    canonical_repo_relative(path, label)?;
+    let literal_pathspec = format!(":(literal){path}");
+    let tree = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-tree",
+            "--full-tree",
+            "-z",
+            commit_oid,
+            "--",
+            &literal_pathspec,
+        ])
+        .output()
+        .with_context(|| format!("查询 {label} candidate tree entry 失败: {path}"))?;
+    if !tree.status.success() {
+        bail!(
+            "查询 {label} candidate tree entry 失败: {}",
+            String::from_utf8_lossy(&tree.stderr).trim()
+        );
+    }
+    let entries = tree
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    if entries.len() != 1 {
+        bail!("{label} 必须在 candidate tree 中恰有一个 tracked entry: {path}");
+    }
+    let entry = std::str::from_utf8(entries[0])
+        .with_context(|| format!("{label} ls-tree entry 非 UTF-8"))?;
+    let (header, entry_path) = entry
+        .split_once('\t')
+        .with_context(|| format!("{label} ls-tree entry 格式错误"))?;
+    let fields = header.split_ascii_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3
+        || !matches!(fields[0], "100644" | "100755")
+        || fields[1] != "blob"
+        || !is_full_commit_oid(fields[2])
+        || entry_path != path
+    {
+        bail!("{label} 必须是 candidate tree 中的 regular tracked blob: {path}");
+    }
+    let blob = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "blob", fields[2]])
+        .output()
+        .with_context(|| format!("读取 {label} candidate blob 失败: {path}"))?;
+    if !blob.status.success() {
+        bail!(
+            "读取 {label} candidate blob 失败: {}",
+            String::from_utf8_lossy(&blob.stderr).trim()
+        );
+    }
+    Ok(blob.stdout)
+}
+
+/// Validate the planner-adjudicated authorization arm against two immutable
+/// Git snapshots.
+///
+/// The adjudication is read as a regular blob from `effective_oid`; the live
+/// worktree is never consulted. Every removed assertion must exist only in the
+/// old frozen-contract text, while its distinct retained-coverage marker must
+/// exist in the new text. Both object IDs must be full commit IDs so a moving
+/// ref cannot change the evidence during validation.
+pub fn validate_planner_adjudicated_supersession(
+    root: &Path,
+    declaration: &card::FrozenContractSupersession,
+    prior_main_oid: &str,
+    effective_oid: &str,
+) -> Result<()> {
+    if !is_full_commit_oid(prior_main_oid) || !is_full_commit_oid(effective_oid) {
+        bail!("planner-adjudicated supersession 只接受完整 commit OID");
+    }
+    let authorization = match (
+        declaration.blocked_attempt.as_ref(),
+        declaration.replacement.as_ref(),
+        declaration.authorization.as_ref(),
+    ) {
+        (None, None, Some(authorization)) => authorization,
+        _ => bail!("planner-adjudicated runtime 校验收到混合或不完整授权变体"),
+    };
+    if authorization.kind != "planner-adjudicated"
+        || authorization.user_authorization.actor != "user"
+        || authorization.user_authorization.date.trim().is_empty()
+        || authorization.user_authorization.date.trim() != authorization.user_authorization.date
+        || authorization.user_authorization.quote.trim().is_empty()
+        || authorization.user_authorization.quote.trim() != authorization.user_authorization.quote
+    {
+        bail!("planner-adjudicated userAuthorization 字段形状非法");
+    }
+    planner_adjudication_round(&authorization.adjudication.path)?;
+    if !is_canonical_sha256(&authorization.adjudication.sha256) {
+        bail!("planner adjudication sha256 非 canonical");
+    }
+
+    let adjudication = committed_regular_blob_bytes(
+        root,
+        effective_oid,
+        &authorization.adjudication.path,
+        "planner adjudication",
+    )?;
+    if sha256_hex(&adjudication) != authorization.adjudication.sha256 {
+        bail!("planner adjudication blob SHA-256 与 signed declaration 不一致");
+    }
+
+    let old = gitx::show_bytes(root, prior_main_oid, &declaration.target)
+        .context("读取 planner supersession old frozen contract 失败")?;
+    let new = gitx::show_bytes(root, effective_oid, &declaration.target)
+        .context("读取 planner supersession new frozen contract 失败")?;
+    if sha256_hex(&old) != declaration.old_file_sha256
+        || sha256_hex(&new) != declaration.new_file_sha256
+    {
+        bail!("planner supersession frozen-contract whole-file SHA 与 fixed snapshots 不一致");
+    }
+    let old_text =
+        std::str::from_utf8(&old).context("planner supersession old frozen contract 非 UTF-8")?;
+    let new_text =
+        std::str::from_utf8(&new).context("planner supersession new frozen contract 非 UTF-8")?;
+    if authorization.removed_assertions.is_empty() {
+        bail!("planner supersession removedAssertions 不得为空");
+    }
+    let mut assertions = BTreeSet::new();
+    for removed in &authorization.removed_assertions {
+        if removed.assertion.trim().is_empty()
+            || removed.assertion.trim() != removed.assertion
+            || removed.reason.trim().is_empty()
+            || removed.reason.trim() != removed.reason
+            || removed.retained_coverage.trim().is_empty()
+            || removed.retained_coverage.trim() != removed.retained_coverage
+            || removed.assertion == removed.retained_coverage
+            || !assertions.insert(removed.assertion.as_str())
+        {
+            bail!("planner supersession removedAssertions 字段缺失、重复或自指");
+        }
+        if !old_text.contains(&removed.assertion) {
+            bail!("planner supersession removed assertion 不存在于 old frozen contract");
+        }
+        if new_text.contains(&removed.assertion) {
+            bail!("planner supersession removed assertion 仍存在于 new frozen contract");
+        }
+        if !new_text.contains(&removed.retained_coverage) {
+            bail!("planner supersession retainedCoverage 不存在于 new frozen contract");
+        }
+    }
+    Ok(())
+}
+
+fn first_byte_mismatch(left: &[u8], right: &[u8]) -> Option<usize> {
+    left.iter()
+        .zip(right)
+        .position(|(left, right)| left != right)
+        .or_else(|| (left.len() != right.len()).then_some(left.len().min(right.len())))
+}
+
+fn validate_structured_evolution_against_snapshots(
+    declaration: &card::FrozenContractSupersession,
+    evolution: &card::FrozenStructuredEvolution,
+    old: &[u8],
+    new: &[u8],
+) -> Result<()> {
+    if evolution.units.is_empty() {
+        bail!("structured evolution units 不得为空");
+    }
+
+    if evolution.units.len() == 1 {
+        let range = evolution.units[0].old_range;
+        if range.start == 0 && usize::try_from(range.end).ok() == Some(old.len()) {
+            bail!("structured evolution 拒绝单个整文件 catch-all unit");
+        }
+    }
+
+    let mut reconstructed = Vec::new();
+    let mut cursor = 0usize;
+    let mut previous_start: Option<usize> = None;
+    let mut deleted_assertions = BTreeSet::new();
+    for (index, unit) in evolution.units.iter().enumerate() {
+        let start = usize::try_from(unit.old_range.start).with_context(|| {
+            format!("structured evolution unit[{index}] oldRange.start 超出平台范围")
+        })?;
+        let end = usize::try_from(unit.old_range.end).with_context(|| {
+            format!("structured evolution unit[{index}] oldRange.end 超出平台范围")
+        })?;
+        if start > end || end > old.len() {
+            bail!("structured evolution unit[{index}] oldRange 越界或反向");
+        }
+        if previous_start.is_some_and(|previous| start <= previous) || start < cursor {
+            bail!("structured evolution units 必须严格有序且互不重叠");
+        }
+        if !is_canonical_sha256(&unit.old_sha256) || sha256_hex(&old[start..end]) != unit.old_sha256
+        {
+            bail!("structured evolution unit[{index}] old window SHA-256 不匹配");
+        }
+
+        reconstructed.extend_from_slice(&old[cursor..start]);
+        match &unit.edit {
+            card::FrozenContractEdit::Replace { content } => {
+                if content.is_empty() || content.as_bytes() == &old[start..end] {
+                    bail!(
+                        "structured evolution unit[{index}] replace 必须声明非空且真实变化的内容"
+                    );
+                }
+                reconstructed.extend_from_slice(content.as_bytes());
+            }
+            card::FrozenContractEdit::Delete { removed_assertion } => {
+                if start == end
+                    || removed_assertion.trim().is_empty()
+                    || removed_assertion.trim() != removed_assertion
+                    || !deleted_assertions.insert(removed_assertion.as_str())
+                    || !old[start..end]
+                        .windows(removed_assertion.len())
+                        .any(|window| window == removed_assertion.as_bytes())
+                {
+                    bail!("structured evolution unit[{index}] delete 未精确绑定唯一 old removedAssertion");
+                }
+            }
+        }
+        cursor = end;
+        previous_start = Some(start);
+    }
+    reconstructed.extend_from_slice(&old[cursor..]);
+
+    if let Some(offset) = first_byte_mismatch(&reconstructed, new) {
+        bail!("structured evolution unexplained byte offset={offset}");
+    }
+
+    if !deleted_assertions.is_empty() {
+        let authorization = declaration.authorization.as_ref().context(
+            "structured evolution delete 必须绑定 planner-adjudicated removedAssertions",
+        )?;
+        let authorized = authorization
+            .removed_assertions
+            .iter()
+            .map(|removed| removed.assertion.as_str())
+            .collect::<BTreeSet<_>>();
+        if authorized != deleted_assertions {
+            bail!("structured evolution delete 与 removedAssertions 未逐条双向绑定");
+        }
+    }
+    Ok(())
+}
+
+fn validate_declaration_against_snapshots(
+    root: &Path,
+    declaration: &card::FrozenContractSupersession,
+    prior_main_oid: &str,
+    effective_oid: &str,
+    anchor: &LandedAnchor,
+    events: &[EventRecord],
+) -> Result<()> {
+    if declaration.effective_anchor != anchor.effective
+        || declaration.old_file_sha256 != anchor.digest.as_deref().unwrap_or("")
+    {
+        bail!("supersession declared old/effective anchor 与 canonical chain 不一致");
+    }
+    let old = gitx::show_bytes(root, prior_main_oid, &declaration.target)
+        .context("读取 supersession old contract bytes 失败")?;
+    let new = gitx::show_bytes(root, effective_oid, &declaration.target)
+        .context("读取 supersession new contract bytes 失败")?;
+    if sha256_hex(&old) != declaration.old_file_sha256
+        || sha256_hex(&new) != declaration.new_file_sha256
+    {
+        bail!("supersession whole-file SHA 与精确快照不一致");
+    }
+    let old_text = std::str::from_utf8(&old).context("supersession old contract 非 UTF-8")?;
+    let new_text = std::str::from_utf8(&new).context("supersession new contract 非 UTF-8")?;
+    match declaration.evolution().map_err(anyhow::Error::msg)? {
+        card::FrozenContractEvolution::LiteralSwap {
+            old_literal_sha256,
+            new_literal_sha256,
+            subject_prefix,
+        } => {
+            let swap = single_hash_literal_swap(old_text, new_text)
+                .context("literal shape: supersession 并非恰好一个 quoted SHA-256 literal swap")?;
+            if swap.0 != old_literal_sha256 || swap.1 != new_literal_sha256 {
+                bail!("supersession literal swap 与 typed declaration 不一致");
+            }
+            let prefix_bytes = usize::try_from(subject_prefix.bytes)
+                .context("subjectPrefix.bytes 超出平台范围")?;
+            let old_subject = gitx::show_bytes(root, prior_main_oid, &subject_prefix.path)
+                .context("读取 old subject-prefix path 失败")?;
+            let new_subject = gitx::show_bytes(root, effective_oid, &subject_prefix.path)
+                .context("读取 new subject-prefix path 失败")?;
+            if old_subject.len() < prefix_bytes
+                || new_subject.len() < prefix_bytes
+                || sha256_hex(&old_subject[..prefix_bytes]) != old_literal_sha256
+                || sha256_hex(&new_subject[..prefix_bytes]) != new_literal_sha256
+            {
+                bail!("subject-prefix 摘要与 literal replacement 不一致");
+            }
+        }
+        card::FrozenContractEvolution::Structured(evolution) => {
+            validate_structured_evolution_against_snapshots(
+                declaration,
+                evolution,
+                old_text.as_bytes(),
+                new_text.as_bytes(),
+            )?;
+        }
+    }
+    validate_relocation_event(
+        events,
+        &declaration.original_seed_relocated.event_id,
+        event_by_id(events, &declaration.original_seed_relocated.event_id)?
+            .round
+            .as_deref()
+            .context("original SeedRelocated 缺 round")?,
+        event_by_id(events, &declaration.original_seed_relocated.event_id)?
+            .task_id
+            .as_deref()
+            .context("original SeedRelocated 缺 taskId")?,
+        &declaration.target,
+        &declaration.original_seed_relocated.sha256,
+    )?;
+    if declaration.original_seed_relocated.event_id != anchor.original_event_id
+        || declaration.original_seed_relocated.sha256 != anchor.original_sha256
+    {
+        bail!("supersession original SeedRelocated anchor 不匹配 genesis");
+    }
+    let recovery_authorized = match (
+        declaration.blocked_attempt.as_ref(),
+        declaration.replacement.as_ref(),
+        declaration.authorization.as_ref(),
+    ) {
+        (Some(blocked_anchor), Some(replacement), None) => {
+            let blocked = event_by_id(events, &blocked_anchor.event_id)?;
+            if blocked.kind != "AttemptBlocked"
+                || blocked.actor != "runtime:orch"
+                || blocked.round.as_deref() != Some(&blocked_anchor.round)
+                || blocked.task_id.as_deref() != Some(&blocked_anchor.task_id)
+                || payload_string(blocked, "attemptId")? != blocked_anchor.attempt_id
+            {
+                bail!("supersession AttemptBlocked anchor 不匹配");
+            }
+            validate_recorded_event(
+                events,
+                &replacement.task_recorded_event_id,
+                &replacement.round,
+                &replacement.task_id,
+            )?;
+            true
+        }
+        (None, None, Some(_)) => {
+            validate_planner_adjudicated_supersession(
+                root,
+                declaration,
+                prior_main_oid,
+                effective_oid,
+            )?;
+            false
+        }
+        _ => bail!("supersession authorization 变体混合或不完整"),
+    };
+    match anchor.effective.kind.as_str() {
+        "seed-relocated" => {
+            if recovery_authorized {
+                frozen_contract_supersession_authorized(
+                    "runtime:orch",
+                    true,
+                    Some(&anchor.original_sha256),
+                    &declaration.old_file_sha256,
+                    anchor.digest.as_deref().unwrap_or(""),
+                )
+                .map_err(anyhow::Error::msg)?;
+            } else {
+                frozen_contract_anchor_digests_match(
+                    Some(&anchor.original_sha256),
+                    &declaration.old_file_sha256,
+                    anchor.digest.as_deref().unwrap_or(""),
+                )
+                .map_err(anyhow::Error::msg)?;
+            }
+        }
+        "migration-baseline" => {
+            if !anchor.grandfathered_drift
+                || anchor.effective.baseline_tree_sha.is_none()
+                || anchor.digest.as_deref() != Some(&declaration.old_file_sha256)
+            {
+                bail!("migration-baseline supersession 未显式 grandfather 或 old 不匹配");
+            }
+        }
+        "frozen-contract-superseded" => {
+            if anchor.digest.as_deref() != Some(&declaration.old_file_sha256) {
+                bail!("repeat supersession old SHA 未链接上一 effective event");
+            }
+        }
+        "migration-tombstone" => bail!("tombstoned frozen contract 不得复活"),
+        other => bail!("unknown effective anchor kind: {other}"),
+    }
+    Ok(())
+}
+
+/// Validate one signed declaration after the candidate has become the exact
+/// effective main snapshot.  Close/verify share this entry point with the
+/// pre-merge guard so authorization cannot silently shrink at emission time.
+pub fn validate_frozen_contract_declaration(
+    root: &Path,
+    declaration: &card::FrozenContractSupersession,
+    prior_main_oid: &str,
+    effective_main_oid: &str,
+) -> Result<()> {
+    let (anchors, events) = load_signed_baseline(root, prior_main_oid)?;
+    let anchor = anchors.get(&declaration.target).with_context(|| {
+        format!(
+            "supersession target 无 landed genesis: {}",
+            declaration.target
+        )
+    })?;
+    validate_declaration_against_snapshots(
+        root,
+        declaration,
+        prior_main_oid,
+        effective_main_oid,
+        anchor,
+        &events,
+    )
+}
+
+fn validate_landed_seed_digests_exact(
+    root: &Path,
+    c: &card::Card,
+    main_oid: &str,
+    candidate_oid: &str,
+) -> Result<BTreeMap<String, LandedAnchor>> {
+    let (anchors, events) = load_signed_baseline(root, main_oid)?;
+    if anchors.is_empty() {
+        return Ok(anchors);
+    }
+    for seed in &c.meta.seeds {
+        let Some(expected) = anchors.get(&seed.target) else {
+            continue;
+        };
+        let source = read_bound_seed_bytes(root, &seed.src)?;
+        let actual = Some(sha256_hex(&source));
+        if actual != expected.digest {
+            bail!(
+                "新 seed 试图覆盖已落位冻结 target: {}，期望 {:?}，seed.src {:?}",
+                seed.target,
+                expected.digest,
+                actual
+            );
+        }
+    }
+    for (target, expected) in &anchors {
+        let actual = tree_landed_digest(root, main_oid, target)?;
+        if actual != expected.digest {
+            bail!(
+                "main landed seed 摘要漂移（非追溯基线之后）: {target}，期望 {:?}，实际 {:?}",
+                expected.digest,
+                actual
+            );
+        }
+    }
+    if main_oid == candidate_oid {
+        if !c.meta.frozen_contract_supersessions.is_empty() {
+            bail!("card 声明 supersession 但 candidate 未改变任何 frozen target");
+        }
+        return Ok(anchors);
+    }
+    let merge_base = gitx::merge_base(root, main_oid, candidate_oid)?;
+    let declarations = c
+        .meta
+        .frozen_contract_supersessions
+        .iter()
+        .map(|declaration| (declaration.target.as_str(), declaration))
+        .collect::<BTreeMap<_, _>>();
+    let mut consumed = BTreeSet::new();
+    for (target, expected) in &anchors {
+        let base = tree_landed_digest(root, &merge_base, target)?;
+        let actual = tree_landed_digest(root, candidate_oid, target)?;
+        if actual == base {
+            continue;
+        }
+        let declaration = declarations.get(target.as_str()).with_context(|| {
+            format!("task 分支修改了已落位冻结 seed 但无签名 supersession: {target}")
+        })?;
+        validate_declaration_against_snapshots(
+            root,
+            declaration,
+            main_oid,
+            candidate_oid,
+            expected,
+            &events,
+        )?;
+        consumed.insert(target.as_str());
+    }
+    if consumed.len() != declarations.len() {
+        let unused = declarations
+            .keys()
+            .filter(|target| !consumed.contains(**target))
+            .copied()
+            .collect::<Vec<_>>();
+        bail!("signed supersession declaration 未对应 frozen target 变更: {unused:?}");
+    }
+    Ok(anchors)
+}
+
+/// Candidate-aware landed guard.  Both object ids must already be resolved
+/// commit OIDs; this function never reads `main`, `HEAD`, or `task/<id>` refs.
+pub fn validate_seed_paths_for_candidate(
+    root: &Path,
+    c: &card::Card,
+    main_oid: &str,
+    candidate_oid: &str,
+) -> Result<()> {
+    if !is_full_commit_oid(main_oid) || !is_full_commit_oid(candidate_oid) {
+        bail!("candidate-aware seed guard 只接受完整 commit OID");
+    }
+    validate_landed_seed_digests_exact(root, c, main_oid, candidate_oid)?;
+    validate_seed_path_shape(root, c)
+}
+
 fn inspect_target_path(base: &Path, relative: &Path, display: &str) -> Result<()> {
     let components = relative.components().collect::<Vec<_>>();
     let mut current = base.to_path_buf();
@@ -279,12 +2056,10 @@ fn create_checked_target_parent(base: &Path, relative: &Path, display: &str) -> 
     Ok(current)
 }
 
-/// 在任何 worktree/ledger/spawn 动作前验证种子路径合同。
-///
-/// `src` 必须是仓库内、全链无 symlink 的 regular file；`target` 必须是规范相对路径，
-/// 且属于任务 writeSet、不得命中任务 frozenPaths。重复 target 也会被拒绝，防止后一个
-/// seed 静默覆盖前一个。
-pub fn validate_seed_paths(root: &Path, c: &card::Card) -> Result<()> {
+/// Validate seed source/target containment without resolving a movable Git
+/// ref. Authorized planning pairs this shape check with the exact-OID landed
+/// write-set census, while legacy callers retain [`validate_seed_paths`].
+pub(crate) fn validate_seed_path_shape(root: &Path, c: &card::Card) -> Result<()> {
     let canonical_root = canonical_directory(root, "仓库 root")?;
     let mut targets = HashSet::new();
     for seed in &c.meta.seeds {
@@ -308,6 +2083,110 @@ pub fn validate_seed_paths(root: &Path, c: &card::Card) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_materialized_seed_replay(canonical_root: &Path, c: &card::Card) -> Result<()> {
+    for seed in &c.meta.seeds {
+        let source = read_bound_seed_bytes(canonical_root, &seed.src)?;
+        let source_digest = sha256_hex(&source);
+        let landed_digest = current_landed_digest(canonical_root, &seed.target)?;
+        if landed_digest
+            .as_deref()
+            .is_some_and(|landed| landed != source_digest.as_str())
+        {
+            bail!(
+                "新 seed 试图覆盖已落位 target: {}，当前 {:?}，seed.src {}",
+                seed.target,
+                landed_digest,
+                source_digest
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Preserve plan-time seed creation/replay safety without resolving Git refs.
+///
+/// In addition to containment, an already materialized target must be
+/// byte-identical to its immutable source. Authorized planning invokes the
+/// exact-main landed write-set census separately, after every card is loaded.
+pub(crate) fn validate_seed_paths_for_authorized_plan(
+    root: &Path,
+    c: &card::Card,
+) -> Result<()> {
+    validate_seed_path_shape(root, c)?;
+    let canonical_root = canonical_directory(root, "仓库 root")?;
+    validate_materialized_seed_replay(&canonical_root, c)
+}
+
+fn card_round_is_closed_at_main(root: &Path, main_oid: &str, c: &card::Card) -> Result<bool> {
+    let Some(round) = c.meta.round.as_deref() else {
+        return Ok(false);
+    };
+    let ledger_path = format!("coordination/rounds/{round}/events.jsonl");
+    if !gitx::tree_path_exists(root, main_oid, &ledger_path)? {
+        return Ok(false);
+    }
+    let bytes = gitx::show_bytes(root, main_oid, &ledger_path)?;
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("历史轮 ledger 非 UTF-8: {ledger_path}"))?;
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let event: EventRecord = serde_json::from_str(line)
+            .with_context(|| format!("历史轮 ledger 坏行: {ledger_path}:{}", index + 1))?;
+        if event.kind == "RoundClosed"
+            && event.actor == "runtime:orch"
+            && event.round.as_deref() == Some(round)
+            && event.task_id.is_none()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 在任何 worktree/ledger/spawn 动作前验证种子路径合同。
+///
+/// `src` 必须是仓库内、全链无 symlink 的 regular file；`target` 必须是规范相对路径，
+/// 且属于任务 writeSet、不得命中任务 frozenPaths。重复 target 也会被拒绝，防止后一个
+/// seed 静默覆盖前一个。已落位 target 还会先经过非追溯 SHA-256 基线守卫；收取期同时
+/// 核对候选快照，防止把冻结测试放进 writeSet 后在合并前篡改。授权型 plan 使用
+/// [`validate_seed_paths_for_authorized_plan`] 保留同样的 materialized replay 强度，
+/// 再以一次捕获的 exact main OID 做完整 writeSet/anchor 准入。
+pub fn validate_seed_paths(root: &Path, c: &card::Card) -> Result<()> {
+    validate_seed_path_shape(root, c)?;
+    if !gitx::branch_exists(root, "main") {
+        return Ok(());
+    }
+    let canonical_root = canonical_directory(root, "仓库 root")?;
+    let git_toplevel = gitx::rev_parse(root, "--show-toplevel")?;
+    let canonical_toplevel = fs::canonicalize(&git_toplevel)
+        .with_context(|| format!("解析 Git toplevel 失败: {git_toplevel}"))?;
+    if canonical_root != canonical_toplevel {
+        // Synthetic roots may live beneath this repository's ignored target/
+        // tree.  Git searches parent directories, but their `main` and landed
+        // manifest do not govern the nested fixture.
+        return Ok(());
+    }
+    let main_oid = gitx::rev_parse(root, "refs/heads/main^{commit}")?;
+    // The migration baseline is deliberately non-retroactive.  Read-only
+    // recompilation of an already closed round must keep that round's signed
+    // planning semantics; otherwise every archived card would be rejudged as
+    // a brand-new seed attempt against a baseline created years later.  Live
+    // rounds and every exact candidate still traverse the landed guard below.
+    if card_round_is_closed_at_main(root, &main_oid, c)? {
+        return Ok(());
+    }
+    // Keep this compatibility entry point cheap and pre-action safe: planning,
+    // copying, and red replay all call it.  An already materialized seed target
+    // may only be replayed byte-for-byte.  The expensive signed-genesis census,
+    // direct edits outside `seeds[]`, and supersession authorization belong to
+    // `validate_seed_paths_for_candidate`, where mech supplies exact P/main
+    // object IDs instead of movable refs.
+    validate_materialized_seed_replay(&canonical_root, c)
 }
 
 /// 将任务卡 seeds 安全落位到已存在的 worktree。
@@ -703,7 +2582,8 @@ pub fn classify_compile_identity_shift(
 
 /// Additive observation wrapper. `Measured` remains source-compatible for
 /// archived struct literals, while schema-v2 JSON gains `compileIdentity`
-/// beside the legacy measured fields through `flatten`.
+/// beside the legacy measured fields through `flatten`. A live preverify may also hold an internal
+/// one-shot gate observation; it is never serialized and is published only after expected-red proof.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OracleObservation {
     #[serde(flatten)]
@@ -714,6 +2594,65 @@ pub struct OracleObservation {
         default
     )]
     pub compile_identity: Option<CompileRedIdentity>,
+    #[serde(skip)]
+    pending_gate_execution: Option<Arc<Mutex<Option<PendingGateExecution>>>>,
+}
+
+struct PendingGateExecution {
+    root: PathBuf,
+    round: String,
+    task_id: String,
+    gate_run_id: String,
+    subject_tree_sha: String,
+    result: gate::GateResult,
+    fingerprint: gate::GateEnvironmentFingerprint,
+}
+
+impl std::fmt::Debug for PendingGateExecution {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingGateExecution")
+            .field("round", &self.round)
+            .field("task_id", &self.task_id)
+            .field("gate_run_id", &self.gate_run_id)
+            .field("gate", &self.result.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingGateExecution {
+    fn record(&self) -> Result<()> {
+        gate::record_gate_execution(
+            &self.root,
+            &self.round,
+            crate::ledger::GateAuditIdentity::PreAttempt {
+                task_id: &self.task_id,
+            },
+            GATE_EXECUTED_SCHEMA,
+            gate::GatePhase::RedReplay,
+            &self.gate_run_id,
+            &self.subject_tree_sha,
+            &self.result,
+            &self.fingerprint,
+        )
+    }
+}
+
+impl OracleObservation {
+    fn record_pending_gate_execution(&self) -> Result<()> {
+        let Some(pending) = &self.pending_gate_execution else {
+            return Ok(());
+        };
+        let mut pending = pending
+            .lock()
+            .map_err(|_| anyhow::anyhow!("oracle pending gate observation lock poisoned"))?;
+        let Some(execution) = pending.as_ref() else {
+            return Ok(());
+        };
+        execution.record()?;
+        *pending = None;
+        Ok(())
+    }
 }
 
 fn strictly_sorted<T: Ord>(values: &[T]) -> bool {
@@ -1005,12 +2944,17 @@ pub(crate) fn validate_expected_red_syntax(
     }
 }
 
+/// Prove the card's expected-red claim and only then publish a pending preverify observation.
+///
+/// Syntax, O5 localization, and identity mismatches therefore remain zero-ledger rejections, while
+/// a successful proof still emits the same canonical `GateExecuted` fact before its caller records
+/// `SeedOracleVerified`.
 pub(crate) fn prove_expected_red(
     red_form: &str,
     expected: &str,
     observation: &OracleObservation,
 ) -> Result<ExpectedRedProof, String> {
-    match red_form {
+    let proof = match red_form {
         "compile" => {
             if observation.measured.red_form.as_deref() != Some("compile") {
                 return Err(format!(
@@ -1039,7 +2983,11 @@ pub(crate) fn prove_expected_red(
             validate_expected_assertion_red(expected, &observation.measured)
         }
         other => Err(format!("unknown card redForm {other:?}")),
-    }
+    }?;
+    observation
+        .record_pending_gate_execution()
+        .map_err(|error| format!("persisting preverify GateExecuted failed: {error:#}"))?;
+    Ok(proof)
 }
 
 fn v2_compile_identity(payload: &serde_json::Value) -> Result<CompileRedIdentity, String> {
@@ -1171,12 +3119,32 @@ fn compile_identity_symbols(identity: &CompileRedIdentity) -> Vec<String> {
 fn identity_after_dropping_symbols(
     baseline: &CompileRedIdentity,
     dropped: &[String],
+    upstream: &[String],
 ) -> CompileRedIdentity {
     let dropped = dropped.iter().collect::<BTreeSet<_>>();
+    let upstream = upstream.iter().cloned().collect::<BTreeSet<_>>();
     let diagnostics = baseline
         .diagnostics
         .iter()
         .filter_map(|diagnostic| {
+            let grouped_import_resolved = diagnostic.keys.iter().any(|item| {
+                let Some(item_name) = item.strip_prefix("symbol:") else {
+                    return false;
+                };
+                if item_name.contains("::") || !dropped.contains(item) {
+                    return false;
+                }
+                diagnostic.keys.iter().any(|module| {
+                    let Some(module_name) = module.strip_prefix("symbol:") else {
+                        return false;
+                    };
+                    module_name != item_name
+                        && upstream.contains(&format!("symbol:{module_name}::{item_name}"))
+                })
+            });
+            if grouped_import_resolved {
+                return None;
+            }
             let keys = diagnostic
                 .keys
                 .iter()
@@ -1193,6 +3161,44 @@ fn identity_after_dropping_symbols(
         dialect: baseline.dialect.clone(),
         diagnostics,
     }
+}
+
+fn upstream_symbols_with_grouped_import_aliases(
+    baseline: &CompileRedIdentity,
+    upstream: &[String],
+) -> BTreeSet<String> {
+    let mut explained = upstream.iter().cloned().collect::<BTreeSet<_>>();
+    let authenticated = explained.clone();
+    for diagnostic in &baseline.diagnostics {
+        for item in &diagnostic.keys {
+            let Some(item_name) = item.strip_prefix("symbol:") else {
+                continue;
+            };
+            if item_name.contains("::") {
+                continue;
+            }
+            for module in &diagnostic.keys {
+                let Some(module_name) = module.strip_prefix("symbol:") else {
+                    continue;
+                };
+                if module_name == item_name {
+                    continue;
+                }
+                let qualified = format!("symbol:{module_name}::{item_name}");
+                if authenticated.contains(&qualified) {
+                    explained.insert(item.clone());
+                    // rustc reports a grouped import as a bare item plus its
+                    // module context. When the authenticated `module::item`
+                    // resolves, the whole diagnostic disappears, including
+                    // that contextual module key. The complete-identity seam
+                    // below still requires that atomic disappearance to
+                    // reproduce replay exactly.
+                    explained.insert(module.clone());
+                }
+            }
+        }
+    }
+    explained
 }
 
 fn compile_oracle_replay_match(
@@ -1218,16 +3224,22 @@ fn compile_oracle_replay_match(
 
     let baseline_symbols = compile_identity_symbols(baseline);
     let replay_symbols = compile_identity_symbols(replay);
+    let upstream_with_aliases = upstream_symbols_with_grouped_import_aliases(
+        baseline,
+        upstream_provided_symbols,
+    )
+    .into_iter()
+    .collect::<Vec<_>>();
     if let CompileIdentityShift::LegitimateShrink { dropped } = classify_compile_identity_shift(
         &baseline_symbols,
         &replay_symbols,
-        upstream_provided_symbols,
+        &upstream_with_aliases,
     ) {
         // The symbol classifier is intentionally small and pure. The replay
         // seam additionally proves that removing exactly those symbols from
         // the complete coded identity yields replay, so code/message changes
         // cannot hide behind a symbol-only shrink.
-        if identity_after_dropping_symbols(baseline, &dropped) == *replay {
+        if identity_after_dropping_symbols(baseline, &dropped, upstream_provided_symbols) == *replay {
             return Ok(CompileReplayDecision {
                 matched,
                 legitimate_shrink: Some(LegitimateShrinkEvidence {
@@ -1436,7 +3448,20 @@ fn public_symbols_in_source(path: &str, source: &str) -> BTreeSet<String> {
     source
         .lines()
         .filter_map(public_item_name)
-        .map(|name| format!("symbol:{prefix}::{name}"))
+        .flat_map(|name| {
+            let mut symbols = vec![format!("symbol:{prefix}::{name}")];
+            // rustc reports a grouped import such as
+            // `use orch_host::harness::{self, registry_digest}` as
+            // `symbol:harness::registry_digest`, while an ordinary unresolved
+            // path can retain the crate-qualified
+            // `symbol:orch_host::harness::registry_digest` shape.  Both refer
+            // to the same authenticated public item from the same recorded
+            // upstream merge, so retain both canonical diagnostic spellings.
+            if let Some((_, crate_stripped)) = prefix.split_once("::") {
+                symbols.push(format!("symbol:{crate_stripped}::{name}"));
+            }
+            symbols
+        })
         .collect()
 }
 
@@ -1485,6 +3510,9 @@ fn introduced_public_symbols(
             // well as its public items.  rustc can diagnose the former as
             // `symbol:<crate>::<module>` without naming an item.
             after_symbols.insert(format!("symbol:{prefix}"));
+            if let Some((_, crate_stripped)) = prefix.split_once("::") {
+                after_symbols.insert(format!("symbol:{crate_stripped}"));
+            }
         }
     }
     Some(after_symbols.difference(&before_symbols).cloned().collect())
@@ -1515,11 +3543,20 @@ impl UpstreamSymbolEvidence {
             .collect()
     }
 
-    fn tasks_explaining(&self, dropped: &[String]) -> Vec<String> {
+    fn tasks_explaining(
+        &self,
+        dropped: &[String],
+        baseline: &CompileRedIdentity,
+    ) -> Vec<String> {
         let dropped = dropped.iter().collect::<BTreeSet<_>>();
         self.by_task
             .iter()
-            .filter(|(_, symbols)| symbols.iter().any(|symbol| dropped.contains(symbol)))
+            .filter(|(_, symbols)| {
+                let symbols = symbols.iter().cloned().collect::<Vec<_>>();
+                upstream_symbols_with_grouped_import_aliases(baseline, &symbols)
+                    .iter()
+                    .any(|symbol| dropped.contains(symbol))
+            })
             .map(|(task, _)| task.clone())
             .collect()
     }
@@ -1532,57 +3569,103 @@ fn recorded_upstream_public_symbols(
     events: &[orch_core::EventRecord],
     ledger_clean: bool,
 ) -> UpstreamSymbolEvidence {
+    // A direct dependency carries its already-recorded ancestors into the
+    // candidate baseline. Walk the signed card graph transitively, but admit
+    // symbols only after every visited node proves its unique all-green
+    // TaskRecorded and preceding no-ff MergeExecuted pair.
+    fn collect_recorded_task(
+        root: &Path,
+        round: &str,
+        upstream_task: &str,
+        events: &[orch_core::EventRecord],
+        visiting: &mut BTreeSet<String>,
+        completed: &mut BTreeSet<String>,
+        by_task: &mut BTreeMap<String, BTreeSet<String>>,
+    ) -> Option<()> {
+        if completed.contains(upstream_task) {
+            return Some(());
+        }
+        if !visiting.insert(upstream_task.to_string()) {
+            return None;
+        }
+
+        let upstream_card = card::load(root, round, upstream_task).ok()?;
+        for dependency in &upstream_card.meta.depends_on {
+            collect_recorded_task(
+                root,
+                round,
+                dependency,
+                events,
+                visiting,
+                completed,
+                by_task,
+            )?;
+        }
+        let recorded = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event.kind == "TaskRecorded"
+                    && event.task_id.as_deref() == Some(upstream_task)
+                    && event.round.as_deref() == Some(round)
+                    && event.actor == "runtime:orch"
+                    && event
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("postMergeGates"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("all-green")
+            })
+            .collect::<Vec<_>>();
+        if recorded.len() != 1 {
+            return None;
+        }
+        let recorded_index = recorded[0].0;
+        let merged = events
+            .iter()
+            .enumerate()
+            .filter(|(index, event)| {
+                *index < recorded_index
+                    && event.kind == "MergeExecuted"
+                    && event.task_id.as_deref() == Some(upstream_task)
+                    && event.round.as_deref() == Some(round)
+                    && event.actor == "reviewer:orch-runtime"
+                    && event
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("policy"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("no-ff")
+            })
+            .collect::<Vec<_>>();
+        if merged.len() != 1 {
+            return None;
+        }
+        let merge_sha = merged[0].1.payload.as_ref()?.get("mergeSha")?.as_str()?;
+        let symbols = introduced_public_symbols(root, merge_sha, &upstream_card.meta.write_set)?;
+        by_task.insert(upstream_task.to_string(), symbols);
+        visiting.remove(upstream_task);
+        completed.insert(upstream_task.to_string());
+        Some(())
+    }
+
     let collected = (|| -> Option<UpstreamSymbolEvidence> {
         if !ledger_clean {
             return None;
         }
         let mut by_task = BTreeMap::new();
+        let mut visiting = BTreeSet::new();
+        let mut completed = BTreeSet::new();
         for upstream_task in &c.meta.depends_on {
-            let recorded = events
-                .iter()
-                .enumerate()
-                .filter(|(_, event)| {
-                    event.kind == "TaskRecorded"
-                        && event.task_id.as_deref() == Some(upstream_task)
-                        && event.round.as_deref() == Some(round)
-                        && event.actor == "runtime:orch"
-                        && event
-                            .payload
-                            .as_ref()
-                            .and_then(|payload| payload.get("postMergeGates"))
-                            .and_then(serde_json::Value::as_str)
-                            == Some("all-green")
-                })
-                .collect::<Vec<_>>();
-            if recorded.len() != 1 {
-                return None;
-            }
-            let recorded_index = recorded[0].0;
-            let merged = events
-                .iter()
-                .enumerate()
-                .filter(|(index, event)| {
-                    *index < recorded_index
-                        && event.kind == "MergeExecuted"
-                        && event.task_id.as_deref() == Some(upstream_task)
-                        && event.round.as_deref() == Some(round)
-                        && event.actor == "reviewer:orch-runtime"
-                        && event
-                            .payload
-                            .as_ref()
-                            .and_then(|payload| payload.get("policy"))
-                            .and_then(serde_json::Value::as_str)
-                            == Some("no-ff")
-                })
-                .collect::<Vec<_>>();
-            if merged.len() != 1 {
-                return None;
-            }
-            let merge_sha = merged[0].1.payload.as_ref()?.get("mergeSha")?.as_str()?;
-            let upstream_card = card::load(root, round, upstream_task).ok()?;
-            let symbols =
-                introduced_public_symbols(root, merge_sha, &upstream_card.meta.write_set)?;
-            by_task.insert(upstream_task.clone(), symbols);
+            collect_recorded_task(
+                root,
+                round,
+                upstream_task,
+                events,
+                &mut visiting,
+                &mut completed,
+                &mut by_task,
+            )?;
         }
         Some(UpstreamSymbolEvidence { by_task })
     })();
@@ -1724,6 +3807,7 @@ fn measure_cargo_observation(
                 red_form: Some("compile".into()),
             },
             compile_identity: Some(compile_identity),
+            pending_gate_execution: None,
         });
     }
 
@@ -1747,6 +3831,7 @@ fn measure_cargo_observation(
             red_form: (exit_code != 0 && suite.failed > 0).then(|| "assertion".into()),
         },
         compile_identity: None,
+        pending_gate_execution: None,
     })
 }
 
@@ -1759,7 +3844,7 @@ fn parse_test_gate_observation(
     b: &binding::Binding,
     workdir: &Path,
     seeds: &[card::SeedSpec],
-    g: gate::GateResult,
+    g: &gate::GateResult,
 ) -> Result<OracleObservation> {
     let log = fs::read_to_string(&g.log_path)?;
     match b.oracle.dialect.as_str() {
@@ -1800,6 +3885,7 @@ fn parse_test_gate_observation(
                     red_form: None,
                 },
                 compile_identity: None,
+                pending_gate_execution: None,
             })
         }
         dialect => bail!("不支持的 oracle dialect: {dialect}"),
@@ -1812,7 +3898,6 @@ fn run_test_gate_and_parse_observation_guarded(
     task: &str,
     b: &binding::Binding,
     workdir: &Path,
-    tag: &str,
     seeds: &[card::SeedSpec],
     gate_ref: &str,
 ) -> Result<OracleObservation> {
@@ -1821,6 +3906,16 @@ fn run_test_gate_and_parse_observation_guarded(
         .get(gate_ref)
         .with_context(|| format!("绑定缺命令: {gate_ref}（卡 gates.fast[0] 解析）"))?;
     let log_dir = root.join("coordination/runtime/logs");
+    let gate_run_id = ulid::Ulid::new().to_string();
+    let scoped_tag = gate::phase_scoped_log_tag(
+        round,
+        task,
+        "pre-attempt",
+        gate::GatePhase::RedReplay,
+        &gate_run_id,
+    );
+    let fingerprint = gate::capture_gate_environment_fingerprint(root)?;
+    let subject_tree_sha = gate::capture_gate_subject_tree(root, workdir)?;
     // Expected red is a normal non-zero exit; only admission/spawn/timeout is an execution error.
     let g = gate::run_gate_with_audit_identity(
         root,
@@ -1830,9 +3925,19 @@ fn run_test_gate_and_parse_observation_guarded(
         spec,
         workdir,
         &log_dir,
-        tag,
+        &scoped_tag,
     )?;
-    parse_test_gate_observation(b, workdir, seeds, g)
+    let mut observation = parse_test_gate_observation(b, workdir, seeds, &g)?;
+    observation.pending_gate_execution = Some(Arc::new(Mutex::new(Some(PendingGateExecution {
+        root: root.to_path_buf(),
+        round: round.to_string(),
+        task_id: task.to_string(),
+        gate_run_id,
+        subject_tree_sha,
+        result: g,
+        fingerprint,
+    }))));
+    Ok(observation)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1843,7 +3948,8 @@ fn run_test_gate_and_parse_observation_with_permit(
     permit: &crate::storage::StoragePermit,
     b: &binding::Binding,
     workdir: &Path,
-    tag: &str,
+    gate_run_id: &str,
+    scoped_tag: &str,
     seeds: &[card::SeedSpec],
     gate_ref: &str,
 ) -> Result<OracleObservation> {
@@ -1863,10 +3969,39 @@ fn run_test_gate_and_parse_observation_with_permit(
             root.join("orch/target"),
         ],
     )?;
+    let expected_tag = gate::phase_scoped_log_tag(
+        round,
+        identity.task_id(),
+        identity.attempt_id().unwrap_or("pre-attempt"),
+        gate::GatePhase::RedReplay,
+        gate_run_id,
+    );
+    if scoped_tag != expected_tag {
+        bail!("red replay gate tag 未绑定 typed round/task/attempt/run identity");
+    }
+    let fingerprint = gate::capture_gate_environment_fingerprint(root)?;
+    let subject_tree_sha = gate::capture_gate_subject_tree(root, workdir)?;
     let g = gate::run_gate_with_permit_and_identity(
-        permit, identity, gate_ref, spec, workdir, &log_dir, tag,
+        permit,
+        identity,
+        gate_ref,
+        spec,
+        workdir,
+        &log_dir,
+        scoped_tag,
     )?;
-    parse_test_gate_observation(b, workdir, seeds, g)
+    gate::record_gate_execution(
+        root,
+        round,
+        identity,
+        GATE_EXECUTED_SCHEMA,
+        gate::GatePhase::RedReplay,
+        gate_run_id,
+        &subject_tree_sha,
+        &g,
+        &fingerprint,
+    )?;
+    parse_test_gate_observation(b, workdir, seeds, &g)
 }
 
 /// Oracle preverification with the schema-v2 observation retained. The public
@@ -1915,7 +4050,6 @@ pub(crate) fn preverify_observation(
             &c.meta.task_id,
             &b,
             &wt,
-            &format!("_oracle-{}", c.meta.task_id),
             &c.meta.seeds,
             &gate_ref,
         )
@@ -1992,6 +4126,8 @@ fn parse_suite_counts_for_dialect(dialect: &str, log: &str) -> Option<SuiteCount
 /// ②叙事核验：REPORT §3 声称的 vitest 计数（若可解析）与实测比对（防报数造假——r6/B9 实测：
 ///   只核事实拦不住「事实真+叙事谎」，必须读叙事数字）。
 /// 不符 = bail（机检 FAIL）；旧轮无 measured 基线则记录并放行（向后兼容）。
+/// `gate_run_id` 与 `scoped_gate_tag` 必须精确绑定本 round/task/attempt 的 red-replay phase；
+/// 身份不一致时在 spawn 前拒绝，避免日志与 durable observation 指向不同的运行。
 pub fn replay_seed_red(
     root: &Path,
     round: &str,
@@ -2000,9 +4136,21 @@ pub fn replay_seed_red(
     worktree: &Path,
     attempt_id: &str,
     storage_permit: &crate::storage::StoragePermit,
+    gate_run_id: &str,
+    scoped_gate_tag: &str,
 ) -> Result<()> {
     if c.meta.seeds.is_empty() {
         return Ok(());
+    }
+    let expected_gate_tag = gate::phase_scoped_log_tag(
+        round,
+        &c.meta.task_id,
+        attempt_id,
+        gate::GatePhase::RedReplay,
+        gate_run_id,
+    );
+    if scoped_gate_tag != expected_gate_tag {
+        bail!("red replay gate tag 未绑定 typed round/task identity");
     }
     validate_seed_paths(root, c)?;
     let b = binding::load(root)?;
@@ -2040,7 +4188,8 @@ pub fn replay_seed_red(
         storage_permit,
         &b,
         worktree,
-        &format!("{}-redreplay", c.meta.task_id),
+        gate_run_id,
+        scoped_gate_tag,
         &c.meta.seeds,
         &gate_ref,
     );
@@ -2108,6 +4257,11 @@ pub fn replay_seed_red(
                 lr.bad_lines.is_empty(),
             );
             let upstream_symbols = upstream.symbols();
+            let (_, seed_baseline) = compile_oracle_baseline_state(&task_payloads)?;
+            let attribution_baseline = effective_rebaseline
+                .as_ref()
+                .or(seed_baseline.as_ref())
+                .cloned();
             compile_oracle_replay_match(
                 &task_payloads,
                 effective_rebaseline.as_ref(),
@@ -2115,8 +4269,12 @@ pub fn replay_seed_red(
                 &upstream_symbols,
             )
             .map(|mut decision| {
-                if let Some(evidence) = decision.legitimate_shrink.as_mut() {
-                    evidence.upstream_tasks = upstream.tasks_explaining(&evidence.dropped);
+                if let (Some(evidence), Some(baseline)) = (
+                    decision.legitimate_shrink.as_mut(),
+                    attribution_baseline.as_ref(),
+                ) {
+                    evidence.upstream_tasks =
+                        upstream.tasks_explaining(&evidence.dropped, baseline);
                 }
                 decision
             })
@@ -2287,6 +4445,138 @@ pub fn seed_red_localized(
 mod tests {
     use super::*;
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ExpectedDynamicAnchor {
+        original_event_id: String,
+        original_sha256: String,
+        digest: Option<String>,
+        effective: card::FrozenEffectiveAnchor,
+    }
+
+    fn expected_recorded_dynamic_anchors(
+        root: &Path,
+        main_oid: &str,
+        events: &[EventRecord],
+        genesis_relocation_ids: &BTreeSet<String>,
+        genesis_anchors: &BTreeMap<
+            String,
+            (Option<String>, card::FrozenEffectiveAnchor),
+        >,
+    ) -> Result<BTreeMap<String, ExpectedDynamicAnchor>> {
+        let mut known = genesis_anchors.clone();
+        let mut dynamic = BTreeMap::<String, ExpectedDynamicAnchor>::new();
+
+        // Keep this delta predicate in lockstep with load_signed_baseline's
+        // immutable-genesis replay block above.
+        for (position, event) in events.iter().enumerate() {
+            if event.kind == "SeedRelocated" {
+                if genesis_relocation_ids.contains(&event.event_id) {
+                    continue;
+                }
+                let payload: SeedRelocatedPayload = serde_json::from_value(
+                    event
+                        .payload
+                        .clone()
+                        .context("dynamic SeedRelocated 缺 payload")?,
+                )
+                .context("dynamic SeedRelocated payload 非 closed schema")?;
+                let (Some(round), Some(task_id)) =
+                    (event.round.as_deref(), event.task_id.as_deref())
+                else {
+                    bail!("dynamic SeedRelocated 缺 round/taskId: {}", event.event_id);
+                };
+                validate_relocation_event(
+                    events,
+                    &event.event_id,
+                    round,
+                    task_id,
+                    &payload.target,
+                    &payload.sha256,
+                )?;
+                canonical_repo_relative(&payload.target, "dynamic landed target")?;
+                let recorded = events[position + 1..].iter().any(|candidate| {
+                    candidate.kind == "TaskRecorded"
+                        && candidate.actor == "runtime:orch"
+                        && candidate.round.as_deref() == Some(round)
+                        && candidate.task_id.as_deref() == Some(task_id)
+                        && candidate
+                            .payload
+                            .as_ref()
+                            .and_then(|payload| payload.get("postMergeGates"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("all-green")
+                });
+                if !recorded {
+                    continue;
+                }
+
+                match known.entry(payload.target.clone()) {
+                    std::collections::btree_map::Entry::Occupied(mut existing) => {
+                        if existing.get().0.as_deref() != Some(&payload.sha256) {
+                            bail!(
+                                "dynamic SeedRelocated 不得覆盖既有 frozen anchor（须 FrozenContractSuperseded）: {}",
+                                payload.target
+                            );
+                        }
+                        if existing.get().1.kind == "seed-relocated" {
+                            existing.get_mut().1.event_id = Some(event.event_id.clone());
+                            if let Some(expected) = dynamic.get_mut(&payload.target) {
+                                expected.effective.event_id = Some(event.event_id.clone());
+                            }
+                        }
+                    }
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        let effective = card::FrozenEffectiveAnchor {
+                            kind: "seed-relocated".to_string(),
+                            event_id: Some(event.event_id.clone()),
+                            baseline_tree_sha: None,
+                            sha256: Some(payload.sha256.clone()),
+                        };
+                        entry.insert((Some(payload.sha256.clone()), effective.clone()));
+                        dynamic.insert(
+                            payload.target,
+                            ExpectedDynamicAnchor {
+                                original_event_id: event.event_id.clone(),
+                                original_sha256: payload.sha256.clone(),
+                                digest: Some(payload.sha256),
+                                effective,
+                            },
+                        );
+                    }
+                }
+            } else if event.kind == "FrozenContractSuperseded" {
+                let payload =
+                    crate::verify::validate_frozen_contract_supersession_delta_for_replay(
+                        root, main_oid, events, position,
+                    )?;
+                if !is_canonical_sha256(&payload.new_file_sha256) {
+                    bail!("supersession newFileSha256 非 canonical");
+                }
+                let known_anchor = known
+                    .get_mut(&payload.target)
+                    .with_context(|| format!("supersession target 无 genesis: {}", payload.target))?;
+                if known_anchor.0.as_deref() != Some(&payload.old_file_sha256)
+                    || known_anchor.1 != payload.effective_anchor
+                {
+                    bail!("supersession effective-anchor chain mismatch: {}", payload.target);
+                }
+                let effective = card::FrozenEffectiveAnchor {
+                    kind: "frozen-contract-superseded".to_string(),
+                    event_id: Some(event.event_id.clone()),
+                    baseline_tree_sha: None,
+                    sha256: Some(payload.new_file_sha256.clone()),
+                };
+                known_anchor.0 = Some(payload.new_file_sha256.clone());
+                known_anchor.1 = effective.clone();
+                if let Some(expected) = dynamic.get_mut(&payload.target) {
+                    expected.digest = Some(payload.new_file_sha256);
+                    expected.effective = effective;
+                }
+            }
+        }
+        Ok(dynamic)
+    }
+
     const LOG_RED: &str = "\
  ❯ test/product.test.ts (5 tests | 5 failed) 3ms
    × product (contract B6) > ① multiplies values 2ms
@@ -2302,6 +4592,278 @@ mod tests {
  Test Files  8 passed (8)
       Tests  43 passed (43)
 ";
+
+    fn quoted_hash(hash: &str) -> String {
+        format!("before \"{hash}\" after")
+    }
+
+    #[test]
+    fn one_hash_swap_allows_shared_nibbles_and_unchanged_hashes() {
+        let old = format!("a{}f", "1".repeat(62));
+        let new = format!("a{}f", "2".repeat(62));
+        let untouched = "3".repeat(64);
+        let before = format!("{} / {}", quoted_hash(&untouched), quoted_hash(&old));
+        let after = format!("{} / {}", quoted_hash(&untouched), quoted_hash(&new));
+        assert_eq!(single_hash_literal_swap(&before, &after), Some((old, new)));
+    }
+
+    #[test]
+    fn hash_swap_is_byte_exact_and_canonical() {
+        let old = "a".repeat(64);
+        let new = "2".repeat(64);
+        assert!(single_hash_literal_swap(&quoted_hash(&old), &quoted_hash(&old)).is_none());
+        assert!(
+            single_hash_literal_swap(&quoted_hash(&old), &format!("{}!", quoted_hash(&new)))
+                .is_none()
+        );
+        assert!(single_hash_literal_swap(
+            &quoted_hash(&format!("{}0", old)),
+            &quoted_hash(&format!("{}0", new))
+        )
+        .is_none());
+        assert!(
+            single_hash_literal_swap(&quoted_hash(&old.to_uppercase()), &quoted_hash(&new))
+                .is_none()
+        );
+        assert_eq!(
+            single_hash_literal_swap(
+                &format!("中文{}尾", quoted_hash(&old)),
+                &format!("中文{}尾", quoted_hash(&new))
+            ),
+            Some((old, new))
+        );
+        let old = "a".repeat(64);
+        let new = "2".repeat(64);
+        assert!(single_hash_literal_swap(
+            &format!("left-A {} right", quoted_hash(&old)),
+            &format!("left-B {} right", quoted_hash(&new)),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn supersession_authorization_rejects_missing_or_malformed_anchors() {
+        let digest = "a".repeat(64);
+        assert!(frozen_contract_supersession_authorized(
+            "runtime:orch",
+            true,
+            None,
+            &digest,
+            &digest
+        )
+        .is_err());
+        assert!(frozen_contract_supersession_authorized(
+            "runtime:orch",
+            true,
+            Some(&digest.to_uppercase()),
+            &digest,
+            &digest
+        )
+        .is_err());
+        assert!(
+            frozen_contract_supersession_authorized("runtime:orch", true, Some(""), "", "")
+                .is_err()
+        );
+        let other = "b".repeat(64);
+        assert!(frozen_contract_supersession_authorized(
+            "runtime:orch",
+            true,
+            Some(&digest),
+            &other,
+            &digest,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn landed_write_set_census_consumes_the_supplied_exact_oid() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .unwrap();
+        if !gitx::branch_exists(root, "main") {
+            return;
+        }
+        let error = collect_landed_write_set_conflicts(
+            root,
+            &"f".repeat(40),
+            &["orch/crates/orch-host/tests/**".to_string()],
+            &BTreeSet::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn signed_landed_seed_manifest_matches_the_current_tree() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest_dir.ancestors().nth(3).unwrap();
+        if !gitx::branch_exists(root, "main") {
+            return;
+        }
+        let main = gitx::rev_parse(root, "refs/heads/main^{commit}").unwrap();
+        let binding_bytes =
+            gitx::show_bytes(root, &main, "coordination/PROJECT-BINDING.yaml").unwrap();
+        let bound = binding::parse_binding_bytes(&binding_bytes).unwrap();
+        let Some(descriptor) = bound.oracle.landed_seed_baseline.as_ref() else {
+            return;
+        };
+        let manifest_bytes = gitx::show_bytes(root, &main, &descriptor.path).unwrap();
+        binding::parse_landed_seed_baseline(descriptor, &manifest_bytes).unwrap();
+        assert_eq!(sha256_hex(&manifest_bytes), descriptor.sha256);
+        let manifest: BaselineManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        let genesis_anchors = manifest
+            .targets
+            .iter()
+            .map(|target| {
+                (
+                    target.target.clone(),
+                    (
+                        target.effective_sha256.clone(),
+                        baseline_anchor_as_card(&target.effective_anchor),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(manifest.targets.len(), 225);
+        assert_eq!(genesis_anchors.len(), manifest.targets.len());
+        assert_eq!(
+            manifest.counts.unique_effective_targets_through_b269,
+            manifest.targets.len()
+        );
+        assert_eq!(
+            manifest
+                .targets
+                .iter()
+                .filter(|target| target.effective_sha256.is_none())
+                .count(),
+            1
+        );
+        assert_eq!(
+            manifest
+                .targets
+                .iter()
+                .filter(|target| target.effective_anchor.kind == "migration-tombstone")
+                .count(),
+            1
+        );
+        assert_eq!(
+            manifest
+                .targets
+                .iter()
+                .filter(|target| target.effective_anchor.kind == "migration-baseline")
+                .count(),
+            34
+        );
+
+        let genesis_relocation_ids = manifest
+            .targets
+            .iter()
+            .flat_map(|target| &target.sources)
+            .flat_map(|source| &source.seed_relocated)
+            .map(|relocation| relocation.event_id.clone())
+            .collect::<BTreeSet<_>>();
+        let events = committed_tree_events(root, &main).unwrap();
+        let (anchors, _) = load_signed_baseline(root, &main).unwrap();
+        if anchors.is_empty() {
+            return;
+        }
+        let dynamic = expected_recorded_dynamic_anchors(
+            root,
+            &main,
+            &events,
+            &genesis_relocation_ids,
+            &genesis_anchors,
+        )
+        .unwrap();
+        assert!(
+            !dynamic.is_empty(),
+            "current tree must exercise at least one recorded post-genesis relocation"
+        );
+        let expected_targets = genesis_anchors
+            .keys()
+            .chain(dynamic.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let actual_targets = anchors.keys().cloned().collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual_targets, expected_targets,
+            "effective targets must exactly equal signed genesis plus recorded dynamic relocations"
+        );
+        let pending =
+            crate::verify::pending_frozen_record_context_from_committed_main(
+                root, &main, &events,
+            )
+            .unwrap()
+            .map(|(_, card)| {
+                card.meta
+                    .frozen_contract_supersessions
+                    .into_iter()
+                    .map(|declaration| (declaration.target, declaration.new_file_sha256))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        for (target, expected) in &dynamic {
+            let actual = anchors.get(target).unwrap();
+            assert_eq!(
+                actual.original_event_id, expected.original_event_id,
+                "{target}"
+            );
+            assert_eq!(actual.original_sha256, expected.original_sha256, "{target}");
+            assert!(!actual.grandfathered_drift, "{target}");
+            if let Some(pending_digest) = pending.get(target) {
+                assert_eq!(actual.digest.as_deref(), Some(pending_digest.as_str()));
+            } else {
+                assert_eq!(actual.digest, expected.digest, "{target}");
+            }
+            assert_eq!(actual.effective, expected.effective, "{target}");
+        }
+        for (target, expected) in &anchors {
+            assert_eq!(
+                tree_landed_digest(root, &main, target).unwrap(),
+                expected.digest,
+                "migration baseline drifted: {target}"
+            );
+        }
+        let meta = serde_yaml::from_str::<card::CardMeta>("taskId: baseline-probe\n").unwrap();
+        let probe = card::Card {
+            meta,
+            body: String::new(),
+            rel_path: "<baseline-probe>".to_string(),
+        };
+        validate_landed_seed_digests_exact(root, &probe, &main, &main).unwrap();
+    }
+
+    #[test]
+    fn a_later_seed_relocation_cannot_revive_a_landed_tombstone() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest_dir.ancestors().nth(3).unwrap();
+        if !gitx::branch_exists(root, "main") {
+            return;
+        }
+        let main = gitx::rev_parse(root, "refs/heads/main^{commit}").unwrap();
+        let (anchors, _) = load_signed_baseline(root, &main).unwrap();
+        if anchors.is_empty() {
+            return;
+        }
+        let target = anchors
+            .iter()
+            .find_map(|(target, anchor)| anchor.digest.is_none().then_some(target))
+            .unwrap()
+            .clone();
+        let meta = serde_yaml::from_str::<card::CardMeta>(&format!(
+            "taskId: overwrite-probe\nseeds:\n  - src: orch/Cargo.toml\n    target: {target}\n"
+        ))
+        .unwrap();
+        let probe = card::Card {
+            meta,
+            body: String::new(),
+            rel_path: "<overwrite-probe>".to_string(),
+        };
+        let error = validate_landed_seed_digests_exact(root, &probe, &main, &main).unwrap_err();
+        assert!(error.to_string().contains("覆盖已落位冻结 target"));
+    }
 
     #[test]
     fn parses_red_suite_and_file() {
@@ -2599,6 +5161,9 @@ pub const VALUE: usize = 1;
                 "symbol:orch_host::wake::Exported".to_string(),
                 "symbol:orch_host::wake::VALUE".to_string(),
                 "symbol:orch_host::wake::run".to_string(),
+                "symbol:wake::Exported".to_string(),
+                "symbol:wake::VALUE".to_string(),
+                "symbol:wake::run".to_string(),
             ]
             .into_iter()
             .collect()
@@ -2608,6 +5173,216 @@ pub const VALUE: usize = 1;
             Some("orch_core")
         );
         assert!(public_module_prefix("orch/crates/orch-cli/src/main.rs").is_none());
+    }
+
+    #[test]
+    fn r77_recorded_dependency_exposes_the_grouped_import_alias() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest_dir.ancestors().nth(3).unwrap();
+        if !gitx::branch_exists(root, "main") {
+            return;
+        }
+        let ledger = read_ledger(&root.join("coordination/rounds/r77/events.jsonl")).unwrap();
+        let card = card::load(root, "r77", "B294").unwrap();
+        let evidence = recorded_upstream_public_symbols(
+            root,
+            "r77",
+            &card,
+            &ledger.events,
+            ledger.bad_lines.is_empty(),
+        );
+        assert_eq!(card.meta.depends_on, ["B293"]);
+        assert!(
+            evidence
+                .by_task
+                .get("B293")
+                .is_some_and(|symbols| symbols.contains("symbol:harness::registry_digest")),
+            "B293 recorded evidence must explain B294 grouped import: {:?}",
+            evidence.by_task
+        );
+    }
+
+    #[test]
+    fn r77_b294_replay_is_a_legitimate_recorded_dependency_shrink() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest_dir.ancestors().nth(3).unwrap();
+        if !gitx::branch_exists(root, "main") {
+            return;
+        }
+        let ledger = read_ledger(&root.join("coordination/rounds/r77/events.jsonl")).unwrap();
+        let card = card::load(root, "r77", "B294").unwrap();
+        let task_payloads = ledger
+            .events
+            .iter()
+            .filter(|event| {
+                event.kind == "SeedOracleVerified"
+                    && event.task_id.as_deref() == Some("B294")
+            })
+            .filter_map(|event| event.payload.clone())
+            .collect::<Vec<_>>();
+        let evidence = recorded_upstream_public_symbols(
+            root,
+            "r77",
+            &card,
+            &ledger.events,
+            ledger.bad_lines.is_empty(),
+        );
+        let replay = CompileRedIdentity {
+            dialect: "rustc".to_string(),
+            diagnostics: vec![
+                CompileDiagnostic {
+                    code: "E0425".to_string(),
+                    keys: vec![
+                        "symbol:ENVELOPE_KEYS".to_string(),
+                        "symbol:harness".to_string(),
+                    ],
+                },
+                CompileDiagnostic {
+                    code: "E0425".to_string(),
+                    keys: vec![
+                        "symbol:NO_REVIEW_OUTPUT".to_string(),
+                        "symbol:harness".to_string(),
+                    ],
+                },
+                CompileDiagnostic {
+                    code: "E0432".to_string(),
+                    keys: vec!["symbol:orch_host::harness::InvocationEnvelope".to_string()],
+                },
+                CompileDiagnostic {
+                    code: "E0583".to_string(),
+                    keys: vec!["symbol:harness_invocation_envelope_support".to_string()],
+                },
+            ],
+        };
+        let upstream_symbols = evidence.symbols();
+        let with_aliases = upstream_symbols_with_grouped_import_aliases(
+            &v2_compile_identity(task_payloads.last().unwrap()).unwrap(),
+            &upstream_symbols,
+        );
+        assert!(
+            with_aliases.contains("symbol:registry_digest"),
+            "grouped-import context must explain the bare item: {with_aliases:?}"
+        );
+        assert!(
+            !upstream_symbols_with_grouped_import_aliases(
+                &v2_compile_identity(task_payloads.last().unwrap()).unwrap(),
+                &["symbol:other::registry_digest".to_string()],
+            )
+            .contains("symbol:registry_digest"),
+            "an unrelated module with the same item name must not explain the shrink"
+        );
+        let decision = compile_oracle_replay_match(
+            &task_payloads,
+            None,
+            &replay,
+            &upstream_symbols,
+        )
+        .unwrap();
+        let shrink = decision
+            .legitimate_shrink
+            .expect("B294 must be recognized as a legitimate shrink");
+        assert_eq!(shrink.dropped, ["symbol:registry_digest"]);
+    }
+
+    #[test]
+    fn r77_b296_replay_accepts_symbols_from_transitive_recorded_dependencies() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest_dir.ancestors().nth(3).unwrap();
+        if !gitx::branch_exists(root, "main") {
+            return;
+        }
+        let ledger = read_ledger(&root.join("coordination/rounds/r77/events.jsonl")).unwrap();
+        let card = card::load(root, "r77", "B296").unwrap();
+        let task_payloads = ledger
+            .events
+            .iter()
+            .filter(|event| {
+                event.kind == "SeedOracleVerified"
+                    && event.task_id.as_deref() == Some("B296")
+            })
+            .filter_map(|event| event.payload.clone())
+            .collect::<Vec<_>>();
+        let evidence = recorded_upstream_public_symbols(
+            root,
+            "r77",
+            &card,
+            &ledger.events,
+            ledger.bad_lines.is_empty(),
+        );
+        assert_eq!(card.meta.depends_on, ["B295"]);
+        assert_eq!(
+            evidence.by_task.keys().cloned().collect::<Vec<_>>(),
+            vec!["B293".to_string(), "B294".to_string(), "B295".to_string()],
+            "the authenticated dependency closure must include B295 -> B294 -> B293"
+        );
+        assert!(
+            evidence
+                .by_task
+                .get("B294")
+                .is_some_and(|symbols| symbols
+                    .contains("symbol:orch_host::harness::ENVELOPE_KEYS")),
+            "B294 recorded evidence must explain ENVELOPE_KEYS: {:?}",
+            evidence.by_task
+        );
+        assert!(
+            evidence
+                .by_task
+                .get("B295")
+                .is_some_and(|symbols| symbols
+                    .contains("symbol:orch_host::harness::TerminalState")),
+            "B295 recorded evidence must explain TerminalState: {:?}",
+            evidence.by_task
+        );
+
+        let replay = CompileRedIdentity {
+            dialect: "rustc".to_string(),
+            diagnostics: vec![
+                CompileDiagnostic {
+                    code: "E0277".to_string(),
+                    keys: vec![
+                        "message:the trait bound `*const _: AsRef<Path>` is not satisfied"
+                            .to_string(),
+                    ],
+                },
+                CompileDiagnostic {
+                    code: "E0425".to_string(),
+                    keys: vec![
+                        "symbol:wake".to_string(),
+                        "symbol:write_nongate_receipt".to_string(),
+                    ],
+                },
+                CompileDiagnostic {
+                    code: "E0583".to_string(),
+                    keys: vec!["symbol:agy_admission_and_derived_receipts_support".to_string()],
+                },
+            ],
+        };
+        let upstream_symbols = evidence.symbols();
+        let decision = compile_oracle_replay_match(
+            &task_payloads,
+            None,
+            &replay,
+            &upstream_symbols,
+        )
+        .unwrap();
+        let shrink = decision
+            .legitimate_shrink
+            .expect("B296 must recognize its recorded dependency closure");
+        assert_eq!(
+            shrink.dropped,
+            [
+                "symbol:ENVELOPE_KEYS",
+                "symbol:orch_host::harness",
+                "symbol:orch_host::harness::TerminalState",
+            ]
+        );
+        assert_eq!(
+            evidence.tasks_explaining(
+                &shrink.dropped,
+                &v2_compile_identity(task_payloads.last().unwrap()).unwrap(),
+            ),
+            ["B294", "B295"]
+        );
     }
 
     #[test]
@@ -2724,5 +5499,41 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n
             red_replay_gate(&["testFast".to_string()]).unwrap(),
             "testFast"
         );
+    }
+
+    #[test]
+    fn oracle_boundary_scopes_runner_artifacts_before_spawn() {
+        let root = crate::util::test_scratch_dir("b272-oracle-scoped-gate");
+        let log_dir = root.join("coordination/runtime/logs");
+        fs::create_dir_all(&log_dir).unwrap();
+        let spec = binding::CommandSpec {
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                ": > \"$ORCH_GATE_FIXTURE_REGISTRY\"; echo oracle-green".into(),
+            ],
+            timeout_seconds: 30,
+            trial_timeout_seconds: None,
+            approval: None,
+        };
+        let scoped_tag = gate::phase_scoped_log_tag(
+            "r71",
+            "B272",
+            "pre-attempt",
+            gate::GatePhase::RedReplay,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
+        let result = gate::run_gate("testFast", &spec, &root, &log_dir, &scoped_tag).unwrap();
+        assert_eq!(result.exit_code, 0);
+
+        let stem =
+            "B272-round-r71-pre-attempt-red-replay-01ARZ3NDEKTSV4RRFFQ69G5FAV-gate-testFast";
+        for extension in ["log", "hb", "fixtures"] {
+            assert!(
+                log_dir.join(format!("{stem}.{extension}")).is_file(),
+                "oracle runner sibling missing: {extension}"
+            );
+        }
+        assert!(!log_dir.join("B272-gate-testFast.log").exists());
     }
 }

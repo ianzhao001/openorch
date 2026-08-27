@@ -15,6 +15,21 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const AGENT: &str = "executor-opencode";
+const CLI_SOURCE: &str = include_str!("../src/main.rs");
+
+#[test]
+fn handshake_reuses_the_durable_signed_receipt_expectation() {
+    let start = CLI_SOURCE
+        .find("fn cmd_handshake(")
+        .expect("cmd_handshake must exist");
+    let end = CLI_SOURCE[start..]
+        .find("fn cmd_resume(")
+        .map(|offset| start + offset)
+        .expect("cmd_resume must follow handshake");
+    let body = &CLI_SOURCE[start..end];
+    assert!(body.contains("backend_receipt_expectation_for_wake"));
+    assert!(!body.contains("BackendReceiptExpectation::new"));
+}
 
 fn fixture_orch_command(extras: &[(&str, &str)]) -> Command {
     let mut command = Command::new(support::orch_bin());

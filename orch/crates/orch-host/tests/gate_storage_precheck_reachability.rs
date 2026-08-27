@@ -197,7 +197,7 @@ fn fresh_and_held_production_closures_are_complete() {
         oracle,
         &["gate::run_gate_with_permit_and_identity("],
     );
-    assert_eq!(count(oracle, "GateAuditIdentity::PreAttempt"), 1);
+    assert_eq!(count(oracle, "GateAuditIdentity::PreAttempt"), 2);
     assert_eq!(count(oracle, "GateAuditIdentity::Attempt"), 1);
     let replay = item(oracle, "pub fn replay_seed_red(");
     assert!(replay.contains("storage_permit: &crate::storage::StoragePermit"));
@@ -230,7 +230,7 @@ fn fresh_and_held_production_closures_are_complete() {
             production_prefix(&close),
             "attempt_id: &authorization.attempt_id"
         ),
-        4,
+        8,
         "every close gate must inherit the durable root authorization attempt"
     );
 }

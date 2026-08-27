@@ -158,11 +158,11 @@ impl ProviderKind {
     /// 稳定字符串（告警 / snapshot 投影用；不参与判据）。
     pub fn as_str(&self) -> &'static str {
         match self {
-            ProviderKind::Codex => "codex",
-            ProviderKind::OpenCode => "opencode",
-            ProviderKind::SmartClaw => "smartclaw",
-            ProviderKind::Agy => "agy",
-            ProviderKind::Dclaw => "dclaw",
+            ProviderKind::Codex => crate::harness::HarnessId::Codex.as_str(),
+            ProviderKind::OpenCode => crate::harness::HarnessId::OpenCode.as_str(),
+            ProviderKind::SmartClaw => crate::harness::HarnessId::SmartClaw.as_str(),
+            ProviderKind::Agy => crate::harness::HarnessId::Agy.as_str(),
+            ProviderKind::Dclaw => crate::harness::HarnessId::Dclaw.as_str(),
         }
     }
 }

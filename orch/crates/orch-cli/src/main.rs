@@ -60,6 +60,12 @@ enum Cmd {
         #[command(subcommand)]
         action: AgentCmd,
     },
+    /// Activate a signed dormant policy or deactivate its exact active generation.
+    #[command(name = "runtime-policy")]
+    RuntimePolicy {
+        #[command(subcommand)]
+        action: RuntimePolicyCmd,
+    },
     /// 折叠当前轮事件账本为任务状态投影（事件是事实，状态是投影）
     Status,
     /// 打印协议 v0 的 EventRecord JSON Schema
@@ -378,6 +384,39 @@ enum ReviewCmd {
         #[arg(long)]
         agent: String,
     },
+    /// Dynamic review-pool routing commands.
+    Panel {
+        #[command(subcommand)]
+        action: ReviewPanelCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReviewPanelCmd {
+    /// Commit one three-seat panel and its routes before spawning providers.
+    Select {
+        task: String,
+        #[arg(long)]
+        attempt: String,
+        #[arg(long = "seat", required = true)]
+        seats: Vec<String>,
+    },
+    /// Route generation two for one business-invalid seat.
+    Retry {
+        task: String,
+        #[arg(long)]
+        attempt: String,
+        #[arg(long)]
+        seat_id: String,
+    },
+    /// Route one unused signed candidate for a system-terminal-invalid seat.
+    Backfill {
+        task: String,
+        #[arg(long)]
+        attempt: String,
+        #[arg(long)]
+        seat: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -412,6 +451,41 @@ enum AgentCmd {
     List,
     /// Parse and validate the complete registry and every referenced tool.
     Lint,
+    /// Amend only provider/model/effort under the active signed plan and append an audit fact.
+    #[command(name = "set-pin")]
+    SetPin {
+        /// Exact registered agent identity to amend.
+        agent: String,
+        /// Replacement provider pin; omitted means unchanged.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Replacement model pin; omitted means unchanged.
+        #[arg(long)]
+        model: Option<String>,
+        /// Replacement effort pin; omitted means unchanged.
+        #[arg(long)]
+        effort: Option<String>,
+        /// Non-empty attribution recorded with the durable amendment event.
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RuntimePolicyCmd {
+    /// Activate a signed policy after its owner task is Recorded.
+    Activate {
+        /// Exact key under PROJECT-BINDING.runtimePolicies.policies.
+        policy: String,
+    },
+    /// Deactivate an active policy for future dispatch bases.
+    Deactivate {
+        /// Exact signed policy key.
+        policy: String,
+        /// Non-blank durable audit reason.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -588,7 +662,9 @@ fn command_effect_policy(command: &Cmd) -> CommandEffectPolicy {
         | Cmd::Cost { .. }
         | Cmd::Schedule { .. }
         | Cmd::Mcp { .. }
-        | Cmd::Agent { .. } => ReadOnly,
+        | Cmd::Agent {
+            action: AgentCmd::List | AgentCmd::Lint,
+        } => ReadOnly,
         // B151：orch current 只读派生 + 幂等覆写 coordination/CURRENT.md 单文件，
         // 属运行时投影写（同 BOARD 先例），不落账本、无其他副作用；按 ReadOnly 归类
         // 保持 mutating-CLI 枚举测试绿（写 CURRENT.md 不经 active_round_contract lease）。
@@ -641,6 +717,10 @@ fn command_effect_policy(command: &Cmd) -> CommandEffectPolicy {
         | Cmd::Handshake { .. }
         | Cmd::Resume { .. }
         | Cmd::Approve { .. }
+        | Cmd::Agent {
+            action: AgentCmd::SetPin { .. },
+        }
+        | Cmd::RuntimePolicy { .. }
         | Cmd::Run
         | Cmd::Step
         | Cmd::Serve { .. }
@@ -917,8 +997,7 @@ mod round_close_cleanup_tests {
             .iter()
             .any(|line| line.contains("removed=1 refused=1 freedBytes=")));
         assert!(summary.iter().any(|line| {
-            line.contains(&format!("REFUSED {}", dirty.site_id))
-                && line.contains("tracked/staged")
+            line.contains(&format!("REFUSED {}", dirty.site_id)) && line.contains("tracked/staged")
         }));
 
         fs::write(root.join(&dirty.worktree).join("tracked.txt"), "baseline\n").unwrap();
@@ -966,7 +1045,9 @@ fn staleness_command_is_read_only(command: &Cmd) -> bool {
         | Cmd::Schedule { .. }
         | Cmd::Current
         | Cmd::Mcp { .. }
-        | Cmd::Agent { .. } => true,
+        | Cmd::Agent {
+            action: AgentCmd::List | AgentCmd::Lint,
+        } => true,
         _ => false,
     }
 }
@@ -1032,7 +1113,15 @@ fn command_task(command: &Cmd) -> Option<&str> {
     match command {
         Cmd::RunTask { task, .. }
         | Cmd::Review {
-            action: ReviewCmd::Reconcile { task, .. } | ReviewCmd::Deliver { task, .. },
+            action:
+                ReviewCmd::Reconcile { task, .. }
+                | ReviewCmd::Deliver { task, .. }
+                | ReviewCmd::Panel {
+                    action:
+                        ReviewPanelCmd::Select { task, .. }
+                        | ReviewPanelCmd::Retry { task, .. }
+                        | ReviewPanelCmd::Backfill { task, .. },
+                },
         }
         | Cmd::Check { task }
         | Cmd::Verify { task, .. }
@@ -1058,6 +1147,7 @@ fn command_task(command: &Cmd) -> Option<&str> {
         | Cmd::Ledger { .. }
         | Cmd::Sites { .. }
         | Cmd::Agent { .. }
+        | Cmd::RuntimePolicy { .. }
         | Cmd::Status
         | Cmd::Schema
         | Cmd::Guide { .. }
@@ -1172,6 +1262,37 @@ fn preflight_cli_command(root: &std::path::Path, command: &Cmd) -> Result<()> {
             bail!("--agent 必须是安全的非空 identity component");
         }
     }
+    if let Cmd::Review {
+        action: ReviewCmd::Panel { action },
+    } = command
+    {
+        let (task, attempt, seats): (&str, &str, Vec<&str>) = match action {
+            ReviewPanelCmd::Select {
+                task,
+                attempt,
+                seats,
+            } => (task, attempt, seats.iter().map(String::as_str).collect()),
+            ReviewPanelCmd::Retry {
+                task,
+                attempt,
+                seat_id,
+            } => (task, attempt, vec![seat_id.as_str()]),
+            ReviewPanelCmd::Backfill {
+                task,
+                attempt,
+                seat,
+            } => (task, attempt, vec![seat.as_str()]),
+        };
+        orch_host::wake::validate_review_reconcile_attempt(task, attempt)?;
+        if seats.iter().any(|value| {
+            value.is_empty()
+                || !value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':')
+                })
+        }) {
+            bail!("review panel seat identity 非安全 component");
+        }
+    }
     if let Cmd::Dispatch {
         new_attempt,
         reason,
@@ -1183,6 +1304,22 @@ fn preflight_cli_command(root: &std::path::Path, command: &Cmd) -> Result<()> {
             (true, _) => bail!("--new-attempt 强制非空 --reason"),
             (false, Some(_)) => bail!("--reason 仅可与 --new-attempt 同用"),
             (false, None) => {}
+        }
+    }
+    if let Cmd::RuntimePolicy { action } = command {
+        let (policy, reason) = match action {
+            RuntimePolicyCmd::Activate { policy } => (policy, None),
+            RuntimePolicyCmd::Deactivate { policy, reason } => (policy, reason.as_ref()),
+        };
+        if policy.is_empty()
+            || !policy
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!("runtime policy 必须是安全的非空 component");
+        }
+        if reason.is_some_and(|value| value.trim().is_empty() || value.trim() != value) {
+            bail!("runtime-policy deactivate --reason 必须非空且无首尾空白");
         }
     }
     if let Some(task) = command_task(command) {
@@ -1405,6 +1542,7 @@ fn main() -> ExitCode {
         Cmd::Review { action } => cmd_review(&root, action),
         Cmd::Sites { action } => cmd_sites(&root, action),
         Cmd::Agent { action } => cmd_agent(&root, action),
+        Cmd::RuntimePolicy { action } => cmd_runtime_policy(&root, action),
         Cmd::Status => cmd_status(&root),
         Cmd::Schema => {
             println!("{}", orch_core::event_schema_json());
@@ -1719,6 +1857,26 @@ fn cmd_doctor(root: &std::path::Path) -> Result<ExitCode> {
     failed |= matches!(status, CheckStatus::Fail);
     println!("  {mark} {:<18} {}", name, detail);
 
+    // B310: live append, expected-main, archive, and doctor all consume the
+    // same typed V1 event-history validator.
+    let (status, detail) = match orch_host::verify::audit_runtime_event_contracts(root) {
+        Ok((ledgers, events)) => (
+            CheckStatus::Pass,
+            format!("ledgersChecked={ledgers} runtimeV1Events={events}"),
+        ),
+        Err(error) => (
+            CheckStatus::Fail,
+            format!("runtime V1 event audit failed closed: {error:#}"),
+        ),
+    };
+    let mark = match status {
+        CheckStatus::Pass => "✅",
+        CheckStatus::Warn => "⚠️ ",
+        CheckStatus::Fail => "❌",
+    };
+    failed |= matches!(status, CheckStatus::Fail);
+    println!("  {mark} {:<18} {}", "runtime事件合同", detail);
+
     // B204/H66: verdict-bound review bytes are recomputed from the current
     // main tree. Only the exact disclosed r59/B181 debt is a Warn.
     let (status, detail) = match orch_host::verify::audit_recorded_review_bindings(root) {
@@ -1966,12 +2124,13 @@ fn current_md_doctor_check(root: &std::path::Path) -> Result<(&'static str, Chec
 }
 
 fn cmd_agent(root: &std::path::Path, action: AgentCmd) -> Result<ExitCode> {
-    let definitions = orch_host::registry::load_agent_definitions(root)?;
     match action {
         AgentCmd::Lint => {
+            let definitions = orch_host::registry::load_agent_definitions(root)?;
             println!("orch agent lint · ok · {} entries", definitions.len());
         }
         AgentCmd::List => {
+            let definitions = orch_host::registry::load_agent_definitions(root)?;
             println!("agent\ttool\tmodel\teffort\tsource\tquotaDomain\tresponsibility\tinjectable\tsessionId");
             for (id, definition) in definitions {
                 let (tool, source) = definition
@@ -2006,7 +2165,54 @@ fn cmd_agent(root: &std::path::Path, action: AgentCmd) -> Result<ExitCode> {
                 );
             }
         }
+        AgentCmd::SetPin {
+            agent,
+            provider,
+            model,
+            effort,
+            reason,
+        } => {
+            let amendment = orch_host::registry::run_agent_pin_amendment(
+                root,
+                &agent,
+                provider.as_deref(),
+                model.as_deref(),
+                effort.as_deref(),
+                &reason,
+            )?;
+            println!(
+                "orch agent set-pin · committed · {}",
+                serde_json::to_string(&amendment)?
+            );
+        }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_runtime_policy(
+    root: &std::path::Path,
+    action: RuntimePolicyCmd,
+) -> Result<ExitCode> {
+    let outcome = match action {
+        RuntimePolicyCmd::Activate { policy } => {
+            orch_host::plan::activate_runtime_policy(root, &policy)?
+        }
+        RuntimePolicyCmd::Deactivate { policy, reason } => {
+            orch_host::plan::deactivate_runtime_policy(
+                root,
+                &policy,
+                reason.as_deref().unwrap_or("operator-requested"),
+            )?
+        }
+    };
+    println!(
+        "orch runtime-policy · policy={} state={:?} eventId={} commit={} replayed={}",
+        outcome.policy,
+        outcome.state,
+        outcome.event_id,
+        outcome.commit_sha,
+        outcome.replayed,
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2016,6 +2222,24 @@ fn cmd_agent(root: &std::path::Path, action: AgentCmd) -> Result<ExitCode> {
 /// markdown；原子覆写 coordination/CURRENT.md（运行时投影写，同 BOARD 先例）。
 /// 不落账本、无其他副作用。CURRENT.md 的 round 与 main 标记可被 doctor 一致性
 /// 检查（`binding::current_md_consistent`）消费。
+fn current_active_plan_signed_off(events: &[orch_core::EventRecord], round: &str) -> Result<bool> {
+    let Some(validation) = events
+        .iter()
+        .rev()
+        .find(|event| event.kind == "TaskValidated" && event.round.as_deref() == Some(round))
+    else {
+        return Ok(false);
+    };
+    let payload = orch_host::plan::decode_runtime_task_validated(validation, round)?;
+    Ok(orch_host::plan::matching_user_plan_signoff_position(
+        events,
+        round,
+        payload.ir_revision,
+        &payload.validation_digest,
+    )?
+    .is_some())
+}
+
 fn cmd_current(root: &std::path::Path) -> Result<ExitCode> {
     let round = orch_host::current_round(root)?;
     let ledger_path = root.join(format!("coordination/rounds/{round}/events.jsonl"));
@@ -2025,6 +2249,7 @@ fn cmd_current(root: &std::path::Path) -> Result<ExitCode> {
         bail!("orch current 拒绝坏账本（{} 行）", ledger.bad_lines.len());
     }
     let projection = fold(&ledger.events);
+    let active_plan_signed_off = current_active_plan_signed_off(&ledger.events, &round)?;
     // 无 git 仓库 / 无 main ref（合成 fixture 根、fresh coordination 目录）时
     // 回退到 "?"，不阻断生成（同 current_md_doctor_check 先例）。orch current 是
     // 只读派生命令，账本可解析即可生成 CURRENT.md；main 缺失只降级标记。
@@ -2109,11 +2334,7 @@ fn cmd_current(root: &std::path::Path) -> Result<ExitCode> {
         round = round,
         main_short = main_short,
         main_full = main_full,
-        signed = if projection.plan_signed_off {
-            "yes"
-        } else {
-            "no"
-        },
+        signed = if active_plan_signed_off { "yes" } else { "no" },
         closed = if projection.round_closed { "yes" } else { "no" },
         events = projection.total_events,
         bad = ledger.bad_lines.len(),
@@ -2261,6 +2482,45 @@ agents:
         ));
 
         fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn current_signoff_is_bound_to_the_latest_validation_tuple() {
+        let round = "r-current";
+        let digest_v1 = "a".repeat(64);
+        let digest_v2 = "b".repeat(64);
+        let validation_v1 = orch_host::ledger::event(
+            "TaskValidated",
+            "runtime:orch",
+            None,
+            Some(round),
+            orch_host::plan::task_validated_payload(1, &digest_v1),
+        );
+        let signoff_v1 = orch_host::ledger::event(
+            "PlanSignedOff",
+            "user",
+            None,
+            Some(round),
+            orch_host::plan::plan_signed_off_payload("v1", 1, &digest_v1).unwrap(),
+        );
+        let validation_v2 = orch_host::ledger::event(
+            "TaskValidated",
+            "runtime:orch",
+            None,
+            Some(round),
+            orch_host::plan::task_validated_payload(2, &digest_v2),
+        );
+
+        assert!(current_active_plan_signed_off(
+            &[validation_v1.clone(), signoff_v1.clone()],
+            round
+        )
+        .unwrap());
+        assert!(!current_active_plan_signed_off(
+            &[validation_v1, signoff_v1, validation_v2],
+            round
+        )
+        .unwrap());
     }
 }
 
@@ -3255,24 +3515,14 @@ fn cmd_handshake(
         .as_ref()
         .context("wake 注入成功但缺 logPath")?;
     let expectation = match outcome.provider_kind {
-        Some(provider_kind) => {
+        Some(_provider_kind) => {
             let wake_id = outcome
                 .wake_id
                 .as_deref()
                 .context("managed wake 注入成功但缺 action wakeId")?;
-            let continuation_id = format!("manual:{round}:{wake_id}:{agent}");
-            let digest = orch_host::wake::wake_request_message_sha256(message, &continuation_id)
-                .map_err(anyhow::Error::msg)?;
-            Some(
-                orch_host::wake::BackendReceiptExpectation::new(
-                    provider_kind,
-                    wake_id,
-                    &continuation_id,
-                    &digest,
-                    outcome.request_session_id.as_deref(),
-                )
-                .map_err(anyhow::Error::msg)?,
-            )
+            Some(orch_host::wake::backend_receipt_expectation_for_wake(
+                root, &round, wake_id,
+            )?)
         }
         // Test/custom adapters keep the legacy generic probe. Registered
         // Codex/OpenCode/SmartClaw production argv always select the branch
@@ -3320,7 +3570,7 @@ fn cmd_review(root: &std::path::Path, action: ReviewCmd) -> Result<ExitCode> {
     match action {
         ReviewCmd::Reconcile { task, attempt } => {
             let delivered =
-                orch_host::wake::reconcile_committed_review_delivery_slots(root, &task, &attempt)?;
+                orch_host::wake::reconcile_review_attempt_v1(root, &task, &attempt)?;
             println!("orch review reconcile: task={task} attempt={attempt} delivered={delivered}");
             Ok(ExitCode::SUCCESS)
         }
@@ -3341,6 +3591,47 @@ fn cmd_review(root: &std::path::Path, action: ReviewCmd) -> Result<ExitCode> {
                 println!(
                     "  下一步：commit {} 到 main，再运行 `orch review reconcile {task} --attempt {attempt}`。",
                     outcome.path
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        ReviewCmd::Panel { action } => {
+            let outcome = match action {
+                ReviewPanelCmd::Select {
+                    task,
+                    attempt,
+                    seats,
+                } => orch_host::wake::select_review_panel_v1(root, &task, &attempt, &seats)?,
+                ReviewPanelCmd::Retry {
+                    task,
+                    attempt,
+                    seat_id,
+                } => {
+                    orch_host::wake::retry_review_panel_v1(root, &task, &attempt, &seat_id)?
+                }
+                ReviewPanelCmd::Backfill {
+                    task,
+                    attempt,
+                    seat,
+                } => orch_host::wake::backfill_review_panel_v1(root, &task, &attempt, &seat)?,
+            };
+            println!(
+                "orch review panel: panel={} routes={} spawned={} commit={} replayed={}",
+                outcome.panel_id,
+                outcome.routes.len(),
+                outcome.spawned,
+                outcome.commit_sha,
+                outcome.replayed,
+            );
+            for route in outcome.routes {
+                println!(
+                    "  seat={} generation={} wake={} role={} agent={} deadlineSecs={}",
+                    route.seat_id,
+                    route.generation,
+                    route.wake_id,
+                    route.role,
+                    route.agent,
+                    route.deadline_secs,
                 );
             }
             Ok(ExitCode::SUCCESS)
@@ -3712,6 +4003,11 @@ fn cmd_verdict(
         reason,
         dry_run,
     )?;
+    for warning in
+        orch_host::verify::nongate_attempt_receipt_warnings(root, task, attempt, expected_head)
+    {
+        eprintln!("{warning}");
+    }
     println!(
         "orch verdict {task}: {}{}{} · gates={}",
         out.verdict,
@@ -3738,6 +4034,9 @@ fn cmd_seal(
     expected_head: &str,
 ) -> Result<ExitCode> {
     let outcome = orch_host::close::run_seal(root, task, attempt, expected_head)?;
+    for warning in &outcome.nongate_receipt_warnings {
+        eprintln!("{warning}");
+    }
     println!(
         "orch seal {task}: complete @{}{} · gates={}",
         outcome.merge_sha_short,
@@ -4488,13 +4787,14 @@ fn cmd_status(root: &std::path::Path) -> Result<ExitCode> {
     let ledger = read_ledger(&ledger_path)
         .with_context(|| format!("读取账本失败: {}", ledger_path.display()))?;
     let p = fold(&ledger.events);
+    let active_plan_signed_off = current_active_plan_signed_off(&ledger.events, &round)?;
 
     println!("orch status · round={round} · root={}", root.display());
     println!(
         "  事件 {} 条（坏行 {}）· 计划签核: {} · 轮态: {}",
         p.total_events,
         ledger.bad_lines.len(),
-        if p.plan_signed_off { "✅" } else { "—" },
+        if active_plan_signed_off { "✅" } else { "—" },
         if p.round_closed {
             "已收轮"
         } else {
@@ -4963,6 +5263,75 @@ mod wake_control_action_contract_tests {
             );
         }
         assert!(WakeControlAction::parse("ordinary-agent").is_none());
+    }
+}
+
+#[cfg(test)]
+mod agent_pin_cli_contract_tests {
+    use super::*;
+
+    #[test]
+    fn set_pin_shape_is_state_changing_and_requires_an_active_round() {
+        let cli = Cli::try_parse_from([
+            "orch",
+            "agent",
+            "set-pin",
+            "executor-pi",
+            "--provider",
+            "one-dewu-pi-anthropic",
+            "--model",
+            "deepseek-v4-next",
+            "--effort",
+            "max",
+            "--reason",
+            "audited routing update",
+        ])
+        .unwrap();
+        match &cli.cmd {
+            Cmd::Agent {
+                action:
+                    AgentCmd::SetPin {
+                        agent,
+                        provider,
+                        model,
+                        effort,
+                        reason,
+                    },
+            } => {
+                assert_eq!(agent, "executor-pi");
+                assert_eq!(provider.as_deref(), Some("one-dewu-pi-anthropic"));
+                assert_eq!(model.as_deref(), Some("deepseek-v4-next"));
+                assert_eq!(effort.as_deref(), Some("max"));
+                assert_eq!(reason, "audited routing update");
+            }
+            _ => panic!("expected agent set-pin command"),
+        }
+        assert!(matches!(
+            command_effect_policy(&cli.cmd),
+            CommandEffectPolicy::RequiresActive
+        ));
+        assert!(!staleness_command_is_read_only(&cli.cmd));
+    }
+
+    #[test]
+    fn set_pin_requires_reason_while_registry_inspection_stays_read_only() {
+        assert!(Cli::try_parse_from([
+            "orch",
+            "agent",
+            "set-pin",
+            "executor-pi",
+            "--model",
+            "deepseek-v4-next",
+        ])
+        .is_err());
+        for leaf in ["list", "lint"] {
+            let cli = Cli::try_parse_from(["orch", "agent", leaf]).unwrap();
+            assert!(matches!(
+                command_effect_policy(&cli.cmd),
+                CommandEffectPolicy::ReadOnly
+            ));
+            assert!(staleness_command_is_read_only(&cli.cmd));
+        }
     }
 }
 

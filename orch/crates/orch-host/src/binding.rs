@@ -1,16 +1,22 @@
 //! PROJECT-BINDING.yaml 薄封装（design/02 §5）。只解析本切片需要的字段，未知字段全容忍。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Deserialize)]
 pub struct Binding {
+    /// Named gate commands available to runtime gate resolution.
     #[serde(default)]
     pub commands: BTreeMap<String, CommandSpec>,
+    /// Signed candidate/merge/fast lane declarations. An all-empty value is
+    /// retained only for bindings created before lane support existed.
+    #[serde(default)]
+    pub gates: BindingGates,
     #[serde(default)]
     pub workspace: Workspace,
     #[serde(default)]
@@ -23,8 +29,92 @@ pub struct Binding {
     pub git: Git,
 }
 
+/// Signed command-reference lists for the three V1 gate-strength lanes.
+///
+/// The nested mapping is closed so a misspelled lane cannot remain signed but
+/// inert. Empty lists preserve parsing compatibility for historical bindings;
+/// a V1 lane consumer still rejects an empty selected or upgrade lane.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BindingGates {
+    /// Narrow commands intended for candidate collection.
+    pub candidate: Vec<String>,
+    /// Full commands required at merge-strength boundaries.
+    pub merge: Vec<String>,
+    /// Compatibility/full-strength commands used for fail-closed upgrades.
+    pub fast: Vec<String>,
+    candidate_declared: bool,
+    merge_declared: bool,
+    fast_declared: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BindingGatesWire {
+    #[serde(default)]
+    candidate: BindingGateArm,
+    #[serde(default)]
+    merge: BindingGateArm,
+    #[serde(default)]
+    fast: BindingGateArm,
+}
+
+#[derive(Default)]
+struct BindingGateArm {
+    values: Vec<String>,
+    declared: bool,
+}
+
+impl<'de> Deserialize<'de> for BindingGateArm {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Deserializing directly as Vec intentionally rejects explicit null;
+        // only serde(default) on an absent mapping key produces declared=false.
+        Ok(Self {
+            values: Vec::<String>::deserialize(deserializer)?,
+            declared: true,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for BindingGates {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = BindingGatesWire::deserialize(deserializer)?;
+        Ok(Self {
+            candidate_declared: wire.candidate.declared,
+            merge_declared: wire.merge.declared,
+            fast_declared: wire.fast.declared,
+            candidate: wire.candidate.values,
+            merge: wire.merge.values,
+            fast: wire.fast.values,
+        })
+    }
+}
+
+impl BindingGates {
+    /// Whether `candidate` was explicitly present rather than legacy-absent.
+    pub fn candidate_declared(&self) -> bool {
+        self.candidate_declared
+    }
+
+    /// Whether `merge` was explicitly present rather than legacy-absent.
+    pub fn merge_declared(&self) -> bool {
+        self.merge_declared
+    }
+
+    /// Whether `fast` was explicitly present rather than legacy-absent.
+    pub fn fast_declared(&self) -> bool {
+        self.fast_declared
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CommandSpec {
+    /// Exact argument vector executed without a shell.
     pub argv: Vec<String>,
     #[serde(rename = "timeoutSeconds", default = "default_timeout")]
     pub timeout_seconds: u64,
@@ -60,14 +150,570 @@ fn default_worktree_root() -> String {
 pub struct Oracle {
     #[serde(default = "default_oracle_dialect")]
     pub dialect: String,
+    #[serde(rename = "landedSeedBaseline", default)]
+    pub landed_seed_baseline: Option<LandedSeedBaselineDescriptor>,
 }
 
 impl Default for Oracle {
     fn default() -> Self {
         Oracle {
             dialect: default_oracle_dialect(),
+            landed_seed_baseline: None,
         }
     }
+}
+
+/// Project-owned, signed pointer to the immutable landed-contract genesis.
+/// The manifest itself stays project data; generic runtime code validates its
+/// digest and closed schema instead of embedding hundreds of project paths.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LandedSeedBaselineDescriptor {
+    pub schema_version: u32,
+    pub path: String,
+    pub sha256: String,
+}
+
+/// Closed JSON schema for the project-signed, immutable landed-seed genesis.
+/// Future relocation/supersession facts are ledger deltas and never rewrite
+/// this manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LandedSeedBaselineManifest {
+    pub schema_version: u32,
+    pub baseline_tree_sha: String,
+    pub scope: LandedSeedBaselineScope,
+    pub counts: LandedSeedBaselineCounts,
+    pub excluded_unrecorded_missing_targets: Vec<String>,
+    pub targets: Vec<LandedSeedBaselineTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LandedSeedBaselineScope {
+    pub declared_pair_audit_through: String,
+    pub effective_baseline_through: String,
+    pub selection: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LandedSeedBaselineCounts {
+    pub declared_pairs_through_r70: usize,
+    pub drifted_declared_pairs_through_r70: usize,
+    pub missing_declared_pairs_through_r70: usize,
+    pub unique_effective_targets_through_b269: usize,
+    pub present_effective_targets: usize,
+    pub effective_tombstones: usize,
+    pub excluded_unrecorded_missing_targets: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LandedSeedBaselineTargetState {
+    Present,
+    Tombstone,
+}
+
+/// `effectiveSha256` is a required JSON field even for a tombstone, where its
+/// value must be explicit `null`.  Wrapping `Option` prevents serde's usual
+/// missing-Option compatibility rule from accepting an omitted field.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct RequiredNullableSha256(pub Option<String>);
+
+impl RequiredNullableSha256 {
+    pub fn as_deref(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+
+    pub fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LandedSeedBaselineTarget {
+    pub target: String,
+    pub state: LandedSeedBaselineTargetState,
+    pub effective_sha256: RequiredNullableSha256,
+    pub effective_anchor: LandedSeedBaselineEffectiveAnchor,
+    pub grandfathered_drift: bool,
+    pub sources: Vec<LandedSeedBaselineSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum LandedSeedBaselineEffectiveAnchor {
+    SeedRelocated {
+        event_id: String,
+        sha256: String,
+    },
+    MigrationBaseline {
+        baseline_tree_sha: String,
+        sha256: String,
+    },
+    MigrationTombstone {
+        baseline_tree_sha: String,
+    },
+}
+
+impl LandedSeedBaselineEffectiveAnchor {
+    pub fn sha256(&self) -> Option<&str> {
+        match self {
+            Self::SeedRelocated { sha256, .. } | Self::MigrationBaseline { sha256, .. } => {
+                Some(sha256)
+            }
+            Self::MigrationTombstone { .. } => None,
+        }
+    }
+
+    pub fn event_id(&self) -> Option<&str> {
+        match self {
+            Self::SeedRelocated { event_id, .. } => Some(event_id),
+            Self::MigrationBaseline { .. } | Self::MigrationTombstone { .. } => None,
+        }
+    }
+
+    pub fn baseline_tree_sha(&self) -> Option<&str> {
+        match self {
+            Self::MigrationBaseline {
+                baseline_tree_sha, ..
+            }
+            | Self::MigrationTombstone { baseline_tree_sha } => Some(baseline_tree_sha),
+            Self::SeedRelocated { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LandedSeedBaselineSource {
+    pub round: String,
+    pub task_id: String,
+    pub card_path: String,
+    pub seed_src: String,
+    pub declared_sha256: String,
+    pub source_sha256: String,
+    pub source_matches_declared: bool,
+    pub drifted_from_source: bool,
+    pub seed_relocated: Vec<LandedSeedRelocationProvenance>,
+    pub task_recorded_event_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LandedSeedRelocationProvenance {
+    pub event_id: String,
+    pub sha256: String,
+}
+
+fn canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn canonical_commit_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn canonical_event_id(value: &str) -> bool {
+    value.len() == 26
+        && value.as_bytes()[0].is_ascii_digit()
+        && value.as_bytes()[0] <= b'7'
+        && value.bytes().all(|byte| {
+            byte.is_ascii_digit()
+                || (byte.is_ascii_uppercase() && !matches!(byte, b'I' | b'L' | b'O' | b'U'))
+        })
+}
+
+fn canonical_repo_relative(path: &str) -> bool {
+    let parsed = Path::new(path);
+    !path.is_empty()
+        && path.trim() == path
+        && !parsed.is_absolute()
+        && !path.contains('\\')
+        && !path.bytes().any(|byte| byte.is_ascii_control())
+        && !path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+}
+
+fn task_id_is_canonical(task_id: &str) -> bool {
+    !task_id.is_empty()
+        && task_id
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && task_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn round_number(round: &str) -> Option<u64> {
+    let number = round.strip_prefix('r')?;
+    if number.is_empty()
+        || number.starts_with('0')
+        || !number.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    number.parse().ok()
+}
+
+fn strictly_sorted_unique<'a>(values: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut previous = None;
+    for value in values {
+        if previous.is_some_and(|previous| previous >= value) {
+            return false;
+        }
+        previous = Some(value);
+    }
+    true
+}
+
+/// Validate the signed pointer without touching the filesystem.  Unknown or
+/// missing descriptor fields are rejected by serde before this semantic pass.
+pub fn validate_landed_seed_baseline_descriptor(
+    descriptor: &LandedSeedBaselineDescriptor,
+) -> std::result::Result<(), String> {
+    if descriptor.schema_version != 1 {
+        return Err(format!(
+            "landedSeedBaseline schemaVersion 必须为 1，实际 {}",
+            descriptor.schema_version
+        ));
+    }
+    if !canonical_repo_relative(&descriptor.path) || !descriptor.path.ends_with(".json") {
+        return Err(format!(
+            "landedSeedBaseline path 必须是 canonical repo-relative JSON 路径: {:?}",
+            descriptor.path
+        ));
+    }
+    if !canonical_sha256(&descriptor.sha256) {
+        return Err("landedSeedBaseline sha256 非 canonical SHA-256".to_string());
+    }
+    Ok(())
+}
+
+/// Parse binding bytes already captured from an exact/signed source.  Machine
+/// overlays are deliberately absent: they are not part of authorization.
+pub fn parse_binding_bytes(bytes: &[u8]) -> std::result::Result<Binding, String> {
+    let binding: Binding = serde_yaml::from_slice(bytes)
+        .map_err(|error| format!("PROJECT-BINDING bytes 解析失败: {error}"))?;
+    if let Some(descriptor) = binding.oracle.landed_seed_baseline.as_ref() {
+        validate_landed_seed_baseline_descriptor(descriptor)?;
+    }
+    Ok(binding)
+}
+
+/// Strictly parse and semantically validate manifest bytes against the signed
+/// descriptor.  The caller supplies bytes from the exact tree named by the
+/// already-validated source binding; this function performs no ref/path read.
+pub fn parse_landed_seed_baseline(
+    descriptor: &LandedSeedBaselineDescriptor,
+    manifest_bytes: &[u8],
+) -> std::result::Result<LandedSeedBaselineManifest, String> {
+    validate_landed_seed_baseline_descriptor(descriptor)?;
+    let actual = hex::encode(Sha256::digest(manifest_bytes));
+    if actual != descriptor.sha256 {
+        return Err(format!(
+            "landed seed baseline manifest SHA-256 不匹配: expected={} actual={actual}",
+            descriptor.sha256
+        ));
+    }
+    let manifest: LandedSeedBaselineManifest = serde_json::from_slice(manifest_bytes)
+        .map_err(|error| format!("landed seed baseline manifest 非 closed JSON schema: {error}"))?;
+    if manifest.schema_version != descriptor.schema_version {
+        return Err(format!(
+            "landed seed baseline manifest schemaVersion={} 与 descriptor={} 不一致",
+            manifest.schema_version, descriptor.schema_version
+        ));
+    }
+    validate_landed_seed_baseline_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+/// Pure semantic validation for a parsed genesis.  Counts are derived back
+/// from provenance rather than trusted as labels, and all ordered collections
+/// are canonical so a digest binds one unambiguous projection.
+pub fn validate_landed_seed_baseline_manifest(
+    manifest: &LandedSeedBaselineManifest,
+) -> std::result::Result<(), String> {
+    if manifest.schema_version != 1 || !canonical_commit_sha(&manifest.baseline_tree_sha) {
+        return Err("landed seed baseline schemaVersion/baselineTreeSha 非 canonical".to_string());
+    }
+    let declared_through = round_number(&manifest.scope.declared_pair_audit_through)
+        .ok_or_else(|| "declaredPairAuditThrough 必须是 canonical round id".to_string())?;
+    let (effective_round, effective_task) = manifest
+        .scope
+        .effective_baseline_through
+        .split_once('/')
+        .ok_or_else(|| "effectiveBaselineThrough 必须是 rN/taskId".to_string())?;
+    if round_number(effective_round).is_none()
+        || !task_id_is_canonical(effective_task)
+        || manifest.scope.selection.trim().is_empty()
+        || manifest.scope.selection.trim() != manifest.scope.selection
+    {
+        return Err("landed seed baseline scope 非 canonical".to_string());
+    }
+    if !strictly_sorted_unique(
+        manifest
+            .excluded_unrecorded_missing_targets
+            .iter()
+            .map(String::as_str),
+    ) || manifest
+        .excluded_unrecorded_missing_targets
+        .iter()
+        .any(|path| !canonical_repo_relative(path))
+    {
+        return Err(
+            "excludedUnrecordedMissingTargets 必须 canonical、严格排序且无重复".to_string(),
+        );
+    }
+    if !strictly_sorted_unique(manifest.targets.iter().map(|target| target.target.as_str())) {
+        return Err("landed seed baseline targets 必须按 path 严格排序且无重复".to_string());
+    }
+
+    let excluded = manifest
+        .excluded_unrecorded_missing_targets
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut declared_pairs = excluded.len();
+    let mut drifted_pairs = 0usize;
+    let mut present = 0usize;
+    let mut tombstones = 0usize;
+
+    for target in &manifest.targets {
+        if !canonical_repo_relative(&target.target) || excluded.contains(target.target.as_str()) {
+            return Err(format!(
+                "landed seed target 非 canonical 或同时被 excluded: {}",
+                target.target
+            ));
+        }
+        if target.sources.is_empty() {
+            return Err(format!(
+                "landed seed target 缺 provenance sources: {}",
+                target.target
+            ));
+        }
+        let mut previous_source: Option<(u64, &str, &str)> = None;
+        let effective_sha = target.effective_sha256.0.as_deref();
+        let anchor_sha = target.effective_anchor.sha256();
+        match target.state {
+            LandedSeedBaselineTargetState::Present => {
+                present += 1;
+                if effective_sha.is_none()
+                    || effective_sha.is_some_and(|sha| !canonical_sha256(sha))
+                    || anchor_sha != effective_sha
+                    || matches!(
+                        &target.effective_anchor,
+                        LandedSeedBaselineEffectiveAnchor::MigrationTombstone { .. }
+                    )
+                {
+                    return Err(format!(
+                        "present target effective SHA/anchor 非 canonical: {}",
+                        target.target
+                    ));
+                }
+            }
+            LandedSeedBaselineTargetState::Tombstone => {
+                tombstones += 1;
+                if effective_sha.is_some()
+                    || !matches!(
+                        &target.effective_anchor,
+                        LandedSeedBaselineEffectiveAnchor::MigrationTombstone { .. }
+                    )
+                    || target.grandfathered_drift
+                {
+                    return Err(format!(
+                        "tombstone target shape 非 canonical: {}",
+                        target.target
+                    ));
+                }
+            }
+        }
+        match &target.effective_anchor {
+            LandedSeedBaselineEffectiveAnchor::SeedRelocated { event_id, sha256 } => {
+                if !canonical_event_id(event_id) || !canonical_sha256(sha256) {
+                    return Err(format!(
+                        "seed-relocated effective anchor 非 canonical: {}",
+                        target.target
+                    ));
+                }
+                let anchored = target
+                    .sources
+                    .iter()
+                    .flat_map(|source| &source.seed_relocated)
+                    .any(|anchor| {
+                        anchor.event_id.as_str() == event_id.as_str()
+                            && anchor.sha256.as_str() == sha256.as_str()
+                    });
+                if !anchored {
+                    return Err(format!(
+                        "effective SeedRelocated 不在 provenance 中: {}",
+                        target.target
+                    ));
+                }
+            }
+            LandedSeedBaselineEffectiveAnchor::MigrationBaseline {
+                baseline_tree_sha,
+                sha256,
+            } => {
+                if baseline_tree_sha != &manifest.baseline_tree_sha || !canonical_sha256(sha256) {
+                    return Err(format!(
+                        "migration-baseline anchor 非 canonical: {}",
+                        target.target
+                    ));
+                }
+            }
+            LandedSeedBaselineEffectiveAnchor::MigrationTombstone { baseline_tree_sha } => {
+                if baseline_tree_sha != &manifest.baseline_tree_sha {
+                    return Err(format!(
+                        "migration-tombstone tree anchor 漂移: {}",
+                        target.target
+                    ));
+                }
+            }
+        }
+
+        let mut any_drift = false;
+        for source in &target.sources {
+            let source_round = round_number(&source.round)
+                .ok_or_else(|| format!("source round 非 canonical: {}", source.round))?;
+            if !task_id_is_canonical(&source.task_id)
+                || !canonical_repo_relative(&source.card_path)
+                || !canonical_repo_relative(&source.seed_src)
+                || source.card_path
+                    != format!(
+                        "coordination/rounds/{}/tasks/{}.md",
+                        source.round, source.task_id
+                    )
+                || !source.seed_src.starts_with(&format!(
+                    "coordination/rounds/{}/seeds/{}/",
+                    source.round, source.task_id
+                ))
+            {
+                return Err(format!(
+                    "source path/task provenance 非 canonical: {}/{}",
+                    source.round, source.task_id
+                ));
+            }
+            let source_key = (
+                source_round,
+                source.task_id.as_str(),
+                source.seed_src.as_str(),
+            );
+            if previous_source.is_some_and(|previous| previous >= source_key) {
+                return Err(format!("sources 未严格排序或重复: {}", target.target));
+            }
+            previous_source = Some(source_key);
+            if !canonical_sha256(&source.declared_sha256)
+                || !canonical_sha256(&source.source_sha256)
+                || source.source_matches_declared
+                    != (source.declared_sha256 == source.source_sha256)
+            {
+                return Err(format!(
+                    "source hash provenance 非 canonical: {}",
+                    target.target
+                ));
+            }
+            if source_round <= declared_through {
+                declared_pairs += 1;
+                if source.drifted_from_source {
+                    drifted_pairs += 1;
+                }
+            }
+            if matches!(target.state, LandedSeedBaselineTargetState::Present)
+                && source.drifted_from_source
+                    != (Some(source.source_sha256.as_str()) != effective_sha)
+            {
+                return Err(format!(
+                    "driftedFromSource 与 effective SHA 不一致: {}",
+                    target.target
+                ));
+            }
+            if matches!(target.state, LandedSeedBaselineTargetState::Tombstone)
+                && source.drifted_from_source
+            {
+                return Err(format!(
+                    "tombstone source 不得伪称 grandfathered drift: {}",
+                    target.target
+                ));
+            }
+            any_drift |= source.drifted_from_source;
+
+            if !strictly_sorted_unique(
+                source
+                    .seed_relocated
+                    .iter()
+                    .map(|anchor| anchor.event_id.as_str()),
+            ) || source.seed_relocated.iter().any(|anchor| {
+                !canonical_event_id(&anchor.event_id) || !canonical_sha256(&anchor.sha256)
+            }) {
+                return Err(format!(
+                    "SeedRelocated provenance 非 canonical: {}",
+                    target.target
+                ));
+            }
+            if !strictly_sorted_unique(source.task_recorded_event_ids.iter().map(String::as_str))
+                || source
+                    .task_recorded_event_ids
+                    .iter()
+                    .any(|event_id| !canonical_event_id(event_id))
+            {
+                return Err(format!(
+                    "TaskRecorded provenance 非 canonical: {}",
+                    target.target
+                ));
+            }
+        }
+        if target.grandfathered_drift != any_drift
+            || (target.grandfathered_drift
+                && !matches!(
+                    &target.effective_anchor,
+                    LandedSeedBaselineEffectiveAnchor::MigrationBaseline { .. }
+                ))
+        {
+            return Err(format!(
+                "grandfathered drift/anchor 不一致: {}",
+                target.target
+            ));
+        }
+    }
+
+    let counts = &manifest.counts;
+    let actual_missing = tombstones + excluded.len();
+    if counts.declared_pairs_through_r70 != declared_pairs
+        || counts.drifted_declared_pairs_through_r70 != drifted_pairs
+        || counts.missing_declared_pairs_through_r70 != actual_missing
+        || counts.unique_effective_targets_through_b269 != manifest.targets.len()
+        || counts.present_effective_targets != present
+        || counts.effective_tombstones != tombstones
+        || counts.excluded_unrecorded_missing_targets != excluded.len()
+    {
+        return Err(format!(
+            "landed seed baseline counts 不一致: declared={declared_pairs} drifted={drifted_pairs} missing={actual_missing} unique={} present={present} tombstones={tombstones} excluded={}",
+            manifest.targets.len(),
+            excluded.len()
+        ));
+    }
+    Ok(())
 }
 
 fn default_oracle_dialect() -> String {
@@ -158,10 +804,167 @@ pub fn resolve_gates(
     }
 }
 
-/// Rust 生态绑定下 testFast / check 门命令的 `--locked` 规则机器化（B106）。
+/// Closed V1 gate lane selected by a runtime boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateLaneV1 {
+    /// Narrow collection lane whose derived inputs must be closed.
+    Candidate,
+    /// Full lane used around merge-strength boundaries.
+    Merge,
+    /// Signed compatibility lane and escalation destination.
+    Fast,
+}
+
+/// Complete, already-derived inputs to the pure V1 lane resolver.
 ///
-/// **严格聚合**（planner r46-repair 决策）：对 `testFast` 与 `check` 两个门命令
-/// 逐条检查，以下任一情形即聚合报错，文案必须含命令名：
+/// Callers derive the two closure booleans from signed card seed targets and
+/// the source-reader descriptor. The resolver never guesses a missing edge or
+/// command and therefore cannot silently shrink a candidate run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateLaneInputsV1 {
+    /// Boundary lane requested by the caller.
+    pub lane: GateLaneV1,
+    /// Ordered candidate command references from the committed binding.
+    pub candidate: Vec<String>,
+    /// Ordered merge command references from the committed binding.
+    pub merge: Vec<String>,
+    /// Ordered full-strength upgrade command references.
+    pub fast: Vec<String>,
+    /// Signed task-card `gates.fast` floor that merge and fast must cover.
+    pub card_fast: Vec<String>,
+    /// Command references the caller can resolve to concrete argv.
+    pub known_commands: Vec<String>,
+    /// Whether every candidate seed target was derived from this card alone.
+    pub seed_targets_closed: bool,
+    /// Whether every production `sourceReaderClosure` edge has a runnable target.
+    pub source_readers_closed: bool,
+}
+
+/// Fail-closed result of resolving one V1 gate lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateLaneDecisionV1 {
+    /// Execute these command references in their signed order.
+    Commands(Vec<String>),
+    /// Execute the signed fast lane and durably record this reason.
+    UpgradeToFast {
+        /// Stable human-readable explanation suitable for GateLaneEscalated.
+        reason: String,
+    },
+}
+
+fn safe_gate_ref(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn checked_gate_refs<'a>(
+    label: &str,
+    values: &'a [String],
+    allow_empty: bool,
+) -> std::result::Result<BTreeSet<&'a str>, String> {
+    if values.is_empty() && !allow_empty {
+        return Err(format!("{label} gate lane 为空"));
+    }
+    let mut seen = BTreeSet::new();
+    for value in values {
+        if !safe_gate_ref(value) {
+            return Err(format!("{label} gate ref 非安全 component: {value:?}"));
+        }
+        if !seen.insert(value.as_str()) {
+            return Err(format!("{label} gate ref 重复: {value}"));
+        }
+    }
+    Ok(seen)
+}
+
+fn validate_full_lane(
+    label: &str,
+    commands: &[String],
+    card_fast: &BTreeSet<&str>,
+    known_commands: &BTreeSet<&str>,
+) -> std::result::Result<(), String> {
+    let lane = checked_gate_refs(label, commands, false)?;
+    let missing_floor = card_fast.difference(&lane).copied().collect::<Vec<_>>();
+    if !missing_floor.is_empty() {
+        return Err(format!(
+            "binding gates.{label} 弱于 signed card gates.fast，缺: {}",
+            missing_floor.join(", ")
+        ));
+    }
+    let unknown = lane.difference(known_commands).copied().collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "binding gates.{label} 含未知 command: {}",
+            unknown.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve a V1 gate lane without filesystem or ledger side effects.
+///
+/// Both full-strength lanes are first checked against the signed card floor.
+/// A candidate closure failure or candidate-only unknown command returns an
+/// explicit fast upgrade; an invalid fast/merge lane is an error because no
+/// stronger modeled destination exists.
+pub fn resolve_gate_lane_v1(
+    inputs: &GateLaneInputsV1,
+) -> std::result::Result<GateLaneDecisionV1, String> {
+    let card_fast = checked_gate_refs("card fast", &inputs.card_fast, false)?;
+    let known_commands = checked_gate_refs("known commands", &inputs.known_commands, false)?;
+    validate_full_lane("merge", &inputs.merge, &card_fast, &known_commands)?;
+    validate_full_lane("fast", &inputs.fast, &card_fast, &known_commands)?;
+
+    match inputs.lane {
+        GateLaneV1::Merge => Ok(GateLaneDecisionV1::Commands(inputs.merge.clone())),
+        GateLaneV1::Fast => Ok(GateLaneDecisionV1::Commands(inputs.fast.clone())),
+        GateLaneV1::Candidate => {
+            let candidate = checked_gate_refs("candidate", &inputs.candidate, false)?;
+            let mut reasons = Vec::new();
+            if !inputs.seed_targets_closed {
+                reasons.push("seed targets are not closed over the signed card".to_string());
+            }
+            if !inputs.source_readers_closed {
+                reasons.push("source-reader closure is unknown or drifted".to_string());
+            }
+            let unknown = candidate
+                .difference(&known_commands)
+                .copied()
+                .collect::<Vec<_>>();
+            if !unknown.is_empty() {
+                reasons.push(format!(
+                    "candidate lane contains unknown command: {}",
+                    unknown.join(", ")
+                ));
+            }
+            if reasons.is_empty() {
+                Ok(GateLaneDecisionV1::Commands(inputs.candidate.clone()))
+            } else {
+                Ok(GateLaneDecisionV1::UpgradeToFast {
+                    reason: reasons.join("; "),
+                })
+            }
+        }
+    }
+}
+
+fn rust_gate_command_names(b: &Binding) -> (&'static str, &'static str) {
+    if b.has_ecosystem("node") {
+        ("rustTest", "rustCheck")
+    } else {
+        ("testFast", "check")
+    }
+}
+
+/// Rust 生态绑定下测试与检查门命令的 `--locked` 规则机器化（B106）。
+///
+/// Rust-only bindings use `testFast`/`check`; Rust+Node bindings use the
+/// unambiguous `rustTest`/`rustCheck` pair so Node commands cannot satisfy a
+/// Cargo floor. Both selected commands are checked and all failures aggregate:
 ///   1. 命令缺失（binding 未声明该命令名）；
 ///   2. 命令存在但 argv 为空；
 ///   3. `--locked` 未作为独立 argv 出现在 `--` 终止符**之前**（把 `--` 之后的
@@ -178,9 +981,12 @@ pub fn validate_locked_rust_gates(b: &Binding) -> std::result::Result<(), Vec<St
         return Ok(());
     }
     let mut errors: Vec<String> = Vec::new();
-    for name in ["testFast", "check"] {
+    let (test_name, check_name) = rust_gate_command_names(b);
+    for name in [test_name, check_name] {
         let Some(spec) = b.commands.get(name) else {
-            errors.push(format!("命令 {name} 缺失：Rust 绑定必须声明 {name} 且含独立 --locked"));
+            errors.push(format!(
+                "命令 {name} 缺失：Rust 绑定必须声明 {name} 且含独立 --locked"
+            ));
             continue;
         };
         if spec.argv.is_empty() {
@@ -198,11 +1004,79 @@ pub fn validate_locked_rust_gates(b: &Binding) -> std::result::Result<(), Vec<St
     }
 }
 
+/// Require a Rust binding's Cargo-check command to cover every Cargo target.
+///
+/// Rust-only bindings select `check`, while Rust+Node bindings select
+/// `rustCheck`. The selected command must exist, have a non-empty argv, and
+/// contain an independent `--all-targets` token before the first `--`
+/// terminator. A joined string or a token after the terminator is not
+/// authorization. Non-Rust bindings keep their historical semantics.
+pub fn validate_rust_check_all_targets(b: &Binding) -> std::result::Result<(), Vec<String>> {
+    if !b.has_ecosystem("rust") {
+        return Ok(());
+    }
+
+    let (_, check_name) = rust_gate_command_names(b);
+    let error = match b.commands.get(check_name) {
+        None => Some(format!(
+            "命令 {check_name} 缺失：Rust 绑定必须声明 {check_name} 且含独立 --all-targets"
+        )),
+        Some(spec) if spec.argv.is_empty() => {
+            Some(format!(
+                "命令 {check_name} argv 为空：必须含独立 --all-targets"
+            ))
+        }
+        Some(spec) if !has_token_before_terminator(&spec.argv, "--all-targets") => Some(
+            format!(
+                "命令 {check_name} 缺独立 --all-targets：argv 必须在 `--` 终止符之前含独立 --all-targets"
+            ),
+        ),
+        Some(_) => None,
+    };
+
+    match error {
+        Some(error) => Err(vec![error]),
+        None => Ok(()),
+    }
+}
+
+/// Aggregate every Rust gate-floor violation so callers never repair
+/// `--locked` only to discover a hidden `--all-targets` failure afterwards.
+pub(crate) fn validate_rust_gate_floors(b: &Binding) -> std::result::Result<(), Vec<String>> {
+    let mut errors = validate_locked_rust_gates(b).err().unwrap_or_default();
+    errors.extend(validate_rust_check_all_targets(b).err().unwrap_or_default());
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Apply the shared Rust gate floors only at a real Cargo project root.
+///
+/// Both [`load`] and production `orch plan` call this wrapper so filesystem
+/// fixtures without `Cargo.toml` retain their historical synthetic semantics,
+/// while a real Rust project cannot take different admission paths.
+pub(crate) fn validate_rust_gate_floors_at_root(
+    root: &Path,
+    b: &Binding,
+) -> std::result::Result<(), Vec<String>> {
+    if is_rust_project_root(root) {
+        validate_rust_gate_floors(b)
+    } else {
+        Ok(())
+    }
+}
+
 /// 判断 argv 是否在 `--` 终止符之前含独立 `--locked` token。
 fn has_locked_before_terminator(argv: &[String]) -> bool {
+    has_token_before_terminator(argv, "--locked")
+}
+
+fn has_token_before_terminator(argv: &[String], required: &str) -> bool {
     argv.iter()
         .take_while(|tok| *tok != "--")
-        .any(|tok| tok == "--locked")
+        .any(|tok| tok == required)
 }
 
 /// 判断根目录是否为真实文件系统 Rust 项目根（planner r46-repair 决策）。
@@ -241,10 +1115,144 @@ mod tests {
         dir
     }
 
+    fn repository_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("CARGO_MANIFEST_DIR 上溯三级应为外层仓根")
+            .to_path_buf()
+    }
+
+    fn genesis_value() -> serde_json::Value {
+        let bytes =
+            std::fs::read(repository_root().join("coordination/frozen-contract-baseline-v1.json"))
+                .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn descriptor_for(bytes: &[u8]) -> LandedSeedBaselineDescriptor {
+        LandedSeedBaselineDescriptor {
+            schema_version: 1,
+            path: "coordination/frozen-contract-baseline-v1.json".to_string(),
+            sha256: hex::encode(Sha256::digest(bytes)),
+        }
+    }
+
+    fn parse_mutated_genesis(value: &serde_json::Value) -> std::result::Result<(), String> {
+        let bytes = serde_json::to_vec(value).unwrap();
+        parse_landed_seed_baseline(&descriptor_for(&bytes), &bytes).map(|_| ())
+    }
+
+    #[test]
+    fn signed_genesis_descriptor_and_manifest_are_strictly_valid() {
+        let root = repository_root();
+        let binding_bytes = std::fs::read(root.join("coordination/PROJECT-BINDING.yaml")).unwrap();
+        let binding = parse_binding_bytes(&binding_bytes).unwrap();
+        let descriptor = binding.oracle.landed_seed_baseline.unwrap();
+        let bytes = std::fs::read(root.join(&descriptor.path)).unwrap();
+        let manifest = parse_landed_seed_baseline(&descriptor, &bytes).unwrap();
+        assert_eq!(manifest.counts.declared_pairs_through_r70, 243);
+        assert_eq!(manifest.counts.drifted_declared_pairs_through_r70, 36);
+        assert_eq!(manifest.counts.missing_declared_pairs_through_r70, 4);
+        assert_eq!(manifest.counts.unique_effective_targets_through_b269, 225);
+        assert_eq!(manifest.counts.present_effective_targets, 224);
+        assert_eq!(manifest.counts.effective_tombstones, 1);
+        assert_eq!(manifest.counts.excluded_unrecorded_missing_targets, 3);
+    }
+
+    #[test]
+    fn baseline_descriptor_rejects_unknown_missing_path_and_hash() {
+        let hash = "a".repeat(64);
+        let unknown = format!(
+            "oracle:\n  landedSeedBaseline:\n    schemaVersion: 1\n    path: coordination/baseline.json\n    sha256: {hash}\n    unknown: true\n"
+        );
+        assert!(parse_binding_bytes(unknown.as_bytes()).is_err());
+        let missing = b"oracle:\n  landedSeedBaseline:\n    schemaVersion: 1\n    path: coordination/baseline.json\n";
+        assert!(parse_binding_bytes(missing).is_err());
+
+        let mut descriptor = descriptor_for(b"{}");
+        descriptor.path = "../baseline.json".to_string();
+        assert!(validate_landed_seed_baseline_descriptor(&descriptor)
+            .unwrap_err()
+            .contains("path"));
+        descriptor.path = "coordination/baseline.json".to_string();
+        descriptor.sha256 = "A".repeat(64);
+        assert!(validate_landed_seed_baseline_descriptor(&descriptor)
+            .unwrap_err()
+            .contains("sha256"));
+    }
+
+    #[test]
+    fn baseline_manifest_rejects_unknown_missing_duplicate_unsorted_and_bad_counts() {
+        let mut value = genesis_value();
+        value["unknown"] = serde_json::json!(true);
+        assert!(parse_mutated_genesis(&value)
+            .unwrap_err()
+            .contains("unknown"));
+
+        let mut value = genesis_value();
+        value["targets"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("effectiveSha256");
+        let error = parse_mutated_genesis(&value).unwrap_err();
+        assert!(
+            error.contains("effective") || error.contains("missing field"),
+            "unexpected error: {error}"
+        );
+
+        let mut value = genesis_value();
+        let duplicate = value["targets"][0]["target"].clone();
+        value["targets"][1]["target"] = duplicate;
+        assert!(parse_mutated_genesis(&value)
+            .unwrap_err()
+            .contains("严格排序"));
+
+        let mut value = genesis_value();
+        value["targets"].as_array_mut().unwrap().swap(0, 1);
+        assert!(parse_mutated_genesis(&value)
+            .unwrap_err()
+            .contains("严格排序"));
+
+        let mut value = genesis_value();
+        value["counts"]["presentEffectiveTargets"] = serde_json::json!(223);
+        assert!(parse_mutated_genesis(&value)
+            .unwrap_err()
+            .contains("counts"));
+    }
+
+    #[test]
+    fn baseline_manifest_rejects_invalid_paths_hashes_and_anchors() {
+        let mut value = genesis_value();
+        value["targets"][0]["target"] = serde_json::json!("../escape.rs");
+        assert!(parse_mutated_genesis(&value)
+            .unwrap_err()
+            .contains("target"));
+
+        let mut value = genesis_value();
+        value["targets"][0]["sources"][0]["sourceSha256"] = serde_json::json!("A".repeat(64));
+        assert!(parse_mutated_genesis(&value)
+            .unwrap_err()
+            .contains("hash provenance"));
+
+        let mut value = genesis_value();
+        value["targets"][0]["effectiveAnchor"]["eventId"] = serde_json::json!("forged");
+        assert!(parse_mutated_genesis(&value)
+            .unwrap_err()
+            .contains("effective anchor"));
+
+        let bytes = serde_json::to_vec(&genesis_value()).unwrap();
+        let mut descriptor = descriptor_for(&bytes);
+        descriptor.sha256 = "f".repeat(64);
+        assert!(parse_landed_seed_baseline(&descriptor, &bytes)
+            .unwrap_err()
+            .contains("不匹配"));
+    }
+
     #[test]
     fn missing_scope_and_git_use_legacy_safe_defaults() {
         let binding: Binding = serde_yaml::from_str(
-            "commands: {}\nunknownTopLevelField: tolerated\n",
+            "commands: {}\nunknownTopLevelField: tolerated\noracle:\n  futureSibling: tolerated\n",
         )
         .unwrap();
         assert!(binding.scope.protected_paths.is_empty());
@@ -268,10 +1276,7 @@ mod tests {
 
     // B106 严格聚合：缺命令本身也报错（planner r46-repair 决策）。
     fn rust_binding_with(yaml: &str) -> Binding {
-        serde_yaml::from_str(&format!(
-            "project: {{ecosystems: [rust]}}\n{yaml}\n"
-        ))
-        .unwrap()
+        serde_yaml::from_str(&format!("project: {{ecosystems: [rust]}}\n{yaml}\n")).unwrap()
     }
 
     #[test]
@@ -327,6 +1332,60 @@ mod tests {
     }
 
     #[test]
+    fn rust_check_all_targets_is_an_independent_pre_terminator_token() {
+        let good = rust_binding_with(
+            "commands:\n  check:\n    argv: [cargo, check, --all-targets, --locked]\n",
+        );
+        assert!(validate_rust_check_all_targets(&good).is_ok());
+
+        for argv in [
+            "[cargo, check, --locked]",
+            "[cargo, \"check --all-targets\", --locked]",
+            "[cargo, check, --locked, --, --all-targets]",
+            "[]",
+        ] {
+            let binding = rust_binding_with(&format!("commands:\n  check:\n    argv: {argv}\n"));
+            let errors = validate_rust_check_all_targets(&binding).unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("check") && error.contains("--all-targets")),
+                "{argv}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_gate_floors_report_locked_and_all_targets_together() {
+        let binding = rust_binding_with(
+            "commands:\n  testFast:\n    argv: [cargo, test, --locked]\n  check:\n    argv: [cargo, check]\n",
+        );
+        let errors = validate_rust_gate_floors(&binding).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("check") && error.contains("--locked")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("check") && error.contains("--all-targets")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn non_rust_binding_keeps_historical_check_semantics() {
+        let binding: Binding = serde_yaml::from_str(
+            "project: {ecosystems: [node]}\ncommands:\n  check: {argv: [npm, test]}\n",
+        )
+        .unwrap();
+        assert!(validate_rust_check_all_targets(&binding).is_ok());
+        assert!(validate_rust_gate_floors(&binding).is_ok());
+    }
+
+    #[test]
     fn is_rust_project_root_detects_top_level_and_nested_cargo_marker() {
         // 顶层 Cargo.toml
         let tmp = b106_scratch_dir("orch-b106-rust-root-toplevel");
@@ -364,6 +1423,7 @@ mod tests {
         assert!(err.contains("testFast"), "{err}");
         assert!(err.contains("check"), "{err}");
         assert!(err.contains("缺失"), "{err}");
+        assert!(err.contains("--all-targets"), "{err}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -385,18 +1445,23 @@ mod tests {
     }
 }
 
+/// Load the project binding, enforce the shared real-Rust gate floors, then
+/// apply the optional machine-local argv[0] overlay.
+///
+/// Validation precedes the overlay so `binding::load` and authorized
+/// `orch plan` judge the same signed command tokens, including independent
+/// pre-terminator `--locked` and `--all-targets` requirements.
 pub fn load(root: &Path) -> Result<Binding> {
     let p = root.join("coordination/PROJECT-BINDING.yaml");
     let text = fs::read_to_string(&p).with_context(|| format!("读取绑定失败: {}", p.display()))?;
-    let mut binding: Binding =
-        serde_yaml::from_str(&text).with_context(|| format!("解析绑定失败: {}", p.display()))?;
+    let mut binding = parse_binding_bytes(text.as_bytes())
+        .map_err(anyhow::Error::msg)
+        .with_context(|| format!("解析绑定失败: {}", p.display()))?;
     // 只在真实文件系统 Rust 项目根强制严格 Rust 门（planner r46-repair 决策）：
     // 合成 fixture 根（无 Cargo.toml/orch/Cargo.toml 标记）与非 Rust 绑定跳过，
     // 保持既有合成测试（如 merge_irreversible 仅 postGate）不受扰。
-    if is_rust_project_root(root) {
-        validate_locked_rust_gates(&binding)
-            .map_err(|errs| anyhow::anyhow!("Rust 门 --locked 校验失败: {}", errs.join("; ")))?;
-    }
+    validate_rust_gate_floors_at_root(root, &binding)
+        .map_err(|errs| anyhow::anyhow!("Rust 门参数 floor 校验失败: {}", errs.join("; ")))?;
     // B151 便携性分层：machine.yaml 覆盖 argv[0]。若本机有 .orch/machine.yaml
     // 且声明的工具键（如 cargo）与某命令 argv[0] 完全相等（可移植默认是裸名），
     // 用 machine 路径替换 argv[0]——这是 detached worktree / 不同机器上 cargo
@@ -444,7 +1509,9 @@ pub fn resolve_main_repo_machine_config(root: &Path) -> Result<Option<MachineCon
     if !common_dir.status.success() {
         return Ok(None);
     }
-    let common_dir_str = String::from_utf8_lossy(&common_dir.stdout).trim().to_string();
+    let common_dir_str = String::from_utf8_lossy(&common_dir.stdout)
+        .trim()
+        .to_string();
     if common_dir_str.is_empty() {
         return Ok(None);
     }
@@ -548,8 +1615,7 @@ pub fn resolve_command_tool(root: &Path, command: &str, tool: &str) -> Result<St
         .get(command)
         .and_then(|spec| spec.argv.first())
         .map(String::as_str);
-    resolve_tool_path(machine_path, project_default, tool)
-        .map_err(anyhow::Error::msg)
+    resolve_tool_path(machine_path, project_default, tool).map_err(anyhow::Error::msg)
 }
 
 /// 判定 `.gitignore` 是否含 `.orch/machine.yaml` 行（M2：机器配置必须被忽略，

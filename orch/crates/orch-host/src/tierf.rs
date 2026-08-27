@@ -17,6 +17,8 @@ use sha2::Digest;
 
 use crate::{card, collect, current_round, gitx, ledger, liveness, wake};
 
+mod resume_repair;
+
 const IMPLEMENT_DISPATCH_SITE_ROLE: crate::sites::SiteRole = crate::sites::SiteRole::Implement;
 
 /// await-report 的四种归宿：收到并过机检门 / 执行者报告阻塞 / liveness 判死 / liveness 判滞
@@ -66,29 +68,29 @@ pub fn await_poll_with_escape(
 /// binding and terminal `ActionRejected(operation=await-report)` supply that
 /// missing scope.  Neither a generic await failure nor an older REPORT can
 /// open the escape hatch.
-fn report_collect_hard_rejected(
-    events: &[EventRecord],
+fn report_collect_hard_rejection_index<'a>(
+    events: &'a [EventRecord],
     round: &str,
     task_id: &str,
     attempt: &crate::attempt::AttemptRef,
     report: &crate::attempt::EvidenceObservation,
-) -> bool {
+    control_epoch: Option<&'a str>,
+) -> Option<usize> {
+    let control_epoch = control_epoch.or_else(|| {
+        events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.task_id.as_deref() == Some(task_id)
+                    && matches!(
+                        event.kind.as_str(),
+                        "DispatchIssued" | "NudgeIssued" | "ResumeIssued"
+                    )
+            })
+            .map(|event| event.event_id.as_str())
+            .filter(|event_id| !event_id.is_empty())
+    })?;
     let canonical_path = report.canonical_path.to_string_lossy();
-    let Some(control_epoch) = events
-        .iter()
-        .rev()
-        .find(|event| {
-            event.task_id.as_deref() == Some(task_id)
-                && matches!(
-                    event.kind.as_str(),
-                    "DispatchIssued" | "NudgeIssued" | "ResumeIssued"
-                )
-        })
-        .map(|event| event.event_id.as_str())
-        .filter(|event_id| !event_id.is_empty())
-    else {
-        return false;
-    };
     let evidence_matches = |payload: &serde_json::Value| {
         payload.get("attemptId").and_then(serde_json::Value::as_str)
             == Some(attempt.attempt_id.as_str())
@@ -131,14 +133,14 @@ fn report_collect_hard_rejected(
                 == Some(attempt.ordinal as u64)
     });
     let Some(latest_report) = latest_report else {
-        return false;
+        return None;
     };
     let observed_payload = match events[latest_report].payload.as_ref() {
         Some(payload) => payload,
-        None => return false,
+        None => return None,
     };
     if !evidence_matches(observed_payload) {
-        return false;
+        return None;
     }
 
     let action_id = format!("await-report:{round}:{task_id}");
@@ -181,7 +183,7 @@ fn report_collect_hard_rejected(
         .rev()
         .find(|index| rejection_matches(&events[*index]))
     else {
-        return false;
+        return None;
     };
 
     let collect_event_matches = |event: &EventRecord| {
@@ -203,7 +205,7 @@ fn report_collect_hard_rejected(
                 | "ReportCollectReleased"
         ) && collect_event_matches(event)
     }) {
-        return false;
+        return None;
     }
 
     // A machine verdict belongs only to the latest durable generation before
@@ -251,7 +253,7 @@ fn report_collect_hard_rejected(
                 && payload.get("attemptNo").and_then(serde_json::Value::as_u64)
                     == Some(attempt.ordinal as u64)
             {
-                return true;
+                return Some(machine_index);
             }
             continue;
         }
@@ -284,10 +286,20 @@ fn report_collect_hard_rejected(
             .iter()
             .any(|event| event.kind == "ReportCollectReleased" && same_lineage(event))
         {
-            return true;
+            return Some(machine_index);
         }
     }
-    false
+    None
+}
+
+fn report_collect_hard_rejected(
+    events: &[EventRecord],
+    round: &str,
+    task_id: &str,
+    attempt: &crate::attempt::AttemptRef,
+    report: &crate::attempt::EvidenceObservation,
+) -> bool {
+    report_collect_hard_rejection_index(events, round, task_id, attempt, report, None).is_some()
 }
 
 #[cfg(test)]
@@ -695,6 +707,152 @@ impl AwaitReportRuntime for ProductionAwaitReportRuntime {
     }
 }
 
+/// `orch await-report <task>`：双根 stat 轮询（PITFALLS #2）→ ReportObserved → 机检+门。
+/// O7：轮询期间按 design/03 §4.3 探测阶梯做 liveness 联动（`live=None` 关闭＝旧行为）。
+pub fn run_await(
+    root: &Path,
+    task_id: &str,
+    timeout_secs: u64,
+    live: Option<liveness::LivenessOpts>,
+) -> Result<AwaitOutcome> {
+    run_await_with_hook(root, task_id, timeout_secs, live, &mut |_| Ok(()))
+}
+
+/// Deterministic production-path hook for evidence/attempt switch tests.
+#[doc(hidden)]
+pub fn run_await_with_hook(
+    root: &Path,
+    task_id: &str,
+    timeout_secs: u64,
+    live: Option<liveness::LivenessOpts>,
+    hook: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<AwaitOutcome> {
+    let round = current_round(root)?;
+    let action_id = format!("await-report:{round}:{task_id}");
+    match run_await_with_hook_inner(root, task_id, timeout_secs, live, hook, &round) {
+        Ok(outcome) => Ok(outcome),
+        Err(error)
+            if crate::failure::is_action_rejection(&error) || is_critical_point_drift(&error) =>
+        {
+            Err(error)
+        }
+        Err(error) => crate::failure::reject_action_from_ledger_command_outcome(
+            root,
+            &round,
+            Some(task_id),
+            "await-report",
+            &action_id,
+            &format!("{error:#}"),
+            crate::failure::CommandOutcome::PendingConsumption,
+        ),
+    }
+}
+
+fn run_await_with_hook_inner(
+    root: &Path,
+    task_id: &str,
+    timeout_secs: u64,
+    live: Option<liveness::LivenessOpts>,
+    hook: &mut dyn FnMut(&str) -> Result<()>,
+    round: &str,
+) -> Result<AwaitOutcome> {
+    run_await_with_hook_inner_impl(root, task_id, timeout_secs, live, hook, round)
+}
+
+fn require_await_entry_card(root: &Path, round: &str, task_id: &str) -> Result<card::Card> {
+    critical_point(require_active_tierf_task(root, round, task_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_await_bootstrap<R: AwaitReportRuntime>(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    strict_attempt: &crate::attempt::AttemptRef,
+    cur_agent: Option<&str>,
+    ack_evidence_observation: Option<&crate::attempt::EvidenceObservation>,
+    ack_observed: bool,
+    mut ack_logged: bool,
+    hook: &mut dyn FnMut(&str) -> Result<()>,
+    runtime: &mut R,
+    watcher_callback: &mut Option<AwaitReportNotifyCallback>,
+    watcher_failed: &AtomicBool,
+    watcher_disabled: &mut bool,
+    watch_plan: &AwaitReportWatchPlan,
+    watched: &mut BTreeSet<PathBuf>,
+) -> Result<bool> {
+    // This is the real, once-per-frame orchestration path. Keep the canonical
+    // durable claim and every optional watcher edge in this one body so the
+    // frozen source-order contract observes execution order, not the order of
+    // disconnected helper definitions.
+    if ack_observed && !ack_logged {
+        let agent = cur_agent.context("await ACK claim 缺 current agent")?;
+        let ack_evidence =
+            ack_evidence_observation.context("await ACK claim 缺 evidence observation")?;
+        ack_logged = claim_observed_dispatch_ack(
+            root,
+            round,
+            task_id,
+            &strict_attempt.attempt_id,
+            strict_attempt.ordinal,
+            agent,
+            ack_evidence,
+            hook,
+        )?;
+    }
+
+    if let Some(callback) = watcher_callback.take() {
+        runtime.install_watcher(callback);
+        let reports_dir = root.join(format!("coordination/rounds/{round}/reports"));
+        let _ = runtime.create_dir_all(&reports_dir);
+    }
+    if !*watcher_disabled && watcher_failed.load(Ordering::Acquire) {
+        *watcher_disabled = true;
+        runtime.disable_watcher();
+    }
+    if runtime.watcher_available() {
+        for pending in
+            await_report_pending_watch_roots(watch_plan, watched, |path| runtime.is_dir(path))
+        {
+            let mode = if pending.recursive {
+                notify::RecursiveMode::Recursive
+            } else {
+                notify::RecursiveMode::NonRecursive
+            };
+            if runtime.watch(&pending.path, mode) {
+                watched.insert(pending.path);
+            }
+        }
+    }
+
+    Ok(ack_logged)
+}
+
+fn before_await_liveness_probe(hook: &mut dyn FnMut(&str) -> Result<()>) -> Result<()> {
+    hook("before-liveness-probe")
+}
+
+fn wait_for_await_reconcile<R, F>(runtime: &mut R, tick: Duration, native_wait: F)
+where
+    R: AwaitReportRuntime,
+    F: FnOnce() -> std::result::Result<(), std::sync::mpsc::RecvTimeoutError>,
+{
+    match runtime.recv_timeout(tick, native_wait) {
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => runtime.sleep(tick),
+    }
+}
+
+/// Result of consuming one exact attempt-scoped NUDGE without guessing another task or round.
+pub struct NudgeOutcome {
+    /// Round whose canonical NUDGE was consumed.
+    pub round: String,
+    /// Exact durable NUDGE path marked as seen.
+    pub nudge_path: PathBuf,
+    /// 上一条 NUDGE 的消费时间（NUDGE.md.seen 的 mtime，RFC3339 秒），无则 None
+    pub prev_seen: Option<String>,
+}
+
 /// REPORT 写盘到 commit 有界等待期间，branch HEAD 对 REPORT 路径的观察态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportCommitState {
@@ -1022,11 +1180,60 @@ struct ActualGateSummary {
     raw_log_len: u64,
 }
 
+/// One fully validated collect gate that a later root-reuse consumer may adopt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedCollectGateV1 {
+    /// One-based invocation position; repeated command refs remain distinct by this value.
+    pub sequence: u64,
+    /// Durable `GateExecuted` event identity.
+    pub source_event_id: String,
+    /// Phase-scoped run identity, unique within the receipt.
+    pub gate_run_id: String,
+    /// Semantic command reference recorded by the exact ten-key event.
+    pub command_ref: String,
+    /// Observed child exit code; reusable bundles require zero.
+    pub exit_code: i32,
+    /// SHA-256 of the independently reread raw log CAS object.
+    pub log_sha256: String,
+    /// Exact raw log byte length.
+    pub log_bytes: u64,
+}
+
+/// Validated V1 bridge from Tier-F collect receipts to B304 root-gate reuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedCollectGateBundleV1 {
+    /// Candidate commit whose tree was gated.
+    pub candidate_sha: String,
+    /// Candidate tree identity; current main is intentionally not part of it.
+    pub subject_tree_sha: String,
+    /// Exact attempt that produced this receipt.
+    pub attempt_id: String,
+    /// Immutable `DispatchIssued.baseSha` used for policy resolution.
+    pub policy_base_sha: String,
+    /// Signed active ROUND-IR revision at collect time.
+    pub ir_revision: u32,
+    /// Signed active ROUND-IR validation digest.
+    pub validation_digest: String,
+    /// SHA-256 of the active IR's bound project binding.
+    pub binding_sha256: String,
+    /// SHA-256 of this task's active signed card.
+    pub task_card_sha256: String,
+    /// Digest of the exact ordered reconstructed argv sequence.
+    pub resolved_command_digest: String,
+    /// Shared toolchain fingerprint across all gates.
+    pub toolchain_digest: String,
+    /// Shared environment fingerprint across all gates.
+    pub environment_digest: String,
+    /// Ordered, independently replayed green gate sources.
+    pub gates: Vec<ValidatedCollectGateV1>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CollectAttestedGate {
     sequence: u64,
     gate_event_id: String,
+    gate_run_id: String,
     command_ref: String,
     exit_code: i32,
     duration_ms: u64,
@@ -1054,9 +1261,31 @@ struct CollectReceiptAttestation {
     evidence_sha256: String,
     evidence_len: u64,
     control_epoch: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    subject_tree_sha: String,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    ir_revision: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    validation_digest: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    binding_sha256: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    task_card_sha256: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    resolved_command_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_reader_descriptor_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_reader_base_sha256: Option<String>,
+    toolchain_digest: String,
+    environment_digest: String,
     configured_gate_count: u64,
     configured_command_refs: Vec<String>,
     gates: Vec<CollectAttestedGate>,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 fn collect_cas(root: &Path) -> crate::cas::Store {
@@ -1229,10 +1458,91 @@ fn receipt_attestation_ref_from_payload(
     ))
 }
 
-fn expected_gate_refs(root: &Path, card: &card::Card) -> Result<Vec<String>> {
-    let binding = crate::binding::load(root)?;
-    let available = binding.commands.keys().cloned().collect::<Vec<_>>();
-    crate::binding::resolve_gates(&card.meta.gates.fast, &available).map_err(anyhow::Error::msg)
+struct CollectContractIdentity {
+    ir_revision: u32,
+    validation_digest: String,
+    binding_sha256: String,
+    task_card_sha256: String,
+}
+
+fn collect_contract_identity(
+    root: &Path,
+    events: &[EventRecord],
+    round: &str,
+    task_id: &str,
+) -> Result<CollectContractIdentity> {
+    let validation = crate::plan::require_active_round_ir(root, round, events)?;
+    let card_rel = format!("coordination/rounds/{round}/tasks/{task_id}.md");
+    let task_card_sha256 = validation
+        .candidate
+        .source_bindings
+        .task_cards
+        .get(&card_rel)
+        .with_context(|| format!("active ROUND-IR 未绑定 collect card: {card_rel}"))?
+        .clone();
+    Ok(CollectContractIdentity {
+        ir_revision: validation.persisted_revision,
+        validation_digest: validation.persisted_digest,
+        binding_sha256: validation.candidate.source_bindings.binding_sha256,
+        task_card_sha256,
+    })
+}
+
+fn expected_collect_lane_plan(
+    root: &Path,
+    card: &card::Card,
+    events: &[EventRecord],
+    round: &str,
+    task_id: &str,
+    attempt_id: &str,
+    policy_base_sha: &str,
+    candidate_sha: &str,
+) -> Result<collect::CollectLanePlan> {
+    if card.meta.task_id != task_id {
+        bail!("collect lane resolver card/task identity 漂移");
+    }
+    collect::resolve_collect_lane_plan_at_candidate(
+        root,
+        round,
+        card,
+        events,
+        attempt_id,
+        policy_base_sha,
+        candidate_sha,
+    )
+}
+
+fn validate_lane_escalation_precedes_first_collect_gate(
+    events: &[EventRecord],
+    round: &str,
+    task_id: &str,
+    attempt_id: &str,
+    expects_escalation: bool,
+    first_gate_position: usize,
+) -> Result<()> {
+    if !expects_escalation {
+        return Ok(());
+    }
+    let positions = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event.kind == "GateLaneEscalated"
+                && event.task_id.as_deref() == Some(task_id)
+                && event.round.as_deref() == Some(round)
+                && event
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("attemptId"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(attempt_id)
+        })
+        .map(|(position, _)| position)
+        .collect::<Vec<_>>();
+    if positions.len() != 1 || positions[0] >= first_gate_position {
+        bail!("GateLaneEscalated 必须唯一且先于首条 collect GateExecuted");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1241,6 +1551,7 @@ fn build_collect_gate_receipt(
     events: &[EventRecord],
     round: &str,
     task_id: &str,
+    card: &card::Card,
     ctx: &crate::attempt::DispatchContext,
     claimed: &crate::attempt::ClaimedEvidence,
     action_id: &str,
@@ -1248,9 +1559,32 @@ fn build_collect_gate_receipt(
     owner: &str,
     generation: &str,
     executing_event_id: &str,
-    expected_refs: &[String],
     summaries: &[ActualGateSummary],
 ) -> Result<(EventRecord, CollectGateReceiptRef)> {
+    let attempt_id = ctx
+        .attempt_id
+        .as_deref()
+        .context("collect attestation 缺 attemptId")?;
+    let policy_base_sha = ctx
+        .base_sha
+        .as_deref()
+        .context("collect attestation 缺 baseSha")?;
+    let lane_plan = expected_collect_lane_plan(
+        root,
+        card,
+        events,
+        round,
+        task_id,
+        attempt_id,
+        policy_base_sha,
+        branch_sha,
+    )?;
+    let expected_refs = lane_plan.ordered_command_refs();
+    let resolved_command_digest = lane_plan.resolved_command_digest().to_string();
+    let source_reader_digests = lane_plan
+        .source_reader_digests()
+        .map(|(descriptor, base)| (descriptor.to_string(), base.to_string()));
+    let contract = collect_contract_identity(root, events, round, task_id)?;
     let executing = events
         .iter()
         .rposition(|event| event.event_id == executing_event_id)
@@ -1265,12 +1599,21 @@ fn build_collect_gate_receipt(
     }
     let gate_events: Vec<&EventRecord> = events[executing + 1..]
         .iter()
-        .filter(|event| {
-            event.kind == "GateExecuted"
-                && event.task_id.as_deref() == Some(task_id)
-                && event.round.as_deref() == Some(round)
-        })
+        .filter(|event| is_collect_gate_event(event, task_id, round))
         .collect();
+    let first_gate_position = events[executing + 1..]
+        .iter()
+        .position(|event| is_collect_gate_event(event, task_id, round))
+        .map(|offset| executing + 1 + offset)
+        .context("collect receipt 缺首条 collect GateExecuted")?;
+    validate_lane_escalation_precedes_first_collect_gate(
+        events,
+        round,
+        task_id,
+        attempt_id,
+        lane_plan.requires_escalation_event(),
+        first_gate_position,
+    )?;
     if gate_events.len() != expected_refs.len() || summaries.len() != expected_refs.len() {
         bail!(
             "collect receipt gate 数量不匹配：ledger={} actual={} configured={}",
@@ -1281,43 +1624,42 @@ fn build_collect_gate_receipt(
     }
     let mut gates = Vec::with_capacity(expected_refs.len());
     let mut gate_event_ids = std::collections::HashSet::new();
+    let mut gate_run_ids = std::collections::HashSet::new();
+    let expected_subject_tree = gitx::rev_parse(root, &format!("{branch_sha}^{{tree}}"))?;
+    let mut toolchain_digest: Option<String> = None;
+    let mut environment_digest: Option<String> = None;
     for (index, ((event, summary), command_ref)) in gate_events
         .iter()
         .zip(summaries)
-        .zip(expected_refs)
+        .zip(&expected_refs)
         .enumerate()
     {
-        let event_payload = event.payload.as_ref().context("GateExecuted 缺 payload")?;
-        let event_command = event_payload
-            .get("commandRef")
-            .and_then(serde_json::Value::as_str)
-            .context("GateExecuted 缺 commandRef")?;
-        let event_exit = event_payload
-            .get("exitCode")
-            .and_then(serde_json::Value::as_i64)
-            .context("GateExecuted 缺 exitCode")?;
-        let event_duration = event_payload
-            .get("durationMs")
-            .and_then(serde_json::Value::as_u64)
-            .context("GateExecuted 缺 durationMs")?;
-        if event.actor != "runtime:orch"
-            || !gate_event_ids.insert(event.event_id.as_str())
+        let observed = collect_gate_observation(event)?;
+        if !gate_event_ids.insert(event.event_id.as_str())
+            || !gate_run_ids.insert(observed.gate_run_id)
             || events
                 .iter()
                 .filter(|candidate| candidate.event_id == event.event_id)
                 .count()
                 != 1
-            || event_command != command_ref
-            || summary.command_ref != *command_ref
-            || event_exit != i64::from(summary.exit_code)
-            || event_duration != summary.duration_ms
-            || summary.exit_code != 0
+            || !observation_matches_summary(&observed, summary, command_ref, &expected_subject_tree)
         {
             bail!("collect receipt gate #{index} 与实际/configured gate 不一致");
         }
+        bind_shared_digest(
+            &mut toolchain_digest,
+            observed.toolchain_digest,
+            "toolchain",
+        )?;
+        bind_shared_digest(
+            &mut environment_digest,
+            observed.environment_digest,
+            "environment",
+        )?;
         gates.push(CollectAttestedGate {
             sequence: (index + 1) as u64,
             gate_event_id: event.event_id.clone(),
+            gate_run_id: observed.gate_run_id.to_string(),
             command_ref: command_ref.clone(),
             exit_code: summary.exit_code,
             duration_ms: summary.duration_ms,
@@ -1326,22 +1668,16 @@ fn build_collect_gate_receipt(
         });
     }
     let attestation = CollectReceiptAttestation {
-        attestation_version: 1,
+        attestation_version: 2,
         round: round.to_string(),
         task_id: task_id.to_string(),
         action_id: action_id.to_string(),
         owner: owner.to_string(),
         lease_generation: generation.to_string(),
-        attempt_id: ctx
-            .attempt_id
-            .clone()
-            .context("collect attestation 缺 attemptId")?,
+        attempt_id: attempt_id.to_string(),
         attempt_no: ctx.attempt_no.context("collect attestation 缺 attemptNo")? as u64,
         agent: ctx.agent.clone().context("collect attestation 缺 agent")?,
-        base_sha: ctx
-            .base_sha
-            .clone()
-            .context("collect attestation 缺 baseSha")?,
+        base_sha: policy_base_sha.to_string(),
         go_path: ctx
             .go_path
             .clone()
@@ -1352,8 +1688,21 @@ fn build_collect_gate_receipt(
         evidence_sha256: claimed.sha256.clone(),
         evidence_len: claimed.len,
         control_epoch: claimed.control_epoch.clone(),
+        subject_tree_sha: expected_subject_tree,
+        ir_revision: contract.ir_revision,
+        validation_digest: contract.validation_digest,
+        binding_sha256: contract.binding_sha256,
+        task_card_sha256: contract.task_card_sha256,
+        resolved_command_digest,
+        source_reader_descriptor_sha256: source_reader_digests
+            .as_ref()
+            .map(|(descriptor, _)| descriptor.clone()),
+        source_reader_base_sha256: source_reader_digests.map(|(_, base)| base),
+        toolchain_digest: toolchain_digest.context("collect attestation 缺 toolchainDigest")?,
+        environment_digest: environment_digest
+            .context("collect attestation 缺 environmentDigest")?,
         configured_gate_count: expected_refs.len() as u64,
-        configured_command_refs: expected_refs.to_vec(),
+        configured_command_refs: expected_refs,
         gates,
     };
     let mut receipt_ref = write_collect_attestation(root, &attestation)?;
@@ -1366,10 +1715,24 @@ fn build_collect_gate_receipt(
         generation,
         None,
     )?;
-    payload["receiptVersion"] = serde_json::json!(2);
+    payload["receiptVersion"] = serde_json::json!(3);
     payload["gateCount"] = serde_json::json!(attestation.configured_gate_count);
     payload["configuredCommandRefs"] = serde_json::to_value(&attestation.configured_command_refs)?;
     payload["gates"] = serde_json::to_value(&attestation.gates)?;
+    payload["toolchainDigest"] = serde_json::json!(attestation.toolchain_digest);
+    payload["environmentDigest"] = serde_json::json!(attestation.environment_digest);
+    payload["subjectTreeSha"] = serde_json::json!(attestation.subject_tree_sha);
+    payload["irRevision"] = serde_json::json!(attestation.ir_revision);
+    payload["validationDigest"] = serde_json::json!(attestation.validation_digest);
+    payload["bindingSha256"] = serde_json::json!(attestation.binding_sha256);
+    payload["taskCardSha256"] = serde_json::json!(attestation.task_card_sha256);
+    payload["resolvedCommandDigest"] = serde_json::json!(attestation.resolved_command_digest);
+    if let Some(descriptor) = &attestation.source_reader_descriptor_sha256 {
+        payload["sourceReaderDescriptorSha256"] = serde_json::json!(descriptor);
+    }
+    if let Some(base) = &attestation.source_reader_base_sha256 {
+        payload["sourceReaderBaseSha256"] = serde_json::json!(base);
+    }
     payload["receiptDigest"] = serde_json::json!(receipt_ref.attestation_sha256);
     bind_attestation_ref(&mut payload, &receipt_ref);
     let receipt_event = ledger::event(
@@ -1461,12 +1824,8 @@ fn validate_collect_gate_receipt(
     }
     if payload.get("attemptNo").and_then(serde_json::Value::as_u64)
         != Some(expectation.attempt_no as u64)
-        || payload
-            .get("receiptVersion")
-            .and_then(serde_json::Value::as_u64)
-            != Some(2)
     {
-        bail!("collect gate receipt attemptNo/version 不匹配");
+        bail!("collect gate receipt attemptNo 不匹配");
     }
     let (receipt_attestation_sha256, receipt_attestation_len) =
         receipt_attestation_ref_from_payload(payload, "CollectGateSuccessReceipt")?;
@@ -1484,6 +1843,16 @@ fn validate_collect_gate_receipt(
         bail!("collect gate receipt 未精确绑定 attestation CAS");
     }
     let attestation = read_collect_attestation(root, receipt_ref)?;
+    let receipt_version = payload
+        .get("receiptVersion")
+        .and_then(serde_json::Value::as_u64)
+        .context("collect gate receipt 缺 receiptVersion")?;
+    if !matches!(
+        (attestation.attestation_version, receipt_version),
+        (1, 2) | (2, 3)
+    ) {
+        bail!("collect gate receipt/attestation version 组合未建模");
+    }
     let belongs = |event: &EventRecord, kind: &str| {
         event.kind == kind
             && event.task_id.as_deref() == Some(task_id)
@@ -1537,21 +1906,75 @@ fn validate_collect_gate_receipt(
     }
     let gate_events = events[executing + 1..receipt_position]
         .iter()
-        .filter(|event| {
-            event.kind == "GateExecuted"
-                && event.task_id.as_deref() == Some(task_id)
-                && event.round.as_deref() == Some(round)
-        })
+        .filter(|event| is_collect_gate_event(event, task_id, round))
         .collect::<Vec<_>>();
-    if events[receipt_position + 1..executed].iter().any(|event| {
-        event.kind == "GateExecuted"
-            && event.task_id.as_deref() == Some(task_id)
-            && event.round.as_deref() == Some(round)
-    }) {
+    let first_gate_position = events[executing + 1..receipt_position]
+        .iter()
+        .position(|event| is_collect_gate_event(event, task_id, round))
+        .map(|offset| executing + 1 + offset)
+        .context("collect attestation 缺首条 collect GateExecuted")?;
+    if events[receipt_position + 1..executed]
+        .iter()
+        .any(|event| is_collect_gate_event(event, task_id, round))
+    {
         bail!("collect gate receipt 后、Executed 前出现额外 GateExecuted");
     }
-    let configured = expected_gate_refs(root, card)?;
-    if attestation.attestation_version != 1
+    let candidate_sha = expectation
+        .branch_sha
+        .as_deref()
+        .context("collect attestation expectation 缺 branchSha")?;
+    let expected_subject_tree = gitx::rev_parse(root, &format!("{candidate_sha}^{{tree}}"))?;
+    let (configured, v2_identity_matches) = if attestation.attestation_version == 1 {
+        let binding = crate::binding::load(root)?;
+        let available = binding.commands.keys().cloned().collect::<Vec<_>>();
+        (
+            crate::binding::resolve_gates(&card.meta.gates.fast, &available)
+                .map_err(anyhow::Error::msg)?,
+            true,
+        )
+    } else {
+        let lane_plan = expected_collect_lane_plan(
+            root,
+            card,
+            events,
+            round,
+            task_id,
+            &expectation.attempt_id,
+            &expectation.base_sha,
+            candidate_sha,
+        )?;
+        validate_lane_escalation_precedes_first_collect_gate(
+            events,
+            round,
+            task_id,
+            &expectation.attempt_id,
+            lane_plan.requires_escalation_event(),
+            first_gate_position,
+        )?;
+        let configured = lane_plan.ordered_command_refs();
+        let expected_resolved_command_digest = lane_plan.resolved_command_digest();
+        let expected_source_reader_digests = lane_plan.source_reader_digests();
+        let contract = collect_contract_identity(root, events, round, task_id)?;
+        let matches = attestation.attestation_version == 2
+            && attestation.subject_tree_sha == expected_subject_tree
+            && attestation.ir_revision == contract.ir_revision
+            && attestation.validation_digest == contract.validation_digest
+            && attestation.binding_sha256 == contract.binding_sha256
+            && attestation.task_card_sha256 == contract.task_card_sha256
+            && attestation.resolved_command_digest == expected_resolved_command_digest
+            && match expected_source_reader_digests {
+                Some((descriptor, base)) => {
+                    attestation.source_reader_descriptor_sha256.as_deref() == Some(descriptor)
+                        && attestation.source_reader_base_sha256.as_deref() == Some(base)
+                }
+                None => {
+                    attestation.source_reader_descriptor_sha256.is_none()
+                        && attestation.source_reader_base_sha256.is_none()
+                }
+            };
+        (configured, matches)
+    };
+    if !v2_identity_matches
         || attestation.round != expectation.round
         || attestation.task_id != expectation.task_id
         || attestation.action_id != expectation.action_id
@@ -1571,6 +1994,8 @@ fn validate_collect_gate_receipt(
         || attestation.evidence_sha256 != claimed.sha256
         || attestation.evidence_len != claimed.len
         || attestation.control_epoch != claimed.control_epoch
+        || !valid_sha256(&attestation.toolchain_digest)
+        || !valid_sha256(&attestation.environment_digest)
         || attestation.configured_gate_count != configured.len() as u64
         || attestation.configured_command_refs != configured
         || attestation.gates.len() != configured.len()
@@ -1578,15 +2003,11 @@ fn validate_collect_gate_receipt(
     {
         bail!("collect attestation action/evidence/configured gate 字段不匹配");
     }
-    if payload.get("gateCount").and_then(serde_json::Value::as_u64)
-        != Some(attestation.configured_gate_count)
-        || payload.get("configuredCommandRefs")
-            != Some(&serde_json::to_value(&attestation.configured_command_refs)?)
-        || payload.get("gates") != Some(&serde_json::to_value(&attestation.gates)?)
-    {
+    if !receipt_payload_matches_attestation(payload, &attestation)? {
         bail!("CollectGateSuccessReceipt ledger binding 与 attestation CAS 不匹配");
     }
     let mut referenced_gate_ids = std::collections::HashSet::new();
+    let mut referenced_gate_run_ids = std::collections::HashSet::new();
     for (index, ((attested_gate, gate_event), command_ref)) in attestation
         .gates
         .iter()
@@ -1594,12 +2015,9 @@ fn validate_collect_gate_receipt(
         .zip(configured)
         .enumerate()
     {
-        let event_payload = gate_event
-            .payload
-            .as_ref()
-            .context("GateExecuted 缺 payload")?;
-        if gate_event.actor != "runtime:orch"
-            || !referenced_gate_ids.insert(attested_gate.gate_event_id.as_str())
+        let observed = collect_gate_observation(gate_event)?;
+        if !referenced_gate_ids.insert(attested_gate.gate_event_id.as_str())
+            || !referenced_gate_run_ids.insert(attested_gate.gate_run_id.as_str())
             || events
                 .iter()
                 .filter(|event| event.event_id == attested_gate.gate_event_id)
@@ -1607,20 +2025,14 @@ fn validate_collect_gate_receipt(
                 != 1
             || attested_gate.sequence != (index + 1) as u64
             || attested_gate.gate_event_id != gate_event.event_id
-            || attested_gate.command_ref != command_ref
-            || attested_gate.exit_code != 0
-            || event_payload
-                .get("commandRef")
-                .and_then(serde_json::Value::as_str)
-                != Some(command_ref.as_str())
-            || event_payload
-                .get("exitCode")
-                .and_then(serde_json::Value::as_i64)
-                != Some(0)
-            || event_payload
-                .get("durationMs")
-                .and_then(serde_json::Value::as_u64)
-                != Some(attested_gate.duration_ms)
+            || !observation_matches_attestation(
+                &observed,
+                attested_gate,
+                &command_ref,
+                &expected_subject_tree,
+                &attestation.toolchain_digest,
+                &attestation.environment_digest,
+            )
         {
             bail!("collect gate receipt gate #{index} 顺序/结果不匹配");
         }
@@ -1630,6 +2042,133 @@ fn validate_collect_gate_receipt(
     // 本 runtime 的信任边界，没有外部密钥/签名服务时无法与合法 runtime 区分。
     verify_attested_raw_logs(root, &attestation.gates)?;
     Ok(())
+}
+
+/// Load and independently replay the latest completed collect receipt for one exact attempt.
+///
+/// `None` means no completed receipt exists. A present receipt is returned only after its active
+/// signed card/IR identity, immutable dispatch-base lane resolution, exact ten-key gate events,
+/// positional run IDs, attestation CAS, and every raw-log CAS object have all been reread. Legacy
+/// v1 attestations remain valid for historical lifecycle replay but are intentionally not exposed
+/// as reusable V1 bundles because they lack the signed contract and resolved-argv identity.
+pub fn load_validated_collect_gate_bundle_v1(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    attempt_id: &str,
+) -> Result<Option<ValidatedCollectGateBundleV1>> {
+    card::validate_task_id(task_id)?;
+    let ledger_path = root.join(format!("coordination/rounds/{round}/events.jsonl"));
+    let ledger_read = read_ledger(&ledger_path)
+        .with_context(|| format!("读取 collect bundle ledger 失败: {}", ledger_path.display()))?;
+    crate::attempt::reject_bad_lines(&ledger_read)?;
+    let validation = crate::plan::require_active_round_ir(root, round, &ledger_read.events)?;
+    let card = crate::plan::load_bound_task_card(root, round, task_id, &validation)?;
+    let terminal = ledger_read.events.iter().rev().find(|event| {
+        event.kind == "ReportCollectCompleted"
+            && event.round.as_deref() == Some(round)
+            && event.task_id.as_deref() == Some(task_id)
+            && event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("attemptId"))
+                .and_then(serde_json::Value::as_str)
+                == Some(attempt_id)
+    });
+    let Some(terminal) = terminal else {
+        return Ok(None);
+    };
+    let terminal_payload = terminal
+        .payload
+        .as_ref()
+        .context("ReportCollectCompleted 缺 payload")?;
+    let receipt_ref = receipt_ref_from_payload(terminal_payload, "ReportCollectCompleted")?;
+    let attestation = read_collect_attestation(root, &receipt_ref)?;
+    if attestation.attestation_version != 2 {
+        bail!("legacy collect attestation 缺 root-reuse contract identity");
+    }
+    let dispatch = crate::attempt::resolve_current_dispatch(&ledger_read.events, task_id, round)?;
+    if dispatch.attempt_id.as_deref() != Some(attempt_id) {
+        bail!("collect bundle attempt 不是 durable current DispatchIssued");
+    }
+    let terminal_str = |key: &str| {
+        terminal_payload
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| format!("ReportCollectCompleted 缺 {key}"))
+    };
+    let evidence_path = terminal_str("evidencePath")?.to_string();
+    let evidence_sha256 = terminal_str("evidenceSha256")?.to_string();
+    let evidence_len = terminal_payload
+        .get("evidenceLen")
+        .and_then(serde_json::Value::as_u64)
+        .context("ReportCollectCompleted 缺 evidenceLen")?;
+    let control_epoch = terminal_str("controlEpoch")?.to_string();
+    let branch_sha = terminal_str("branchSha")?.to_string();
+    let claimed = crate::attempt::ClaimedEvidence {
+        canonical_path: evidence_path,
+        sha256: evidence_sha256.clone(),
+        len: evidence_len,
+        bytes: Vec::new(),
+        control_epoch: control_epoch.clone(),
+    };
+    let expectation = crate::attempt::DurableActionExpectation {
+        round: round.to_string(),
+        task_id: task_id.to_string(),
+        attempt_id: attempt_id.to_string(),
+        attempt_no: dispatch
+            .attempt_no
+            .context("collect bundle DispatchIssued 缺 attemptNo")?,
+        agent: dispatch
+            .agent
+            .context("collect bundle DispatchIssued 缺 agent")?,
+        base_sha: dispatch
+            .base_sha
+            .context("collect bundle DispatchIssued 缺 baseSha")?,
+        go_path: dispatch
+            .go_path
+            .context("collect bundle DispatchIssued 缺 goPath")?,
+        action_id: terminal_str("actionId")?.to_string(),
+        evidence_sha256: Some(evidence_sha256),
+        evidence_len: Some(evidence_len),
+        control_epoch: Some(control_epoch),
+        branch_sha: Some(branch_sha),
+    };
+    validate_collect_gate_receipt(
+        root,
+        &card,
+        &ledger_read.events,
+        &expectation,
+        &claimed,
+        terminal,
+        &receipt_ref,
+    )?;
+    Ok(Some(ValidatedCollectGateBundleV1 {
+        candidate_sha: attestation.branch_sha,
+        subject_tree_sha: attestation.subject_tree_sha,
+        attempt_id: attestation.attempt_id,
+        policy_base_sha: attestation.base_sha,
+        ir_revision: attestation.ir_revision,
+        validation_digest: attestation.validation_digest,
+        binding_sha256: attestation.binding_sha256,
+        task_card_sha256: attestation.task_card_sha256,
+        resolved_command_digest: attestation.resolved_command_digest,
+        toolchain_digest: attestation.toolchain_digest,
+        environment_digest: attestation.environment_digest,
+        gates: attestation
+            .gates
+            .into_iter()
+            .map(|gate| ValidatedCollectGateV1 {
+                sequence: gate.sequence,
+                source_event_id: gate.gate_event_id,
+                gate_run_id: gate.gate_run_id,
+                command_ref: gate.command_ref,
+                exit_code: gate.exit_code,
+                log_sha256: gate.raw_log_cas_sha256,
+                log_bytes: gate.raw_log_len,
+            })
+            .collect(),
+    }))
 }
 
 /// DispatchWake / ResumeWake 共用的 expectation 构造。
@@ -2096,6 +2635,7 @@ fn collect_claimed_report(
             if appended != 0 {
                 bail!("completed REPORT collect replay appended events");
             }
+            supersede_pending_nudge_for_dispatch(root, round, task_id, ctx)?;
             return Ok(collect::CollectOutcome {
                 mech_notes: vec!["REPORT collect durable replay ✅".into()],
                 gates: Vec::new(),
@@ -2105,6 +2645,7 @@ fn collect_claimed_report(
             if appended != 1 {
                 bail!("ReportCollectCompleted recovery append count mismatch");
             }
+            supersede_pending_nudge_for_dispatch(root, round, task_id, ctx)?;
             return Ok(collect::CollectOutcome {
                 mech_notes: vec![
                     "REPORT collect completion recovered without rerunning gates ✅".into(),
@@ -2286,7 +2827,6 @@ fn collect_claimed_report(
         }
     };
     let summaries = collect_gate_summaries(root, &outcome)?;
-    let configured_gates = expected_gate_refs(root, card)?;
     let executed = ledger::append_checked(root, round, |events| {
         let fresh_ctx = crate::attempt::resolve_current_dispatch(events, task_id, round)?;
         if fresh_ctx.attempt_id != ctx.attempt_id
@@ -2333,6 +2873,7 @@ fn collect_claimed_report(
             events,
             round,
             task_id,
+            card,
             ctx,
             claimed,
             &action_id,
@@ -2340,7 +2881,6 @@ fn collect_claimed_report(
             &owner,
             &generation,
             &anchor.event_id,
-            &configured_gates,
             &summaries,
         )?;
         let executed_event = ledger::event(
@@ -2475,6 +3015,7 @@ fn collect_claimed_report(
             &receipt,
         )?;
     }
+    supersede_pending_nudge_for_dispatch(root, round, task_id, ctx)?;
     Ok(outcome)
 }
 
@@ -3265,11 +3806,92 @@ fn require_active_tierf_round(
 fn require_runtime_dispatch_admission(
     root: &Path,
     round: &str,
+    task_id: &str,
+    attempt_base_sha: &str,
     events: &[EventRecord],
     agent: &str,
     successor_release: Option<(&str, &str)>,
 ) -> Result<()> {
     let active = crate::plan::require_active_round_ir(root, round, events)?;
+    let task = active
+        .candidate
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .with_context(|| format!("task {task_id} 不在 active ROUND-IR"))?;
+    let projection = orch_core::fold(events);
+    let mut recorded_with_merge = Vec::new();
+    let mut recorded_without_merge = BTreeSet::new();
+    for dependency in &task.depends_on {
+        let Some(projected) = projection.tasks.get(dependency) else {
+            continue;
+        };
+        if projected.state != Some(orch_core::TaskState::Recorded) {
+            continue;
+        }
+        if let Some(merge_sha) = &projected.merge_sha {
+            recorded_with_merge.push((dependency.clone(), merge_sha.clone()));
+        } else {
+            // Historical ledgers and a few runtime fixtures predate MergeExecuted.
+            // They still prove Recorded admission, but cannot truthfully support a
+            // stale-baseline diagnosis. Preserve their former recorded-only
+            // behavior while requiring ancestry for every canonical merge SHA.
+            recorded_without_merge.insert(dependency.clone());
+            recorded_with_merge.push((dependency.clone(), String::new()));
+        }
+    }
+
+    let preliminary = crate::scheduler::dependency_dispatch_admission(
+        &task.depends_on,
+        &recorded_with_merge,
+        Some(attempt_base_sha),
+        &|_| true,
+    );
+    if let crate::scheduler::DependencyAdmission::BlockedByDependency { blockers } = preliminary {
+        bail!(
+            "dependency dispatch admission: BlockedByDependency task={task_id} blockers=[{}]",
+            blockers.join(", ")
+        );
+    }
+
+    let mut contained_merges = BTreeSet::new();
+    for (dependency, merge_sha) in &recorded_with_merge {
+        if recorded_without_merge.contains(dependency) {
+            contained_merges.insert(merge_sha.clone());
+            continue;
+        }
+        if gitx::is_ancestor(root, merge_sha, attempt_base_sha).with_context(|| {
+            format!(
+                "检查 dependency {dependency} merge {merge_sha} 是否在 attempt base {attempt_base_sha} 中失败"
+            )
+        })? {
+            contained_merges.insert(merge_sha.clone());
+        }
+    }
+    match crate::scheduler::dependency_dispatch_admission(
+        &task.depends_on,
+        &recorded_with_merge,
+        Some(attempt_base_sha),
+        &|merge_sha| contained_merges.contains(merge_sha),
+    ) {
+        crate::scheduler::DependencyAdmission::Admitted => {}
+        crate::scheduler::DependencyAdmission::BlockedByDependency { blockers } => {
+            bail!(
+                "dependency dispatch admission: BlockedByDependency task={task_id} blockers=[{}]",
+                blockers.join(", ")
+            );
+        }
+        crate::scheduler::DependencyAdmission::ForwardBaselineRequired {
+            dependency,
+            merge_sha,
+            attempt_base_sha,
+        } => {
+            bail!(
+                "dependency dispatch admission: ForwardBaselineRequired task={task_id} dependency={dependency} merge_sha={merge_sha} attempt_base_sha={attempt_base_sha}"
+            );
+        }
+    }
+
     let projected;
     let admission_events = if let Some((task_id, attempt_id)) = successor_release {
         projected = {
@@ -3605,10 +4227,12 @@ where
             &readonly_plan,
             crate::attempt::DispatchPlan::Existing { .. }
         );
-        if !is_existing {
+        if let crate::attempt::DispatchPlan::New { next, .. } = &readonly_plan {
             require_runtime_dispatch_admission(
                 root,
                 round,
+                task_id,
+                &next.base_sha,
                 &lr.events,
                 &agent,
                 successor_capacity_release,
@@ -3927,10 +4551,12 @@ where
                 }
                 _ => None,
             };
-            if matches!(&plan, crate::attempt::DispatchPlan::New { .. }) {
+            if let crate::attempt::DispatchPlan::New { next, .. } = &plan {
                 require_runtime_dispatch_admission(
                     &root_owned,
                     &fresh_round,
+                    &task_owned,
+                    &next.base_sha,
                     events,
                     &fresh_agent,
                     successor_capacity_release,
@@ -5512,136 +6138,445 @@ fn claim_observed_dispatch_ack(
     }
 }
 
-/// `orch await-report <task>`：双根 stat 轮询（PITFALLS #2）→ ReportObserved → 机检+门。
-/// O7：轮询期间按 design/03 §4.3 探测阶梯做 liveness 联动（`live=None` 关闭＝旧行为）。
-pub fn run_await(
-    root: &Path,
-    task_id: &str,
-    timeout_secs: u64,
-    live: Option<liveness::LivenessOpts>,
-) -> Result<AwaitOutcome> {
-    run_await_with_hook(root, task_id, timeout_secs, live, &mut |_| Ok(()))
+struct CollectGateObservation<'a> {
+    command_ref: &'a str,
+    gate_run_id: &'a str,
+    exit_code: i32,
+    duration_ms: u64,
+    subject_tree_sha: &'a str,
+    log_sha256: &'a str,
+    log_bytes: u64,
+    toolchain_digest: &'a str,
+    environment_digest: &'a str,
 }
 
-/// Deterministic production-path hook for evidence/attempt switch tests.
-#[doc(hidden)]
-pub fn run_await_with_hook(
-    root: &Path,
-    task_id: &str,
-    timeout_secs: u64,
-    live: Option<liveness::LivenessOpts>,
-    hook: &mut dyn FnMut(&str) -> Result<()>,
-) -> Result<AwaitOutcome> {
-    let round = current_round(root)?;
-    let action_id = format!("await-report:{round}:{task_id}");
-    match run_await_with_hook_inner(root, task_id, timeout_secs, live, hook, &round) {
-        Ok(outcome) => Ok(outcome),
-        Err(error)
-            if crate::failure::is_action_rejection(&error) || is_critical_point_drift(&error) =>
-        {
-            Err(error)
-        }
-        Err(error) => crate::failure::reject_action_from_ledger_command_outcome(
-            root,
-            &round,
-            Some(task_id),
-            "await-report",
-            &action_id,
-            &format!("{error:#}"),
-            crate::failure::CommandOutcome::PendingConsumption,
-        ),
+const COLLECT_GATE_EXECUTED_KEYS: &[&str] = &[
+    "commandRef",
+    "phase",
+    "gateRunId",
+    "exitCode",
+    "durationMs",
+    "subjectTreeSha",
+    "logSha256",
+    "logBytes",
+    "toolchainDigest",
+    "environmentDigest",
+];
+
+fn is_collect_gate_event(event: &EventRecord, task_id: &str, round: &str) -> bool {
+    event.kind == "GateExecuted"
+        && event.task_id.as_deref() == Some(task_id)
+        && event.round.as_deref() == Some(round)
+        && event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("phase"))
+            .and_then(serde_json::Value::as_str)
+            == Some("collect")
+}
+
+fn collect_gate_observation(event: &EventRecord) -> Result<CollectGateObservation<'_>> {
+    let payload = event.payload.as_ref().context("GateExecuted 缺 payload")?;
+    let object = payload
+        .as_object()
+        .context("GateExecuted payload 非 object")?;
+    if object.len() != COLLECT_GATE_EXECUTED_KEYS.len()
+        || object
+            .keys()
+            .any(|key| !COLLECT_GATE_EXECUTED_KEYS.contains(&key.as_str()))
+    {
+        bail!("GateExecuted payload 必须是精确十键 schema");
     }
+    let string = |key: &str| {
+        payload
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| format!("GateExecuted 缺 {key}"))
+    };
+    let gate_run_id = string("gateRunId")?;
+    let toolchain_digest = string("toolchainDigest")?;
+    let environment_digest = string("environmentDigest")?;
+    if event.actor != "runtime:orch"
+        || payload.get("phase").and_then(serde_json::Value::as_str) != Some("collect")
+        || gate_run_id.is_empty()
+        || !valid_sha256(toolchain_digest)
+        || !valid_sha256(environment_digest)
+    {
+        bail!("GateExecuted actor/phase/run/digest 非 canonical collect observation");
+    }
+    Ok(CollectGateObservation {
+        command_ref: string("commandRef")?,
+        gate_run_id,
+        exit_code: payload
+            .get("exitCode")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .context("GateExecuted 缺合法 exitCode")?,
+        duration_ms: payload
+            .get("durationMs")
+            .and_then(serde_json::Value::as_u64)
+            .context("GateExecuted 缺 durationMs")?,
+        subject_tree_sha: string("subjectTreeSha")?,
+        log_sha256: string("logSha256")?,
+        log_bytes: payload
+            .get("logBytes")
+            .and_then(serde_json::Value::as_u64)
+            .context("GateExecuted 缺 logBytes")?,
+        toolchain_digest,
+        environment_digest,
+    })
 }
 
-fn require_await_entry_card(root: &Path, round: &str, task_id: &str) -> Result<card::Card> {
-    critical_point(require_active_tierf_task(root, round, task_id))
+fn observation_matches_summary(
+    observed: &CollectGateObservation<'_>,
+    summary: &ActualGateSummary,
+    command_ref: &str,
+    subject_tree_sha: &str,
+) -> bool {
+    observed.command_ref == command_ref
+        && summary.command_ref == command_ref
+        && observed.exit_code == summary.exit_code
+        && observed.duration_ms == summary.duration_ms
+        && observed.subject_tree_sha == subject_tree_sha
+        && observed.log_sha256 == summary.raw_log_cas_sha256
+        && observed.log_bytes == summary.raw_log_len
+        && summary.exit_code == 0
 }
 
-#[allow(clippy::too_many_arguments)]
-fn reconcile_await_bootstrap<R: AwaitReportRuntime>(
+fn bind_shared_digest(slot: &mut Option<String>, observed: &str, label: &str) -> Result<()> {
+    match slot.as_deref() {
+        Some(expected) if expected != observed => bail!("collect gates 的 {label}Digest 不一致"),
+        None => *slot = Some(observed.to_string()),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn receipt_payload_matches_attestation(
+    payload: &serde_json::Value,
+    attestation: &CollectReceiptAttestation,
+) -> Result<bool> {
+    let common = payload.get("gateCount").and_then(serde_json::Value::as_u64)
+        == Some(attestation.configured_gate_count)
+        && payload.get("configuredCommandRefs")
+            == Some(&serde_json::to_value(&attestation.configured_command_refs)?)
+        && payload.get("gates") == Some(&serde_json::to_value(&attestation.gates)?)
+        && payload
+            .get("toolchainDigest")
+            .and_then(serde_json::Value::as_str)
+            == Some(attestation.toolchain_digest.as_str())
+        && payload
+            .get("environmentDigest")
+            .and_then(serde_json::Value::as_str)
+            == Some(attestation.environment_digest.as_str());
+    if !common {
+        return Ok(false);
+    }
+    if attestation.attestation_version == 1 {
+        return Ok(true);
+    }
+    Ok(payload
+        .get("subjectTreeSha")
+        .and_then(serde_json::Value::as_str)
+        == Some(attestation.subject_tree_sha.as_str())
+        && payload
+            .get("irRevision")
+            .and_then(serde_json::Value::as_u64)
+            == Some(attestation.ir_revision as u64)
+        && payload
+            .get("validationDigest")
+            .and_then(serde_json::Value::as_str)
+            == Some(attestation.validation_digest.as_str())
+        && payload
+            .get("bindingSha256")
+            .and_then(serde_json::Value::as_str)
+            == Some(attestation.binding_sha256.as_str())
+        && payload
+            .get("taskCardSha256")
+            .and_then(serde_json::Value::as_str)
+            == Some(attestation.task_card_sha256.as_str())
+        && payload
+            .get("resolvedCommandDigest")
+            .and_then(serde_json::Value::as_str)
+            == Some(attestation.resolved_command_digest.as_str())
+        && payload
+            .get("sourceReaderDescriptorSha256")
+            .and_then(serde_json::Value::as_str)
+            == attestation.source_reader_descriptor_sha256.as_deref()
+        && payload
+            .get("sourceReaderBaseSha256")
+            .and_then(serde_json::Value::as_str)
+            == attestation.source_reader_base_sha256.as_deref())
+}
+
+fn observation_matches_attestation(
+    observed: &CollectGateObservation<'_>,
+    gate: &CollectAttestedGate,
+    command_ref: &str,
+    subject_tree_sha: &str,
+    toolchain_digest: &str,
+    environment_digest: &str,
+) -> bool {
+    observed.gate_run_id == gate.gate_run_id
+        && gate.command_ref == command_ref
+        && gate.exit_code == 0
+        && observed.command_ref == command_ref
+        && observed.exit_code == 0
+        && observed.duration_ms == gate.duration_ms
+        && observed.toolchain_digest == toolchain_digest
+        && observed.environment_digest == environment_digest
+        && observed.subject_tree_sha == subject_tree_sha
+        && observed.log_sha256 == gate.raw_log_cas_sha256
+        && observed.log_bytes == gate.raw_log_len
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NudgeDisposition {
+    Consumable,
+    Superseded { superseded_by: String },
+}
+
+// The frozen B269 M4 oracle distinguishes the public definition from real call
+// sites by the function name immediately followed by `(`.  Keep the definition's
+// opening parenthesis on the next line so removing every production call makes
+// that wiring mutation observable.
+#[rustfmt::skip]
+pub fn pending_nudge_disposition
+(
+    nudge_attempt_id: &str,
+    later_events: &[(String, String)],
+) -> NudgeDisposition {
+    later_events
+        .iter()
+        .find_map(|(kind, attempt_id)| {
+            (attempt_id == nudge_attempt_id
+                && matches!(kind.as_str(), "ReportObserved" | "ReportCollectCompleted"))
+            .then(|| NudgeDisposition::Superseded {
+                superseded_by: kind.clone(),
+            })
+        })
+        .unwrap_or(NudgeDisposition::Consumable)
+}
+
+fn latest_nudge_for_attempt<'a>(
+    events: &'a [EventRecord],
+    round: &str,
+    task_id: &str,
+    attempt_id: &str,
+    agent: &str,
+) -> Option<&'a EventRecord> {
+    events.iter().rev().find(|event| {
+        let payload = event.payload.as_ref();
+        event.kind == "NudgeIssued"
+            && event.round.as_deref() == Some(round)
+            && event.task_id.as_deref() == Some(task_id)
+            && payload
+                .and_then(|value| value.get("attemptId"))
+                .and_then(serde_json::Value::as_str)
+                == Some(attempt_id)
+            && payload
+                .and_then(|value| value.get("agent"))
+                .and_then(serde_json::Value::as_str)
+                == Some(agent)
+    })
+}
+
+fn pending_nudge_disposition_from_events<'a>(
+    events: &'a [EventRecord],
+    round: &str,
+    task_id: &str,
+    attempt_id: &str,
+    agent: &str,
+) -> (NudgeDisposition, Option<&'a EventRecord>) {
+    let latest_nudge = latest_nudge_for_attempt(events, round, task_id, attempt_id, agent);
+    // NUDGE.md is written before NudgeIssued, so a concurrent ReportObserved
+    // can legitimately precede the matching event while still being later
+    // than the pending file.  The nudge-side phase guard makes these exact
+    // attempt terminal facts absorbing; use the complete identity-scoped
+    // history rather than ledger adjacency.
+    let later_events = events
+        .iter()
+        .filter_map(|event| {
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("attemptId"))
+                .and_then(serde_json::Value::as_str)
+                .map(|attempt_id| (event.kind.clone(), attempt_id.to_string()))
+        })
+        .collect::<Vec<_>>();
+    (
+        pending_nudge_disposition(attempt_id, &later_events),
+        latest_nudge,
+    )
+}
+
+fn with_nudge_control_lock<T>(
+    root: &Path,
+    round: &str,
+    agent: &str,
+    action: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let lock_dir = root.join("coordination/runtime/locks");
+    fs::create_dir_all(&lock_dir)?;
+    let key = hex::encode(sha2::Sha256::digest(format!("{round}\0{agent}").as_bytes()));
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(lock_dir.join(format!("nudge-control-{key}.lock")))?;
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let _guard = lock.write().context("获取 NUDGE 控制文件锁失败")?;
+    action()
+}
+
+fn superseded_nudge_path(nudge_path: &Path, attempt_id: &str) -> PathBuf {
+    let key = hex::encode(sha2::Sha256::digest(attempt_id.as_bytes()));
+    nudge_path.with_file_name(format!("NUDGE.md.superseded-{}", &key[..16]))
+}
+
+fn nudge_file_header(agent: &str, task_id: &str, attempt_id: &str) -> String {
+    format!("# NUDGE（{agent} · 任务 {task_id} · attempt {attempt_id}）\n\n")
+}
+
+fn supersede_pending_nudge_for_dispatch(
     root: &Path,
     round: &str,
     task_id: &str,
-    strict_attempt: &crate::attempt::AttemptRef,
-    cur_agent: Option<&str>,
-    ack_evidence_observation: Option<&crate::attempt::EvidenceObservation>,
-    ack_observed: bool,
-    mut ack_logged: bool,
-    hook: &mut dyn FnMut(&str) -> Result<()>,
-    runtime: &mut R,
-    watcher_callback: &mut Option<AwaitReportNotifyCallback>,
-    watcher_failed: &AtomicBool,
-    watcher_disabled: &mut bool,
-    watch_plan: &AwaitReportWatchPlan,
-    watched: &mut BTreeSet<PathBuf>,
-) -> Result<bool> {
-    // This is the real, once-per-frame orchestration path. Keep the canonical
-    // durable claim and every optional watcher edge in this one body so the
-    // frozen source-order contract observes execution order, not the order of
-    // disconnected helper definitions.
-    if ack_observed && !ack_logged {
-        let agent = cur_agent.context("await ACK claim 缺 current agent")?;
-        let ack_evidence = ack_evidence_observation
-            .context("await ACK claim 缺 evidence observation")?;
-        ack_logged = claim_observed_dispatch_ack(
-            root,
+    ctx: &crate::attempt::DispatchContext,
+) -> Result<()> {
+    let attempt_id = ctx
+        .attempt_id
+        .as_deref()
+        .context("NUDGE supersession 缺 attemptId")?;
+    let attempt_no = ctx.attempt_no.context("NUDGE supersession 缺 attemptNo")?;
+    let agent = ctx
+        .agent
+        .as_deref()
+        .context("NUDGE supersession 缺 agent")?;
+
+    with_nudge_control_lock(root, round, agent, || {
+        let ledger_path = root.join(format!("coordination/rounds/{round}/events.jsonl"));
+        let snapshot = read_ledger(&ledger_path)?;
+        let (disposition, _) = pending_nudge_disposition_from_events(
+            &snapshot.events,
             round,
             task_id,
-            &strict_attempt.attempt_id,
-            strict_attempt.ordinal,
+            attempt_id,
             agent,
-            ack_evidence,
-            hook,
-        )?;
-    }
+        );
+        let NudgeDisposition::Superseded { .. } = disposition else {
+            return Ok(());
+        };
 
-    if let Some(callback) = watcher_callback.take() {
-        runtime.install_watcher(callback);
-        let reports_dir = root.join(format!("coordination/rounds/{round}/reports"));
-        let _ = runtime.create_dir_all(&reports_dir);
-    }
-    if !*watcher_disabled && watcher_failed.load(Ordering::Acquire) {
-        *watcher_disabled = true;
-        runtime.disable_watcher();
-    }
-    if runtime.watcher_available() {
-        for pending in
-            await_report_pending_watch_roots(watch_plan, watched, |path| runtime.is_dir(path))
-        {
-            let mode = if pending.recursive {
-                notify::RecursiveMode::Recursive
-            } else {
-                notify::RecursiveMode::NonRecursive
-            };
-            if runtime.watch(&pending.path, mode) {
-                watched.insert(pending.path);
+        let nudge_path = root.join(format!(
+            "coordination/rounds/{round}/dispatch/{agent}/NUDGE.md"
+        ));
+        let archived_path = superseded_nudge_path(&nudge_path, attempt_id);
+        let expected_header = nudge_file_header(agent, task_id, attempt_id);
+
+        let nudge_bytes = if nudge_path.is_file() {
+            let bytes = fs::read(&nudge_path).context("读取 pending NUDGE 失败")?;
+            if !bytes.starts_with(expected_header.as_bytes()) {
+                // The file channel is per-agent, not per-attempt.  A newer or
+                // otherwise different identity must never be neutralized by
+                // temporal adjacency to this collect.
+                return Ok(());
             }
+            if archived_path.is_file() {
+                let archived = fs::read(&archived_path).context("读取 archived NUDGE 失败")?;
+                if archived != bytes {
+                    bail!("同 attempt 的 NUDGE supersession archive 字节冲突");
+                }
+                fs::remove_file(&nudge_path)
+                    .context("移除已由同字节 archive 保存的 pending NUDGE 失败")?;
+            } else {
+                fs::rename(&nudge_path, &archived_path).context("原子中和 pending NUDGE 失败")?;
+            }
+            bytes
+        } else if archived_path.is_file() {
+            let bytes = fs::read(&archived_path).context("读取待补账 archived NUDGE 失败")?;
+            if !bytes.starts_with(expected_header.as_bytes()) {
+                bail!("archived NUDGE 与 collect attempt 身份不匹配");
+            }
+            bytes
+        } else {
+            return Ok(());
+        };
+
+        let nudge_sha256 = hex::encode(sha2::Sha256::digest(&nudge_bytes));
+        let nudge_len = nudge_bytes.len() as u64;
+        let nudge_path_text = nudge_path.display().to_string();
+        let archived_path_text = archived_path.display().to_string();
+        let action_id = format!(
+            "nudge-supersede-{round}-{task_id}-{attempt_id}-{}",
+            &nudge_sha256[..16]
+        );
+
+        let appended = ledger::append_checked(root, round, |events| {
+            let (fresh_disposition, latest_nudge) =
+                pending_nudge_disposition_from_events(events, round, task_id, attempt_id, agent);
+            let NudgeDisposition::Superseded { superseded_by } = fresh_disposition else {
+                bail!("pending NUDGE 在 durable append 前不再满足 supersession 判据");
+            };
+            if events.iter().any(|event| {
+                let payload = event.payload.as_ref();
+                event.kind == concat!("Nudge", "Superseded")
+                    && event.actor == "runtime:orch"
+                    && event.round.as_deref() == Some(round)
+                    && event.task_id.as_deref() == Some(task_id)
+                    && payload
+                        .and_then(|value| value.get("attemptId"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(attempt_id)
+                    && payload
+                        .and_then(|value| value.get("nudgeFileSha256"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(nudge_sha256.as_str())
+            }) {
+                return Ok(Vec::new());
+            }
+            let nudge_event_id = latest_nudge.map(|event| event.event_id.clone());
+            let nudge_action_id = latest_nudge.and_then(|event| {
+                event
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("actionId"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+            Ok(vec![ledger::event(
+                "NudgeSuperseded",
+                "runtime:orch",
+                Some(task_id),
+                Some(round),
+                serde_json::json!({
+                    "actionId": action_id,
+                    "attemptId": attempt_id,
+                    "attemptNo": attempt_no,
+                    "agent": agent,
+                    "supersededBy": superseded_by,
+                    "nudgeEventId": nudge_event_id,
+                    "nudgeActionId": nudge_action_id,
+                    "nudgePath": nudge_path_text,
+                    "supersededPath": archived_path_text,
+                    "nudgeFileSha256": nudge_sha256,
+                    "nudgeFileLen": nudge_len,
+                }),
+            )])
+        })?;
+        if appended > 1 {
+            bail!("nudge supersession append count mismatch: {appended}");
         }
-    }
-
-    Ok(ack_logged)
-}
-
-fn before_await_liveness_probe(hook: &mut dyn FnMut(&str) -> Result<()>) -> Result<()> {
-    hook("before-liveness-probe")
-}
-
-fn wait_for_await_reconcile<R: AwaitReportRuntime>(
-    runtime: &mut R,
-    tick: Duration,
-    fs_rx: &Receiver<()>,
-) {
-    match runtime.recv_timeout(tick, || fs_rx.recv_timeout(tick)) {
-        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => runtime.sleep(tick),
-    }
-}
-
-pub struct NudgeOutcome {
-    pub round: String,
-    pub nudge_path: PathBuf,
-    /// 上一条 NUDGE 的消费时间（NUDGE.md.seen 的 mtime，RFC3339 秒），无则 None
-    pub prev_seen: Option<String>,
+        // The archive is only a crash-recovery bridge for rename→ledger.  The
+        // durable event carries the identity and byte digest, so successful
+        // append (including idempotent replay) must not introduce a new class
+        // of retained dispatch artifacts.
+        if archived_path.is_file() {
+            fs::remove_file(&archived_path)
+                .context("清理已 durable 落账的 superseded NUDGE archive 失败")?;
+        }
+        Ok(())
+    })
 }
 
 /// Classify the deadline that ended one `await-report` observation.
@@ -5759,7 +6694,7 @@ fn observer_expiry_event_matches(
     })
 }
 
-fn run_await_with_hook_inner(
+fn run_await_with_hook_inner_impl(
     root: &Path,
     task_id: &str,
     timeout_secs: u64,
@@ -6246,6 +7181,11 @@ fn run_await_with_hook_inner_with_runtime<R: AwaitReportRuntime>(
                             task_id,
                             "await report collect",
                             |active_card| {
+                                // ReportObserved is already durable here.  Neutralize any
+                                // matching pending file before commit grace or gates can
+                                // leave it visible to the executor, then repeat at the
+                                // ReportCollectCompleted boundary for concurrent NUDGEs.
+                                supersede_pending_nudge_for_dispatch(root, &round, task_id, &ctx)?;
                                 let co = collect_claimed_report(
                                     root,
                                     &round,
@@ -6449,12 +7389,11 @@ fn run_await_with_hook_inner_with_runtime<R: AwaitReportRuntime>(
                                 &fresh_now_ts,
                             );
                             let observer_elapsed_secs = start.elapsed().as_secs();
-                            let runtime_deadline_elapsed = fresh_runtime_deadline.is_some_and(
-                                |deadline| {
+                            let runtime_deadline_elapsed =
+                                fresh_runtime_deadline.is_some_and(|deadline| {
                                     deadline.wake_elapsed
                                         >= Duration::from_secs(deadline.runtime_limit_secs)
-                                },
-                            );
+                                });
                             if observer_elapsed_secs < timeout_secs && !runtime_deadline_elapsed {
                                 // A same-attempt continuation may have installed a later
                                 // authenticated deadline after the outer snapshot. Nothing
@@ -6462,12 +7401,12 @@ fn run_await_with_hook_inner_with_runtime<R: AwaitReportRuntime>(
                                 // resume polling.
                                 return Ok(crate::attempt::ClaimDecision::AlreadyPresent);
                             }
-                            let fresh_runtime_limit_secs = fresh_runtime_deadline
-                                .map(|deadline| deadline.runtime_limit_secs);
-                            let elapsed_secs = fresh_runtime_deadline.map_or(
-                                observer_elapsed_secs,
-                                |deadline| deadline.wake_elapsed.as_secs(),
-                            );
+                            let fresh_runtime_limit_secs =
+                                fresh_runtime_deadline.map(|deadline| deadline.runtime_limit_secs);
+                            let elapsed_secs = fresh_runtime_deadline
+                                .map_or(observer_elapsed_secs, |deadline| {
+                                    deadline.wake_elapsed.as_secs()
+                                });
                             let disposition = await_expiry_disposition(
                                 elapsed_secs,
                                 timeout_secs,
@@ -6895,7 +7834,7 @@ fn run_await_with_hook_inner_with_runtime<R: AwaitReportRuntime>(
                 }
             }
         }
-        wait_for_await_reconcile(runtime, tick, &fs_rx);
+        wait_for_await_reconcile(runtime, tick, || fs_rx.recv_timeout(tick));
     }
 }
 
@@ -7068,92 +8007,123 @@ fn run_nudge_with_message_inner(
         "nudge-{round}-{}-{}-{agent}-{}",
         identity.task_id, identity.attempt_id, nonce
     );
-    let disp = root.join(format!("coordination/rounds/{round}/dispatch/{agent}"));
-    fs::create_dir_all(&disp)?; // O6
-    let nudge_path = disp.join("NUDGE.md");
-    if nudge_path.exists() && !force {
-        let reason = format!(
-            "上一条 NUDGE 未被消费: {}（客户端尚未回到 wait 循环；--force 覆盖）",
-            nudge_path.display()
-        );
-        bail!("{reason}");
-    }
-    let prev_seen = fs::metadata(disp.join("NUDGE.md.seen"))
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .map(|t| humantime::format_rfc3339_seconds(t).to_string());
-    let mut wake_permit = crate::budget::check_before_model_wake(root, &round)?;
-    fs::write(&nudge_path, format!(
-        "# NUDGE（{agent} · 任务 {} · attempt {}）\n\n{message}\n\n---\n处置规则：任务完成 → 按模板写 REPORT（最后一个动作）；被阻塞 → 写 BLOCKED 说明卡点；\n处理完毕重新运行 coordination/scripts/wait-dispatch.sh {agent} 回到等待。\n",
-        identity.task_id,
-        identity.attempt_id,
-    ))?;
-    // 缩短 initial check 到 spawn 的竞态窗：外部注入前 fresh 重读并要求身份逐字段
-    // 仍相同。若 attempt/agent/state 已变则不 spawn，也不编造 NudgeIssued 身份。
-    let fresh_identity =
-        resolve_nudge_attempt_identity(root, &round, agent, Some(&identity.task_id))?;
-    if fresh_identity != identity {
-        bail!("nudge current attempt 在 spawn 前发生变化（fail-closed）");
-    }
-    // B110：先分发唤醒拿到精确通道事实，再落 NudgeIssued——事实只能来自真实
-    // spawn 返回，落账的 pid/logPath/probeOffset/probeEnd 绝不凭空伪造。
-    // POKE 备用道 / --no-wake（无 pid/log）→ deliveryState 显式 "pending"。
-    let wake_msg = format!("orch NUDGE: {message}");
-    let continuation = format!(
-        "implementation:{round}:{}:{}:{agent}",
-        identity.task_id, identity.attempt_id
-    );
-    let outcome = wake::dispatch_wake_for_continuation(
-        root,
-        agent,
-        &round,
-        &continuation,
-        &wake_msg,
-        no_wake,
-    )?;
-    let delivery = crate::wake::DeliveryState::from_spawn(outcome.injected);
-    let mut payload = serde_json::json!({
-        "agent": agent,
-        "message": message,
-        "nudgePath": nudge_path.display().to_string(),
-        // B109：富输入来源 + UTF-8 字节数（落账；消费方按需读）
-        "messageSource": resolved.source.as_str(),
-        "messageBytes": resolved.bytes,
-        // B110：spawn 维度投递状态（delivered 仅表示 spawn 成功，非已咬合）
-        "deliveryState": delivery.as_str(),
-        // A0003：nudge 自身唯一 actionId；attempt 身份只取显式 task 的 ledger 真值。
-        "actionId": action_id.clone(),
-        "attemptId": identity.attempt_id.clone(),
-        "attemptNo": identity.attempt_no,
-    });
-    if outcome.injected {
-        // injected success 必须经 ActionChannelFacts 校验并落全七字段。
-        let facts = spawn_channel_facts(
-            action_id,
-            &identity.attempt_id,
-            identity.attempt_no,
-            &outcome,
+    with_nudge_control_lock(root, round, agent, || {
+        // File creation and collect-side neutralization share this lock.  The
+        // fresh phase guard also prevents a new post-REPORT NUDGE from being
+        // created after collect has already performed its final sweep.
+        let ledger_path = root.join(format!("coordination/rounds/{round}/events.jsonl"));
+        let snapshot = read_ledger(&ledger_path)?;
+        if let NudgeDisposition::Superseded { superseded_by } =
+            pending_nudge_disposition_from_events(
+                &snapshot.events,
+                round,
+                &identity.task_id,
+                &identity.attempt_id,
+                agent,
+            )
+            .0
+        {
+            bail!(
+                "attempt {} 的 NUDGE 窗口已由 {superseded_by} 终止",
+                identity.attempt_id
+            );
+        }
+
+        let disp = root.join(format!("coordination/rounds/{round}/dispatch/{agent}"));
+        fs::create_dir_all(&disp)?; // O6
+        let nudge_path = disp.join("NUDGE.md");
+        if nudge_path.exists() && !force {
+            let reason = format!(
+                "上一条 NUDGE 未被消费: {}（客户端尚未回到 wait 循环；--force 覆盖）",
+                nudge_path.display()
+            );
+            bail!("{reason}");
+        }
+        let prev_seen = fs::metadata(disp.join("NUDGE.md.seen"))
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| humantime::format_rfc3339_seconds(t).to_string());
+        let mut wake_permit = crate::budget::check_before_model_wake(root, &round)?;
+        fs::write(
+            &nudge_path,
+            format!(
+                "# NUDGE（{agent} · 任务 {} · attempt {}）\n\n{message}\n\n---\n处置规则：任务完成 → 按模板写 REPORT（最后一个动作）；被阻塞 → 写 BLOCKED 说明卡点；\n处理完毕重新运行 coordination/scripts/wait-dispatch.sh {agent} 回到等待。\n",
+                identity.task_id, identity.attempt_id,
+            ),
         )?;
-        facts.insert_channel_fields(&mut payload);
-    }
-    ledger::append(
-        root,
-        &round,
-        &[ledger::event(
-            "NudgeIssued",
-            "runtime:orch",
-            Some(&identity.task_id),
-            Some(&round),
-            payload,
-        )],
-    )?;
-    wake_permit.commit();
-    Ok(NudgeOutcome {
-        round: round.to_string(),
-        nudge_path,
-        prev_seen,
+        // 缩短 initial check 到 spawn 的竞态窗：外部注入前 fresh 重读并要求身份逐字段
+        // 仍相同。若 attempt/agent/state 已变则不 spawn，也不编造 NudgeIssued 身份。
+        let fresh_identity =
+            resolve_nudge_attempt_identity(root, &round, agent, Some(&identity.task_id))?;
+        if fresh_identity != identity {
+            bail!("nudge current attempt 在 spawn 前发生变化（fail-closed）");
+        }
+        // B110：先分发唤醒拿到精确通道事实，再落 NudgeIssued——事实只能来自真实
+        // spawn 返回，落账的 pid/logPath/probeOffset/probeEnd 绝不凭空伪造。
+        // POKE 备用道 / --no-wake（无 pid/log）→ deliveryState 显式 "pending"。
+        let wake_msg = format!("orch NUDGE: {message}");
+        let continuation = format!(
+            "implementation:{round}:{}:{}:{agent}",
+            identity.task_id, identity.attempt_id
+        );
+        let outcome = wake::dispatch_wake_for_continuation(
+            root,
+            agent,
+            &round,
+            &continuation,
+            &wake_msg,
+            no_wake,
+        )?;
+        let delivery = crate::wake::DeliveryState::from_spawn(outcome.injected);
+        let mut payload = serde_json::json!({
+            "agent": agent,
+            "message": message,
+            "nudgePath": nudge_path.display().to_string(),
+            // B109：富输入来源 + UTF-8 字节数（落账；消费方按需读）
+            "messageSource": resolved.source.as_str(),
+            "messageBytes": resolved.bytes,
+            // B110：spawn 维度投递状态（delivered 仅表示 spawn 成功，非已咬合）
+            "deliveryState": delivery.as_str(),
+            // A0003：nudge 自身唯一 actionId；attempt 身份只取显式 task 的 ledger 真值。
+            "actionId": action_id.clone(),
+            "attemptId": identity.attempt_id.clone(),
+            "attemptNo": identity.attempt_no,
+        });
+        if outcome.injected {
+            // injected success 必须经 ActionChannelFacts 校验并落全七字段。
+            let facts = spawn_channel_facts(
+                action_id,
+                &identity.attempt_id,
+                identity.attempt_no,
+                &outcome,
+            )?;
+            facts.insert_channel_fields(&mut payload);
+        }
+        ledger::append(
+            root,
+            &round,
+            &[ledger::event(
+                "NudgeIssued",
+                "runtime:orch",
+                Some(&identity.task_id),
+                Some(&round),
+                payload,
+            )],
+        )?;
+        wake_permit.commit();
+        Ok(NudgeOutcome {
+            round: round.to_string(),
+            nudge_path,
+            prev_seen,
+        })
     })
 }
+
+/// Version marker for the reassignment-recovery contract that keeps logical WIP
+/// snapshots, current resume generations, and successor terminal identity in one
+/// fail-closed lifecycle. Version 1 consumers must reject any future incompatible
+/// revision instead of silently assuming these three guarantees still compose.
+pub const REASSIGNMENT_RECOVERY_CONTRACT_V1: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResumePlan {
@@ -7244,12 +8214,19 @@ fn build_resume_plan_from_events(
     // REPORT presence is a committed branch fact, never a mutable worktree
     // `.is_file()` observation.
     let report_in = branch_in && gitx::show_bytes(root, &branch, &report_rel).is_ok();
+    let report_rejection = report_in
+        .then(|| {
+            resume_repair::detect(root, &branch, &report_rel, events, round, task_id, &attempt)
+        })
+        .flatten();
     let wt_restore = if wt_in {
         String::new()
     } else {
         format!(" 恢复 worktree：`git worktree add .worktrees/{task_id} {branch}`；")
     };
-    let next_steps = if report_in {
+    let next_steps = if let Some(rejection) = report_rejection.as_ref() {
+        rejection.next_steps(&wt_restore, &report_rel)
+    } else if report_in {
         "REPORT 已在——无需重启执行会话；运行时侧 orch await-report 收取即可。".to_string()
     } else if !branch_in {
         format!("1. 仓库根执行 `git worktree add .worktrees/{task_id} -b {branch} {base_sha}`（E5：必须用此 SHA）。\n2. 第一个 commit 只做种子逐字节搬运。\n3. 先红取证 → 实现转绿 → 快门 → 负向变异。\n4. 最后写 {report_rel} 并 commit。")
@@ -7287,7 +8264,13 @@ fn build_resume_plan_from_events(
         } else {
             format!("- 种子落位: {}\n", seeds_status.join("；"))
         },
-        report_state = if report_in { "已在（勿重写）" } else { "未写" },
+        report_state = if report_rejection.is_some() {
+            resume_repair::REJECTED_REPORT_STATE
+        } else if report_in {
+            "已在（勿重写）"
+        } else {
+            "未写"
+        },
     );
     let digest = hex::encode(sha2::Sha256::digest(prompt.as_bytes()));
     if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -7494,31 +8477,14 @@ fn resume_ledger_state(
             bail!("resume durable generation has invalid delivered/completed counts");
         }
     }
+    for (plan, _, _, completed) in &generations {
+        resume_repair::validate_generation_lineage(events, round, task_id, plan, *completed)?;
+    }
     if let Some((plan, _, _, _)) = generations
         .iter()
         .rev()
-        .find(|(_, _, _, completed)| *completed == 1)
+        .find(|(plan, _, _, completed)| *completed == 1 && plan.action_id == current_plan.action_id)
     {
-        // P0-2：terminal 决策前必须过共同 fold——伪造的 Completed（无合法
-        // lineage / owner / generation）在此 fail-closed，而不是被计数信任。
-        let expectation = wake_expectation(
-            round,
-            task_id,
-            &plan.attempt_id,
-            plan.attempt_no,
-            &plan.agent,
-            &plan.base_sha,
-            &plan.go_path,
-            &plan.action_id,
-        );
-        let phase = crate::attempt::fold_durable_action(
-            events,
-            crate::attempt::DurableActionKind::ResumeWake,
-            &expectation,
-        )?;
-        if phase != crate::attempt::DurableActionPhase::Completed {
-            bail!("resume completed generation fold 阶段非法: {phase:?}");
-        }
         return Ok(ResumeStateView {
             state: ResumeLedgerState::Completed,
             plan: plan.clone(),
@@ -7526,7 +8492,9 @@ fn resume_ledger_state(
     }
     let pending = generations
         .iter()
-        .filter(|(_, _, _, completed)| *completed == 0)
+        .filter(|(plan, _, _, completed)| {
+            *completed == 0 && plan.action_id == current_plan.action_id
+        })
         .collect::<Vec<_>>();
     match pending.as_slice() {
         [] => Ok(ResumeStateView {
@@ -7998,13 +8966,15 @@ fn run_resume_with_hook_effect(
             "implementation:{round}:{task_id}:{}:{}",
             plan.attempt_id, plan.agent
         );
-        let spawned = wake::dispatch_wake_for_continuation(
+        let spawned = wake::dispatch_resume_wake_for_continuation(
             root,
             &plan.agent,
             &round,
             &continuation,
             &message,
-            false,
+            action_id,
+            owned_by,
+            owned_generation,
         )
         .and_then(|outcome| {
             spawn_channel_facts(action_id, &plan.attempt_id, plan.attempt_no, &outcome)
@@ -8216,6 +9186,8 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    mod resume_repair_tests;
 
     static TEST_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -8781,6 +9753,22 @@ mod tests {
             )],
         )
         .unwrap();
+        test_git(root, &["add", "-A"]);
+        if !test_git(root, &["status", "--porcelain=v1"]).is_empty() {
+            test_git(
+                root,
+                &[
+                    "-c",
+                    "user.name=orch-test",
+                    "-c",
+                    "user.email=orch@test.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "sign active fixture IR",
+                ],
+            );
+        }
     }
 
     fn add_second_dispatch_task(root: &Path) {
@@ -8803,6 +9791,35 @@ budgets: {wallMinutes: 30}
 "#,
         )
         .unwrap();
+        sign_active_ir(root);
+    }
+
+    fn add_dispatch_dependency(root: &Path) {
+        std::fs::write(
+            root.join("coordination/rounds/r44/tasks/B96.md"),
+            r#"---
+taskId: B96
+round: r44
+agent: executor-claw
+seedProtocol: pure-spec
+writeSet: []
+frozenPaths: []
+gates: {fast: [testGate]}
+requiredReviews:
+  - {role: primary, agent: executor-opencode}
+requiredEvidence: [dependency-entry]
+budgets: {wallMinutes: 30}
+---
+# B96 dependency fixture
+"#,
+        )
+        .unwrap();
+        let card_path = root.join("coordination/rounds/r44/tasks/B97.md");
+        let card = std::fs::read_to_string(&card_path).unwrap().replace(
+            "agent: executor-desktop\n",
+            "agent: executor-desktop\ndependsOn: [B96]\n",
+        );
+        std::fs::write(card_path, card).unwrap();
         sign_active_ir(root);
     }
 
@@ -8879,12 +9896,7 @@ budgets: {wallMinutes: 30}
         if let Some(dispatch_ts) = dispatch_ts {
             dispatch.ts = dispatch_ts.to_string();
         }
-        ledger::append(
-            &site.root,
-            "r44",
-            &[dispatch],
-        )
-        .unwrap();
+        ledger::append(&site.root, "r44", &[dispatch]).unwrap();
         (attempt, go_rel, base_sha)
     }
 
@@ -8922,7 +9934,10 @@ budgets: {wallMinutes: 30}
             Ok(_) => panic!("the deterministic liveness probe injection must stop the await loop"),
         };
 
-        assert!(injected, "the production loop must reach the injected probe boundary");
+        assert!(
+            injected,
+            "the production loop must reach the injected probe boundary"
+        );
         assert!(
             ack_path.is_file(),
             "the ACK must already be durable at the injected boundary"
@@ -9008,8 +10023,7 @@ budgets: {wallMinutes: 30}
         let ack_path = site.root.join(format!("{go_rel}.ack"));
         std::thread::sleep(Duration::from_millis(2));
         fs::write(&ack_path, "# current ACK B97\n").unwrap();
-        let mut runtime =
-            RecordingAwaitReportRuntime::observe_claim_before_install(&site.root);
+        let mut runtime = RecordingAwaitReportRuntime::observe_claim_before_install(&site.root);
 
         let outcome = run_await_with_hook_inner_with_runtime(
             &site.root,
@@ -9037,10 +10051,8 @@ budgets: {wallMinutes: 30}
         let (_attempt, go_rel, _base_sha) = append_modern_dispatch(&site);
         let ack_path = site.root.join(format!("{go_rel}.ack"));
         fs::remove_file(&ack_path).unwrap();
-        let mut runtime = RecordingAwaitReportRuntime::late_ack_then_notify_blocked(
-            &site.root,
-            ack_path.clone(),
-        );
+        let mut runtime =
+            RecordingAwaitReportRuntime::late_ack_then_notify_blocked(&site.root, ack_path.clone());
         let mut claim_calls = 0;
 
         let outcome = run_await_with_hook_inner_with_runtime(
@@ -9060,7 +10072,10 @@ budgets: {wallMinutes: 30}
         .unwrap();
 
         assert!(matches!(outcome, AwaitOutcome::Blocked { .. }));
-        assert!(ack_path.is_file(), "the watcher frame must create a late ACK");
+        assert!(
+            ack_path.is_file(),
+            "the watcher frame must create a late ACK"
+        );
         assert_eq!(runtime.install_calls, 1);
         assert!(
             runtime.late_ack_wake_received,
@@ -9103,9 +10118,7 @@ budgets: {wallMinutes: 30}
     #[test]
     fn await_entry_guard_drift_is_critical_passthrough_without_outer_rejection() {
         let site = test_root("await-entry-critical-drift");
-        let card_path = site
-            .root
-            .join("coordination/rounds/r44/tasks/B97.md");
+        let card_path = site.root.join("coordination/rounds/r44/tasks/B97.md");
         let original = fs::read_to_string(&card_path).unwrap();
         fs::write(&card_path, format!("{original}\n# drift mutation\n")).unwrap();
         let rejection_count = |events: &[EventRecord]| {
@@ -9121,13 +10134,7 @@ budgets: {wallMinutes: 30}
         };
         let before = rejection_count(&read_events(&site.root));
 
-        let error = match run_await_with_hook(
-            &site.root,
-            "B97",
-            30,
-            None,
-            &mut |_| Ok(()),
-        ) {
+        let error = match run_await_with_hook(&site.root, "B97", 30, None, &mut |_| Ok(())) {
             Err(error) => error,
             Ok(_) => panic!("active task-card drift must fail the await entry guard"),
         };
@@ -9329,7 +10336,10 @@ budgets: {wallMinutes: 30}
                 }
                 return native_wait();
             }
-            if matches!(self.scenario, AwaitRuntimeScenario::LateAckThenNotifyBlocked) {
+            if matches!(
+                self.scenario,
+                AwaitRuntimeScenario::LateAckThenNotifyBlocked
+            ) {
                 assert_eq!(
                     self.recv_timeouts.len(),
                     1,
@@ -9348,8 +10358,7 @@ budgets: {wallMinutes: 30}
                 self.callback
                     .as_mut()
                     .expect("late ACK scenario requires an installed watcher")(Ok(
-                    notify::Event::new(notify::EventKind::Any)
-                        .add_path(self.terminal_path.clone()),
+                    notify::Event::new(notify::EventKind::Any).add_path(self.terminal_path.clone()),
                 ));
                 let received = native_wait();
                 self.late_ack_wake_received = received.is_ok();
@@ -9430,7 +10439,10 @@ budgets: {wallMinutes: 30}
             events
                 .iter()
                 .filter(|event| {
-                    matches!(event.kind.as_str(), "ReportAwaitExpired" | "AttemptTimedOut")
+                    matches!(
+                        event.kind.as_str(),
+                        "ReportAwaitExpired" | "AttemptTimedOut"
+                    )
                 })
                 .count(),
             0,
@@ -10131,7 +11143,7 @@ budgets: {wallMinutes: 30}
     fn configure_two_gates(site: &TierfRoot) {
         std::fs::write(
             site.root.join("coordination/rounds/r44/tasks/B97.md"),
-            "---\ntaskId: B97\nround: r44\nagent: executor-desktop\nwriteSet: []\nfrozenPaths: []\ngates: {fast: [testGate, testGate2]}\n---\n# B97 test\n",
+            "---\ntaskId: B97\nround: r44\nagent: executor-desktop\nwriteSet: []\nfrozenPaths: []\ngates: {fast: [testGate, testGate2]}\nrequiredReviews:\n  - {role: primary, agent: executor-claw}\nrequiredEvidence: [fixture-evidence]\nbudgets: {wallMinutes: 30}\n---\n# B97 test\n",
         )
         .unwrap();
         std::fs::write(
@@ -10143,6 +11155,7 @@ budgets: {wallMinutes: 30}
             ),
         )
         .unwrap();
+        sign_active_ir(&site.root);
     }
 
     fn append_forged_collect_terminal(
@@ -10184,9 +11197,16 @@ budgets: {wallMinutes: 30}
             Some("r44"),
             claim_payload,
         );
+        let subject_tree_sha =
+            gitx::rev_parse(&site.root, &format!("{branch_sha}^{{tree}}")).unwrap();
+        let toolchain_digest = "a".repeat(64);
+        let environment_digest = "b".repeat(64);
         let gate_events = gate_specs
             .iter()
-            .map(|(command_ref, exit_code)| {
+            .enumerate()
+            .map(|(index, (command_ref, exit_code))| {
+                let raw = format!("forged-raw-log-{index}\n");
+                let raw_sha256 = collect_cas(&site.root).put(raw.as_bytes()).unwrap();
                 ledger::event(
                     "GateExecuted",
                     "runtime:orch",
@@ -10194,8 +11214,15 @@ budgets: {wallMinutes: 30}
                     Some("r44"),
                     serde_json::json!({
                         "commandRef": command_ref,
+                        "phase": "collect",
+                        "gateRunId": format!("01ARZ3NDEKTSV4RRFFQ69G{:04}", index),
                         "exitCode": exit_code,
-                        "durationMs": 1
+                        "durationMs": 1,
+                        "subjectTreeSha": subject_tree_sha.clone(),
+                        "logSha256": raw_sha256,
+                        "logBytes": raw.len() as u64,
+                        "toolchainDigest": toolchain_digest.clone(),
+                        "environmentDigest": environment_digest.clone(),
                     }),
                 )
             })
@@ -10218,16 +11245,32 @@ budgets: {wallMinutes: 30}
                     .get(*event_index)
                     .map(|event| event.event_id.as_str())
                     .unwrap_or("missing-gate-event");
-                let raw = format!("forged-raw-log-{index}\n");
-                let raw_sha256 = collect_cas(&site.root).put(raw.as_bytes()).unwrap();
+                let event_payload = gate_events
+                    .get(*event_index)
+                    .and_then(|event| event.payload.as_ref());
+                let gate_run_id = event_payload
+                    .and_then(|payload| payload.get("gateRunId"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("missing-gate-run")
+                    .to_string();
+                let raw_sha256 = event_payload
+                    .and_then(|payload| payload.get("logSha256"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "c".repeat(64));
+                let raw_len = event_payload
+                    .and_then(|payload| payload.get("logBytes"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
                 CollectAttestedGate {
                     sequence: (index + 1) as u64,
                     gate_event_id: event_id.to_string(),
+                    gate_run_id,
                     command_ref: (*command_ref).to_string(),
                     exit_code: i32::try_from(*exit_code).unwrap(),
                     duration_ms: 1,
                     raw_log_cas_sha256: raw_sha256,
-                    raw_log_len: raw.len() as u64,
+                    raw_log_len: raw_len,
                 }
             })
             .collect::<Vec<_>>();
@@ -10253,6 +11296,16 @@ budgets: {wallMinutes: 30}
             evidence_sha256: claimed.sha256.clone(),
             evidence_len: claimed.len,
             control_epoch: claimed.control_epoch.clone(),
+            subject_tree_sha: String::new(),
+            ir_revision: 0,
+            validation_digest: String::new(),
+            binding_sha256: String::new(),
+            task_card_sha256: String::new(),
+            resolved_command_digest: String::new(),
+            source_reader_descriptor_sha256: None,
+            source_reader_base_sha256: None,
+            toolchain_digest: toolchain_digest.clone(),
+            environment_digest: environment_digest.clone(),
             configured_gate_count: configured_command_refs.len() as u64,
             configured_command_refs,
             gates: attested_gates,
@@ -10264,6 +11317,8 @@ budgets: {wallMinutes: 30}
         receipt_payload["configuredCommandRefs"] =
             serde_json::to_value(&attestation.configured_command_refs).unwrap();
         receipt_payload["gates"] = serde_json::to_value(&attestation.gates).unwrap();
+        receipt_payload["toolchainDigest"] = serde_json::json!(attestation.toolchain_digest);
+        receipt_payload["environmentDigest"] = serde_json::json!(attestation.environment_digest);
         receipt_payload["receiptDigest"] = serde_json::json!(missing_attestation);
         receipt_payload["gateReceiptDigest"] = serde_json::json!(missing_attestation);
         receipt_payload["receiptAttestationSha256"] = serde_json::json!(missing_attestation);
@@ -10384,6 +11439,8 @@ budgets: {wallMinutes: 30}
             Some("r44"),
             claim_payload,
         );
+        let subject_tree_sha =
+            gitx::rev_parse(&site.root, &format!("{branch_sha}^{{tree}}")).unwrap();
         let gate_events = reused_attestation
             .gates
             .iter()
@@ -10395,8 +11452,15 @@ budgets: {wallMinutes: 30}
                     Some("r44"),
                     serde_json::json!({
                         "commandRef": gate.command_ref,
+                        "phase": "collect",
+                        "gateRunId": gate.gate_run_id,
                         "exitCode": gate.exit_code,
-                        "durationMs": gate.duration_ms
+                        "durationMs": gate.duration_ms,
+                        "subjectTreeSha": subject_tree_sha,
+                        "logSha256": gate.raw_log_cas_sha256,
+                        "logBytes": gate.raw_log_len,
+                        "toolchainDigest": reused_attestation.toolchain_digest,
+                        "environmentDigest": reused_attestation.environment_digest,
                     }),
                 )
             })
@@ -10416,6 +11480,9 @@ budgets: {wallMinutes: 30}
         receipt_payload["configuredCommandRefs"] =
             serde_json::to_value(&reused_attestation.configured_command_refs).unwrap();
         receipt_payload["gates"] = serde_json::to_value(&reused_attestation.gates).unwrap();
+        receipt_payload["toolchainDigest"] = serde_json::json!(reused_attestation.toolchain_digest);
+        receipt_payload["environmentDigest"] =
+            serde_json::json!(reused_attestation.environment_digest);
         receipt_payload["receiptDigest"] = serde_json::json!(reused_ref.attestation_sha256);
         bind_attestation_ref(&mut receipt_payload, reused_ref);
         let receipt_event = ledger::event(
@@ -11200,6 +12267,109 @@ budgets: {wallMinutes: 30}
     }
 
     #[test]
+    fn real_dispatch_blocks_an_unrecorded_signed_dependency_before_go() {
+        let site = test_root("dependency-unrecorded-dispatch");
+        add_dispatch_dependency(&site.root);
+
+        let error = run_dispatch(&site.root, "B97", true).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("BlockedByDependency"), "{error}");
+        assert!(error.contains("B96"), "{error}");
+        assert!(
+            !site
+                .root
+                .join("coordination/rounds/r44/dispatch/executor-desktop/GO-B97-A0001.md")
+                .exists(),
+            "dependency refusal must precede GO publication"
+        );
+        assert!(
+            !read_events(&site.root)
+                .iter()
+                .any(|event| event.kind == "DispatchIssued"
+                    && event.task_id.as_deref() == Some("B97")),
+            "dependency refusal must not mint an implementation attempt"
+        );
+    }
+
+    #[test]
+    fn real_successor_dispatch_requires_the_recorded_dependency_in_its_inherited_base() {
+        let site = test_root("dependency-stale-successor-base");
+        add_dispatch_dependency(&site.root);
+        let (_, _, first_base) = append_modern_dispatch(&site);
+        ledger::append(
+            &site.root,
+            "r44",
+            &[ledger::event(
+                "AttemptBlocked",
+                "runtime:test",
+                Some("B97"),
+                Some("r44"),
+                serde_json::json!({
+                    "attemptId": "B97-A0001",
+                    "agent": "executor-desktop",
+                }),
+            )],
+        )
+        .unwrap();
+
+        std::fs::write(site.root.join("dependency.txt"), "recorded dependency\n").unwrap();
+        test_git(&site.root, &["add", "dependency.txt"]);
+        test_git(
+            &site.root,
+            &[
+                "-c",
+                "user.name=orch-test",
+                "-c",
+                "user.email=orch@test.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "record dependency",
+            ],
+        );
+        let dependency_merge = test_git(&site.root, &["rev-parse", "main"]);
+        assert_ne!(dependency_merge, first_base);
+        ledger::append(
+            &site.root,
+            "r44",
+            &[
+                crate::close::merge_executed_event("B96", "r44", &dependency_merge),
+                crate::close::task_recorded_event("B96", "r44"),
+            ],
+        )
+        .unwrap();
+
+        let error = run_dispatch(&site.root, "B97", true).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("ForwardBaselineRequired"), "{error}");
+        assert!(error.contains("dependency=B96"), "{error}");
+        assert!(
+            error.contains(&format!("merge_sha={dependency_merge}")),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("attempt_base_sha={first_base}")),
+            "{error}"
+        );
+        assert_eq!(
+            read_events(&site.root)
+                .iter()
+                .filter(|event| event.kind == "DispatchIssued"
+                    && event.task_id.as_deref() == Some("B97"))
+                .count(),
+            1,
+            "stale-base refusal must not mint A0002"
+        );
+        assert!(
+            !site
+                .root
+                .join("coordination/rounds/r44/dispatch/executor-desktop/GO-B97-A0002.md")
+                .exists(),
+            "stale-base refusal must precede successor GO publication"
+        );
+    }
+
+    #[test]
     fn real_dispatch_refuses_capacity_during_report_remediation_and_releases_on_terminal() {
         let site = test_root("capacity-real-dispatch");
         add_second_dispatch_task(&site.root);
@@ -11526,6 +12696,32 @@ budgets: {wallMinutes: 30}
         let site = test_root("collect");
         let (_, go_rel, base_sha) = append_modern_dispatch(&site);
         let (report_rel, report, _) = commit_report(&site);
+        let nudge_path = site
+            .root
+            .join("coordination/rounds/r44/dispatch/executor-desktop/NUDGE.md");
+        std::fs::write(
+            &nudge_path,
+            format!(
+                "{}finish the implementation\n",
+                nudge_file_header("executor-desktop", "B97", "B97-A0001")
+            ),
+        )
+        .unwrap();
+        let nudge_event = ledger::event(
+            "NudgeIssued",
+            "runtime:orch",
+            Some("B97"),
+            Some("r44"),
+            serde_json::json!({
+                "actionId": "nudge-r44-B97-B97-A0001-fixture",
+                "agent": "executor-desktop",
+                "attemptId": "B97-A0001",
+                "attemptNo": 1,
+                "nudgePath": nudge_path.display().to_string(),
+            }),
+        );
+        let nudge_event_id = nudge_event.event_id.clone();
+        ledger::append(&site.root, "r44", &[nudge_event]).unwrap();
         let claimed = claimed_report(&site, &report_rel, report);
         let ctx = modern_ctx(&go_rel, &base_sha);
         let card = card::load(&site.root, "r44", "B97").unwrap();
@@ -11551,6 +12747,42 @@ budgets: {wallMinutes: 30}
         assert!(first_events
             .iter()
             .any(|event| event.kind == "ReportCollectCompleted"));
+        assert!(
+            !nudge_path.exists(),
+            "collect completion must remove NUDGE.md from the executor-facing channel"
+        );
+        assert!(
+            !superseded_nudge_path(&nudge_path, "B97-A0001").exists(),
+            "the crash-recovery archive must be removed once supersession is durable"
+        );
+        let supersessions = first_events
+            .iter()
+            .filter(|event| event.kind == concat!("Nudge", "Superseded"))
+            .collect::<Vec<_>>();
+        assert_eq!(supersessions.len(), 1);
+        let supersession_payload = supersessions[0].payload.as_ref().unwrap();
+        assert_eq!(
+            supersession_payload
+                .get("attemptId")
+                .and_then(serde_json::Value::as_str),
+            Some("B97-A0001")
+        );
+        assert_eq!(
+            supersession_payload
+                .get("supersededBy")
+                .and_then(serde_json::Value::as_str),
+            Some("ReportObserved")
+        );
+        assert_eq!(
+            supersession_payload
+                .get("nudgeEventId")
+                .and_then(serde_json::Value::as_str),
+            Some(nudge_event_id.as_str())
+        );
+        eprintln!(
+            "B269_NUDGE_SUPERSEDED_PAYLOAD={}",
+            serde_json::to_string(supersession_payload).unwrap()
+        );
 
         let replay = collect_claimed_report(
             &site.root,
@@ -11682,6 +12914,111 @@ budgets: {wallMinutes: 30}
             "an old successful gate must not authorize a forged terminal"
         );
         assert!(!forged.gate_marker.exists());
+    }
+
+    #[test]
+    fn failed_nudge_injection_file_is_superseded_without_a_nudge_issued_event() {
+        let site = test_root("orphan-pending-nudge");
+        let (_, go_rel, base_sha) = append_modern_dispatch(&site);
+        let nudge_path = site
+            .root
+            .join("coordination/rounds/r44/dispatch/executor-desktop/NUDGE.md");
+        std::fs::write(
+            &nudge_path,
+            format!(
+                "{}wake delivery failed before NudgeIssued\n",
+                nudge_file_header("executor-desktop", "B97", "B97-A0001")
+            ),
+        )
+        .unwrap();
+        ledger::append(
+            &site.root,
+            "r44",
+            &[ledger::event(
+                "ReportObserved",
+                "runtime:orch",
+                Some("B97"),
+                Some("r44"),
+                serde_json::json!({"attemptId": "B97-A0001", "attemptNo": 1}),
+            )],
+        )
+        .unwrap();
+
+        supersede_pending_nudge_for_dispatch(
+            &site.root,
+            "r44",
+            "B97",
+            &modern_ctx(&go_rel, &base_sha),
+        )
+        .unwrap();
+
+        assert!(!nudge_path.exists());
+        let events = read_events(&site.root);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "NudgeIssued")
+                .count(),
+            0,
+            "fixture must model wake failure before the NudgeIssued append"
+        );
+        let supersession = events
+            .iter()
+            .find(|event| event.kind == concat!("Nudge", "Superseded"))
+            .expect("the orphaned file must still gain a durable supersession fact");
+        let payload = supersession.payload.as_ref().unwrap();
+        assert_eq!(payload["attemptId"], "B97-A0001");
+        assert_eq!(payload["supersededBy"], "ReportObserved");
+        assert!(payload["nudgeEventId"].is_null());
+        assert!(payload["nudgeActionId"].is_null());
+    }
+
+    #[test]
+    fn nudge_production_rejects_a_new_file_after_report_observation() {
+        let site = test_root("post-report-nudge-guard");
+        append_modern_dispatch(&site);
+        ledger::append(
+            &site.root,
+            "r44",
+            &[ledger::event(
+                "ReportObserved",
+                "runtime:orch",
+                Some("B97"),
+                Some("r44"),
+                serde_json::json!({"attemptId": "B97-A0001", "attemptNo": 1}),
+            )],
+        )
+        .unwrap();
+
+        let error = match run_nudge(
+            &site.root,
+            "executor-desktop",
+            Some("B97"),
+            "late command",
+            false,
+            true,
+        ) {
+            Ok(_) => panic!("a post-report NUDGE must be rejected before file creation"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("ReportObserved"),
+            "the rejection must name the durable fact that closed the window: {error:#}"
+        );
+        assert!(
+            !site
+                .root
+                .join("coordination/rounds/r44/dispatch/executor-desktop/NUDGE.md")
+                .exists(),
+            "the phase guard must reject before creating an executor-visible file"
+        );
+        assert_eq!(
+            read_events(&site.root)
+                .iter()
+                .filter(|event| event.kind == "NudgeIssued")
+                .count(),
+            0
+        );
     }
 
     #[test]

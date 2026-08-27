@@ -11,7 +11,11 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
-use crate::{budget::RoundBudget, card, ledger};
+use crate::{binding, budget::RoundBudget, card, gitx, ledger};
+
+/// Version marker for the exact-main landed write-set guard and Rust
+/// `check --all-targets` admission floor enforced by production `orch plan`.
+pub const PLAN_ADMISSION_GUARDS_V1: u32 = 1;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskInput {
@@ -98,10 +102,125 @@ pub struct IrSourceBindings {
         skip_serializing_if = "String::is_empty"
     )]
     pub agent_registry_digest: String,
+    /// SHA-256 of the harness capability registry whose terminal and receipt
+    /// semantics are trusted by fallback and nongate review transitions.
+    #[serde(
+        rename = "harnessRegistryDigest",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub harness_registry_digest: String,
     #[serde(rename = "taskCards", default)]
     pub task_cards: BTreeMap<String, String>,
     #[serde(rename = "seedSources", default)]
     pub seed_sources: BTreeMap<String, String>,
+}
+
+/// Replay state of one runtime policy at an immutable attempt base commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimePolicyStateV1 {
+    /// The policy exists in signed binding bytes but has no active authority.
+    Dormant,
+    /// A canonical activation or explicit carry-forward authorizes consumers.
+    Active,
+}
+
+/// Explicit cross-round provenance required when a new binding starts active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimePolicyCarryForwardV1 {
+    /// Prior signed round that owns the source activation fact.
+    pub source_round: String,
+    /// Exact source activation event identity.
+    pub source_event_id: String,
+    /// SHA-256 of the prior policy subtree.
+    pub source_policy_sha256: String,
+    /// SHA-256 of the canonical source event JSON bytes.
+    pub source_event_sha256: String,
+}
+
+/// One candidate in the signed review-pool union.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewPoolCandidateV1 {
+    /// Exact registered agent identity.
+    pub agent: String,
+    /// Maximum routed role for this candidate.
+    pub role: String,
+    /// Lineage used by the primary-PASS requirement.
+    pub lineage: String,
+    /// Whether a business-invalid generation can receive generation two.
+    pub retry_eligible: bool,
+    /// Optional candidate whose system failure this candidate backfills.
+    #[serde(default)]
+    pub fallback_for: Option<String>,
+}
+
+/// Exact signed descriptor for `review-pool-v1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewPoolPolicyV1 {
+    /// Descriptor schema version; only one is accepted.
+    pub schema_version: u32,
+    /// Recorded task that must own activation.
+    pub owner_task: String,
+    /// `dormant` in the defining round or `active` with carry-forward proof.
+    pub initial_state: String,
+    /// V1 policy scope; review-pool-v1 is round-scoped.
+    pub scope: String,
+    /// Minimum unique substantive PASS voices.
+    pub minimum_passes: usize,
+    /// Whether a counted PASS must have primary lineage.
+    pub require_primary_pass: bool,
+    /// Number of initial routes committed before any wake.
+    pub initial_seat_count: usize,
+    /// Minimum number of formal gate-eligible initial seats.
+    pub minimum_gate_eligible: usize,
+    /// Whole-panel business retry budget.
+    pub maximum_business_retries: usize,
+    /// Only formal role a nongate PASS may replace.
+    pub nongate_substitutes_role: String,
+    /// Ordered signed candidate union from which the planner selects.
+    pub candidates: Vec<ReviewPoolCandidateV1>,
+    /// Required provenance when a later round starts in active state.
+    #[serde(default)]
+    pub carry_forward: Option<RuntimePolicyCarryForwardV1>,
+}
+
+/// Fully verified policy state reconstructed from committed base bytes only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePolicyResolutionV1 {
+    /// Exact policy key requested by the caller.
+    pub policy: String,
+    /// Task that owns activation of this policy.
+    pub owner_task: String,
+    /// Dormant or active state at `policy_base_sha`.
+    pub state: RuntimePolicyStateV1,
+    /// SHA-256 of committed binding bytes signed by the committed ROUND-IR.
+    pub binding_sha256: String,
+    /// SHA-256 of the canonical selected policy subtree.
+    pub policy_sha256: String,
+    /// Activation/carry-forward event identity when active.
+    pub activation_event_id: Option<String>,
+    /// Immutable commit from which every field was resolved.
+    pub policy_base_sha: String,
+    /// Typed review-pool descriptor for `review-pool-v1`.
+    pub review_pool: Option<ReviewPoolPolicyV1>,
+}
+
+/// Result of one idempotent activate/deactivate accounting transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePolicyTransitionOutcomeV1 {
+    /// Exact policy key whose state was resolved.
+    pub policy: String,
+    /// State visible from the returned committed main.
+    pub state: RuntimePolicyStateV1,
+    /// Activation or deactivation event identity.
+    pub event_id: String,
+    /// Scoped one-parent accounting commit containing the event.
+    pub commit_sha: String,
+    /// True when the requested committed state already existed on entry.
+    pub replayed: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -134,6 +253,30 @@ pub struct IrTask {
     pub wall_minutes: u64,
     #[serde(rename = "requiredReviews", default)]
     pub required_reviews: Vec<card::RequiredReview>,
+    /// Role-keyed formal fallbacks signed beside the frozen `RequiredReview`
+    /// representation, preserving historical source compatibility.
+    #[serde(
+        rename = "reviewFallbacks",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub review_fallbacks: Vec<card::ReviewFallback>,
+    /// Explicit nongate obligations signed with the task instead of inferred
+    /// from the scheduling capacity roster.
+    #[serde(
+        rename = "nongateSeats",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub nongate_seats: Vec<card::NongateSeat>,
+    /// Optional closed quorum contract. Absence is the historical strict mode
+    /// in which all formal seats remain mandatory.
+    #[serde(
+        rename = "reviewQuorum",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub review_quorum: Option<card::ReviewQuorumPolicy>,
     #[serde(rename = "requiredEvidence", default)]
     pub required_evidence: Vec<String>,
     #[serde(rename = "bootstrapPreSignoffAttempt", default)]
@@ -1090,6 +1233,17 @@ pub fn agent_registry_digest(root: &Path) -> Result<String> {
     Ok(hex::encode(digest.finalize()))
 }
 
+/// Fold a signed registry genesis digest through audited amendments in ledger
+/// order.  Every record must start at the previous record's exact output;
+/// missing, duplicated, or reordered links fail closed instead of weakening
+/// the signed registry binding.
+pub fn expected_registry_digest_with_amendments(
+    genesis: &str,
+    amendments: &[crate::registry::AgentPinAmendment],
+) -> Result<String> {
+    crate::registry::fold_agent_pin_amendments(genesis, amendments)
+}
+
 /// Cross-check the round scheduling envelope against the loaded registry.
 /// The registry is an upper bound: a round may narrow roles/capacities, but it
 /// cannot invent an agent, grant a new role, or omit a shared tool domain.
@@ -2022,6 +2176,13 @@ fn validate_required_contract(task: &TaskInput) -> Result<()> {
     let mut roles = BTreeSet::new();
     let mut agents = BTreeSet::new();
     for review in &task.required_reviews {
+        if !matches!(review.role.as_str(), "primary" | "secondary") {
+            bail!(
+                "task {} requiredReviews role 只能是 primary|secondary: {}",
+                task.id,
+                review.role
+            );
+        }
         let role_valid = safe_identity_component(&review.role);
         let agent_valid = safe_identity_component(&review.agent);
         if !role_valid || !agent_valid {
@@ -2045,7 +2206,6 @@ fn validate_required_contract(task: &TaskInput) -> Result<()> {
             bail!("task {} reviewer 不得等于实现 agent", task.id);
         }
     }
-
     if task.required_evidence.is_empty() {
         bail!("task {} requiredEvidence 缺失", task.id);
     }
@@ -2109,6 +2269,104 @@ fn validate_gate_refs(task: &TaskInput) -> Result<()> {
     Ok(())
 }
 
+fn validate_binding_lane_floor(task: &TaskInput, project_binding: &binding::Binding) -> Result<()> {
+    fn refs<'a>(task_id: &str, lane: &str, values: &'a [String]) -> Result<BTreeSet<&'a str>> {
+        let mut seen = BTreeSet::new();
+        for value in values {
+            let safe = !value.is_empty()
+                && value != "."
+                && value != ".."
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+            if !safe {
+                bail!("task {task_id} binding gates.{lane} ref 非安全 component: {value:?}");
+            }
+            if !seen.insert(value.as_str()) {
+                bail!("task {task_id} binding gates.{lane} ref 重复: {value}");
+            }
+        }
+        Ok(seen)
+    }
+
+    refs(&task.id, "candidate", &project_binding.gates.candidate)?;
+    let signed_floor = task
+        .gates_fast
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let known = project_binding
+        .commands
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+
+    for (lane, declared, configured) in [
+        (
+            "merge",
+            project_binding.gates.merge_declared(),
+            project_binding.gates.merge.as_slice(),
+        ),
+        (
+            "fast",
+            project_binding.gates.fast_declared(),
+            project_binding.gates.fast.as_slice(),
+        ),
+    ] {
+        // Absence remains compatible with pre-lane binding fixtures, while an
+        // explicitly empty list is a real signed weakening and fails below.
+        if !declared {
+            continue;
+        }
+        let configured = refs(&task.id, lane, configured)?;
+        let missing = signed_floor
+            .difference(&configured)
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!(
+                "task {} binding gates.{lane} 弱于 signed card gates.fast，缺: {}",
+                task.id,
+                missing.join(", ")
+            );
+        }
+        let unknown = configured.difference(&known).copied().collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            bail!(
+                "task {} binding gates.{lane} 含未知 command: {}",
+                task.id,
+                unknown.join(", ")
+            );
+        }
+    }
+
+    if project_binding.gates.candidate_declared() {
+        if project_binding.gates.candidate.is_empty() {
+            bail!("task {} binding gates.candidate 显式为空", task.id);
+        }
+        for (lane, declared, commands) in [
+            (
+                "merge",
+                project_binding.gates.merge_declared(),
+                project_binding.gates.merge.as_slice(),
+            ),
+            (
+                "fast",
+                project_binding.gates.fast_declared(),
+                project_binding.gates.fast.as_slice(),
+            ),
+        ] {
+            if !declared || commands.is_empty() {
+                bail!(
+                    "task {} binding gates.candidate 已声明但缺非空 gates.{lane} 强门/升级目标",
+                    task.id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn compile_ir(
     round: &str,
     mode_yaml: &str,
@@ -2128,6 +2386,9 @@ fn compile_ir_with_dispatched(
     let mode: ModeConfig = serde_yaml::from_str(mode_yaml).context("解析 ModeConfig 失败")?;
     let binding: PlanBinding =
         serde_yaml::from_str(binding_yaml).context("解析 PROJECT-BINDING 失败")?;
+    let gate_binding = binding::parse_binding_bytes(binding_yaml.as_bytes())
+        .map_err(anyhow::Error::msg)
+        .context("解析 PROJECT-BINDING gate lanes 失败")?;
     validate_source_bindings(round, tasks)?;
 
     if mode.verification.mode != "root-manual-fixed-head" {
@@ -2214,6 +2475,7 @@ fn compile_ir_with_dispatched(
         }
         validate_required_contract(task)?;
         validate_gate_refs(task)?;
+        validate_binding_lane_floor(task, &gate_binding)?;
         if scheduling_applies {
             for review in &task.required_reviews {
                 if !mode.scheduling.allowed_agents.contains(&review.agent)
@@ -2314,6 +2576,9 @@ fn compile_ir_with_dispatched(
                 .wall_minutes
                 .expect("task wall_minutes was validated above"),
             required_reviews: task.required_reviews.clone(),
+            review_fallbacks: Vec::new(),
+            nongate_seats: Vec::new(),
+            review_quorum: None,
             required_evidence: task.required_evidence.clone(),
             bootstrap_pre_signoff_attempt: task.bootstrap_pre_signoff_attempt.clone(),
             // B147：TaskInput 布局冻结不含 B141 元数据；卡面 dependsOn /
@@ -2377,6 +2642,7 @@ fn compile_ir_with_dispatched(
             mode_sha256: contract_digest_of_mode(mode_yaml)?,
             binding_sha256: source_sha256(binding_yaml.as_bytes()),
             agent_registry_digest: String::new(),
+            harness_registry_digest: String::new(),
             task_cards,
             seed_sources,
         },
@@ -2413,7 +2679,1008 @@ pub fn validation_digest(ir: &RoundIr) -> String {
     hex::encode(digest)
 }
 
-fn load_task_inputs(root: &Path, round: &str) -> Result<LoadedTasks> {
+fn parse_committed_policy_ledger(bytes: &[u8], label: &str) -> Result<Vec<EventRecord>> {
+    let text = std::str::from_utf8(bytes).with_context(|| format!("{label} 非 UTF-8"))?;
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            serde_json::from_str::<EventRecord>(line)
+                .with_context(|| format!("{label} 第 {} 行非 canonical event", index + 1))
+        })
+        .collect()
+}
+
+fn yaml_policy_node<'a>(
+    binding: &'a serde_yaml::Value,
+    policy: &str,
+) -> Result<&'a serde_yaml::Value> {
+    let key = |value: &str| serde_yaml::Value::String(value.to_string());
+    let root = binding
+        .as_mapping()
+        .context("committed binding root 必须是 mapping")?;
+    let runtime_value = root
+        .get(&key("runtimePolicies"))
+        .context("committed binding 缺 runtimePolicies envelope")?;
+    let runtime = runtime_value
+        .as_mapping()
+        .context("committed binding present runtimePolicies 非 mapping")?;
+    if runtime.len() != 2
+        || runtime
+            .get(&key("schemaVersion"))
+            .and_then(serde_yaml::Value::as_u64)
+            != Some(1)
+    {
+        bail!("runtimePolicies envelope 必须是 exact schemaVersion 1 + policies");
+    }
+    runtime
+        .get(&key("policies"))
+        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(|policies| policies.get(&key(policy)))
+        .with_context(|| format!("committed binding 缺 runtime policy {policy}"))
+}
+
+fn policy_node_string(node: &serde_yaml::Value, key: &str) -> Result<String> {
+    node.as_mapping()
+        .and_then(|mapping| mapping.get(&serde_yaml::Value::String(key.to_string())))
+        .and_then(serde_yaml::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .with_context(|| format!("runtime policy descriptor 缺非空 {key}"))
+}
+
+fn policy_node_u64(node: &serde_yaml::Value, key: &str) -> Result<u64> {
+    node.as_mapping()
+        .and_then(|mapping| mapping.get(&serde_yaml::Value::String(key.to_string())))
+        .and_then(serde_yaml::Value::as_u64)
+        .with_context(|| format!("runtime policy descriptor 缺 unsigned {key}"))
+}
+
+fn policy_node_carry_forward(
+    node: &serde_yaml::Value,
+) -> Result<Option<RuntimePolicyCarryForwardV1>> {
+    let Some(value) = node
+        .as_mapping()
+        .and_then(|mapping| mapping.get(&serde_yaml::Value::String("carryForward".to_string())))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        serde_yaml::from_value(value.clone()).context("runtime policy carryForward 非 exact")?,
+    ))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn policy_config_sha256(node: &serde_yaml::Value) -> Result<String> {
+    let mut value =
+        serde_json::to_value(node).context("runtime policy config 无法 canonicalize")?;
+    let object = value
+        .as_object_mut()
+        .context("runtime policy descriptor 必须是 mapping")?;
+    object.remove("initialState");
+    object.remove("carryForward");
+    Ok(sha256_bytes(&serde_json::to_vec(&value)?))
+}
+
+fn validate_policy_base_sha(value: &str) -> Result<()> {
+    if value.len() != 40
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("policyBaseSha 必须为完整 40 位小写 hex commit");
+    }
+    Ok(())
+}
+
+/// One closed V1 command invocation whose immutable argv prefix comes from a
+/// committed binding and whose optional selector is derived from signed card
+/// or source-reader inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCommandArgvV1 {
+    /// Semantic command identity recorded by gate receipts.
+    pub command_ref: String,
+    /// Command whose argv prefix must exist in the committed binding.
+    /// `sourceReaderClosure` deliberately uses the signed `seedTargets` Cargo
+    /// test prefix; all other V1 commands bind to their own reference.
+    pub binding_command_ref: String,
+    /// Empty for a static binding command, or exactly
+    /// `-p <safe-package> --test <safe-test>` for one derived Rust test.
+    pub derived_argv: Vec<String>,
+}
+
+fn safe_resolved_command_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn validate_resolved_command_input(command: &ResolvedCommandArgvV1) -> Result<()> {
+    if !safe_resolved_command_component(&command.command_ref)
+        || !safe_resolved_command_component(&command.binding_command_ref)
+    {
+        bail!("resolved command ref 非安全 component");
+    }
+    let expected_binding = if command.command_ref == "sourceReaderClosure" {
+        "seedTargets"
+    } else {
+        command.command_ref.as_str()
+    };
+    if command.binding_command_ref != expected_binding {
+        bail!(
+            "resolved command {} binding base 必须为 {}，实际 {}",
+            command.command_ref,
+            expected_binding,
+            command.binding_command_ref
+        );
+    }
+    if command.derived_argv.is_empty() {
+        if matches!(
+            command.command_ref.as_str(),
+            "seedTargets" | "sourceReaderClosure"
+        ) {
+            bail!(
+                "resolved command {} 缺 signed-derived Rust test selector",
+                command.command_ref
+            );
+        }
+        return Ok(());
+    }
+    if !matches!(
+        command.command_ref.as_str(),
+        "seedTargets" | "sourceReaderClosure"
+    ) || command.derived_argv.len() != 4
+        || command.derived_argv[0] != "-p"
+        || command.derived_argv[2] != "--test"
+        || !safe_resolved_command_component(&command.derived_argv[1])
+        || !safe_resolved_command_component(&command.derived_argv[3])
+    {
+        bail!(
+            "resolved command {} derived argv 必须是 exact `-p <package> --test <test>`",
+            command.command_ref
+        );
+    }
+    Ok(())
+}
+
+/// Recompute the digest of ordered resolved argv from one immutable policy
+/// base's committed binding.
+///
+/// Every argv prefix is reread from `policy_base_sha`; callers can supply only
+/// the closed V1 Rust-test selector suffix, never a replacement executable or
+/// base flag. The hash domain includes semantic command reference and complete
+/// reconstructed argv in caller order. Unknown bases and empty argv are
+/// rejected. Machine overlays and working-tree bytes are
+/// intentionally excluded so B304 reuse identity describes the signed command
+/// contract rather than a mutable local path. Repeated invocations remain in
+/// the canonical vector: their position is part of the digest and receipt
+/// sequence, so repeated semantic refs are never collapsed into a set.
+pub fn resolved_command_argv_digest_at_policy_base(
+    root: &Path,
+    policy_base_sha: &str,
+    ordered_commands: &[ResolvedCommandArgvV1],
+) -> Result<String> {
+    validate_policy_base_sha(policy_base_sha)?;
+    if gitx::rev_parse(root, &format!("{policy_base_sha}^{{commit}}"))? != policy_base_sha
+        || !gitx::is_ancestor(root, policy_base_sha, "refs/heads/main")?
+    {
+        bail!("policyBaseSha 必须是 current main 的 exact commit ancestor");
+    }
+    if ordered_commands.is_empty() {
+        bail!("resolved command argv digest 拒绝空 command set");
+    }
+
+    let bytes = gitx::show_bytes(root, policy_base_sha, "coordination/PROJECT-BINDING.yaml")
+        .context("读取 policy-base committed PROJECT-BINDING 失败")?;
+    let committed = binding::parse_binding_bytes(&bytes)
+        .map_err(anyhow::Error::msg)
+        .context("解析 policy-base committed PROJECT-BINDING 失败")?;
+
+    let mut resolved = Vec::with_capacity(ordered_commands.len());
+    for command in ordered_commands {
+        validate_resolved_command_input(command)?;
+        let spec = committed
+            .commands
+            .get(&command.binding_command_ref)
+            .with_context(|| {
+                format!(
+                    "policy-base binding 缺 command {}",
+                    command.binding_command_ref
+                )
+            })?;
+        if spec.argv.is_empty() {
+            bail!(
+                "policy-base binding command {} argv 为空",
+                command.binding_command_ref
+            );
+        }
+        if !command.derived_argv.is_empty() && spec.argv.iter().any(|argument| argument == "--") {
+            bail!(
+                "policy-base binding command {} 含 `--` terminator，拒绝把 derived selector 追加到其后",
+                command.binding_command_ref
+            );
+        }
+        let mut argv = spec.argv.clone();
+        argv.extend(command.derived_argv.iter().cloned());
+        resolved.push((command.command_ref.as_str(), argv));
+    }
+
+    let canonical = serde_json::to_vec(&resolved).context("canonicalize resolved command argv")?;
+    let mut digest = Sha256::new();
+    digest.update(b"orch-resolved-command-argv-v1\0");
+    digest.update(canonical);
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn safe_policy_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn canonical_runtime_round(value: &str) -> bool {
+    value.strip_prefix('r').is_some_and(|digits| {
+        !digits.is_empty()
+            && !digits.starts_with('0')
+            && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn validate_review_pool_policy(policy: &ReviewPoolPolicyV1) -> Result<()> {
+    if policy.schema_version != 1
+        || policy.scope != "round"
+        || policy.minimum_passes != 2
+        || !policy.require_primary_pass
+        || policy.initial_seat_count != 3
+        || policy.minimum_gate_eligible != 2
+        || policy.maximum_business_retries != 1
+        || policy.nongate_substitutes_role != "secondary"
+        || !matches!(policy.initial_state.as_str(), "dormant" | "active")
+    {
+        bail!("review-pool-v1 descriptor contract 漂移");
+    }
+    card::validate_task_id(&policy.owner_task)?;
+    if policy.candidates.len() < 4 {
+        bail!("review-pool-v1 至少需要四个 signed candidates");
+    }
+    let mut agents = BTreeSet::new();
+    for candidate in &policy.candidates {
+        if !safe_policy_id(&candidate.agent)
+            || !agents.insert(candidate.agent.as_str())
+            || !matches!(candidate.role.as_str(), "primary" | "secondary" | "nongate")
+            || candidate.lineage != candidate.role
+            || candidate
+                .fallback_for
+                .as_deref()
+                .is_some_and(|agent| !safe_policy_id(agent))
+        {
+            bail!("review-pool-v1 candidate union 非 canonical");
+        }
+    }
+    if policy.carry_forward.as_ref().is_some_and(|carry| {
+        !canonical_runtime_round(&carry.source_round)
+            || !safe_policy_id(&carry.source_event_id)
+            || !valid_source_sha256(&carry.source_policy_sha256)
+            || !valid_source_sha256(&carry.source_event_sha256)
+    }) {
+        bail!("review-pool-v1 carryForward identity/digest 非 canonical");
+    }
+    Ok(())
+}
+
+fn verify_policy_carry_forward(
+    root: &Path,
+    policy_base_sha: &str,
+    policy: &str,
+    current_config_sha256: &str,
+    carry: &RuntimePolicyCarryForwardV1,
+) -> Result<String> {
+    let rel = format!("coordination/rounds/{}/events.jsonl", carry.source_round);
+    let bytes = gitx::show_bytes(root, policy_base_sha, &rel)
+        .with_context(|| format!("读取 carryForward source ledger 失败: {rel}"))?;
+    let events = parse_committed_policy_ledger(&bytes, "carryForward source ledger")?;
+    ledger::validate_runtime_event_history_v1(&events, &carry.source_round)?;
+    let matching = events
+        .iter()
+        .filter(|event| event.event_id == carry.source_event_id)
+        .collect::<Vec<_>>();
+    let [event] = matching.as_slice() else {
+        bail!("carryForward sourceEventId 不唯一");
+    };
+    let Some(ledger::RuntimeEventPayloadV1::RuntimePolicyActivated(activation)) =
+        ledger::decode_runtime_event_v1(event)?
+    else {
+        bail!("carryForward source event 不是 RuntimePolicyActivated");
+    };
+    if event.round.as_deref() != Some(carry.source_round.as_str())
+        || activation.policy != policy
+        || activation.policy_sha256 != carry.source_policy_sha256
+    {
+        bail!("carryForward source activation tuple 漂移");
+    }
+    let canonical = serde_json::to_vec(event)?;
+    if sha256_bytes(&canonical) != carry.source_event_sha256 {
+        bail!("carryForward sourceEventSha256 漂移");
+    }
+    let mut source_active = None::<String>;
+    for candidate in &events {
+        match ledger::decode_runtime_event_v1(candidate)? {
+            Some(ledger::RuntimeEventPayloadV1::RuntimePolicyActivated(payload))
+                if payload.policy == policy =>
+            {
+                source_active = Some(candidate.event_id.clone());
+            }
+            Some(ledger::RuntimeEventPayloadV1::RuntimePolicyDeactivated(payload))
+                if payload.policy == policy
+                    && source_active.as_deref() == Some(payload.activation_event_id.as_str()) =>
+            {
+                source_active = None;
+            }
+            _ => {}
+        }
+    }
+    if source_active.as_deref() != Some(carry.source_event_id.as_str()) {
+        bail!("carryForward source ledger 最终状态不是所指 activation");
+    }
+    let source_binding = gitx::show_bytes(
+        root,
+        &activation.activated_at_main_sha,
+        "coordination/PROJECT-BINDING.yaml",
+    )
+    .context("读取 carryForward source binding 失败")?;
+    let source_yaml: serde_yaml::Value =
+        serde_yaml::from_slice(&source_binding).context("carryForward source binding 非 YAML")?;
+    let source_node = yaml_policy_node(&source_yaml, policy)?;
+    let source_raw = serde_json::to_value(source_node)?;
+    if sha256_bytes(&serde_json::to_vec(&source_raw)?) != carry.source_policy_sha256
+        || policy_config_sha256(source_node)? != current_config_sha256
+    {
+        bail!("carryForward source/current stable policy config 漂移");
+    }
+    Ok(event.event_id.clone())
+}
+
+/// Resolve one runtime policy entirely from the committed binding, ROUND-IR,
+/// and ledger blobs at `policy_base_sha`.  Mutable working-tree bytes and
+/// policy events created after that commit are never consulted.
+pub fn resolve_runtime_policy_at(
+    root: &Path,
+    round: &str,
+    policy: &str,
+    policy_base_sha: &str,
+) -> Result<RuntimePolicyResolutionV1> {
+    validate_policy_base_sha(policy_base_sha)?;
+    if gitx::rev_parse(root, &format!("{policy_base_sha}^{{commit}}"))? != policy_base_sha
+        || !gitx::is_ancestor(root, policy_base_sha, "refs/heads/main")?
+    {
+        bail!("policyBaseSha 必须是 current main 的 exact commit ancestor");
+    }
+    if !safe_policy_id(policy) {
+        bail!("runtime policy id 非安全 component: {policy:?}");
+    }
+    let binding_rel = "coordination/PROJECT-BINDING.yaml";
+    let binding_bytes = gitx::show_bytes(root, policy_base_sha, binding_rel)
+        .context("读取 policy-base committed PROJECT-BINDING 失败")?;
+    // Historical rounds can have both a committed binding and ROUND-IR while
+    // predating runtimePolicies and the later source-binding digest.  Resolve
+    // that compatibility discriminator first: callers may preserve the
+    // signed legacy/quorum contract only for a genuinely absent policy
+    // envelope, while every present envelope still takes the strict modern
+    // IR/digest/ledger path below.
+    let binding: serde_yaml::Value =
+        serde_yaml::from_slice(&binding_bytes).context("policy-base binding YAML 非 canonical")?;
+    let node = yaml_policy_node(&binding, policy)?;
+    let binding_sha256 = sha256_bytes(&binding_bytes);
+    let ir_rel = format!("coordination/rounds/{round}/ROUND-IR.yaml");
+    let ir_bytes = gitx::show_bytes(root, policy_base_sha, &ir_rel)
+        .with_context(|| format!("读取 policy-base committed ROUND-IR 失败: {ir_rel}"))?;
+    let ir_text = std::str::from_utf8(&ir_bytes).context("policy-base ROUND-IR 非 UTF-8")?;
+    let ir = parse_signed_round_ir(ir_text).map_err(anyhow::Error::msg)?;
+    if ir.round != round || ir.source_bindings.binding_sha256 != binding_sha256 {
+        bail!("policy-base ROUND-IR round/bindingSha256 漂移");
+    }
+    // Once the envelope is present, every remaining committed input stays
+    // mandatory; no legacy compatibility branch can bypass these checks.
+    let ledger_rel = format!("coordination/rounds/{round}/events.jsonl");
+    let ledger_bytes = gitx::show_bytes(root, policy_base_sha, &ledger_rel)
+        .with_context(|| format!("读取 policy-base committed ledger 失败: {ledger_rel}"))?;
+    let events = parse_committed_policy_ledger(&ledger_bytes, "policy-base ledger")?;
+    ledger::validate_runtime_event_history_v1(&events, round)?;
+    let digest = validation_digest(&ir);
+    let mut validations = 0usize;
+    for event in events.iter().filter(|event| event.kind == "TaskValidated") {
+        let value = decode_runtime_task_validated(event, round)?;
+        if value.ir_revision == ir.revision && value.validation_digest == digest {
+            validations += 1;
+        }
+    }
+    if validations != 1
+        || matching_user_plan_signoff_positions(&events, round, ir.revision, &digest)?.len() != 1
+    {
+        bail!("policy-base ROUND-IR 缺唯一 committed validation/sign-off");
+    }
+
+    if policy_node_u64(node, "schemaVersion")? != 1 {
+        bail!("runtime policy schemaVersion 未建模");
+    }
+    let owner_task = policy_node_string(node, "ownerTask")?;
+    card::validate_task_id(&owner_task)?;
+    let initial_state = policy_node_string(node, "initialState")?;
+    if policy_node_string(node, "scope")? != "round" {
+        bail!("runtime policy scope 必须为 round");
+    }
+    if !matches!(initial_state.as_str(), "dormant" | "active") {
+        bail!("runtime policy initialState 必须为 dormant|active");
+    }
+    let policy_json =
+        serde_json::to_value(node).context("runtime policy subtree 无法 canonicalize")?;
+    let policy_sha256 = sha256_bytes(&serde_json::to_vec(&policy_json)?);
+    let config_sha256 = policy_config_sha256(node)?;
+    let carry_forward = policy_node_carry_forward(node)?;
+    if carry_forward.as_ref().is_some_and(|carry| {
+        !canonical_runtime_round(&carry.source_round)
+            || !safe_policy_id(&carry.source_event_id)
+            || !valid_source_sha256(&carry.source_policy_sha256)
+            || !valid_source_sha256(&carry.source_event_sha256)
+    }) {
+        bail!("runtime policy carryForward identity/digest 非 canonical");
+    }
+    let review_pool = if policy == "review-pool-v1" {
+        let parsed: ReviewPoolPolicyV1 =
+            serde_yaml::from_value(node.clone()).context("review-pool-v1 descriptor 非 exact")?;
+        validate_review_pool_policy(&parsed)?;
+        Some(parsed)
+    } else {
+        None
+    };
+    let (mut state, mut activation_event_id) = match initial_state.as_str() {
+        "dormant" if carry_forward.is_none() => (RuntimePolicyStateV1::Dormant, None),
+        "active" => {
+            let carry = carry_forward.as_ref().context(
+                "active runtime policy 必须显式 carryForward source round/event/policy digest",
+            )?;
+            (
+                RuntimePolicyStateV1::Active,
+                Some(verify_policy_carry_forward(
+                    root,
+                    policy_base_sha,
+                    policy,
+                    &config_sha256,
+                    carry,
+                )?),
+            )
+        }
+        "dormant" => bail!("dormant runtime policy 不得携带 active carryForward"),
+        _ => unreachable!(),
+    };
+    for event in &events {
+        match ledger::decode_runtime_event_v1(event)? {
+            Some(ledger::RuntimeEventPayloadV1::RuntimePolicyActivated(payload))
+                if payload.policy == policy =>
+            {
+                if payload.owner_task != owner_task
+                    || payload.binding_sha256 != binding_sha256
+                    || payload.policy_sha256 != policy_sha256
+                    || state == RuntimePolicyStateV1::Active
+                {
+                    bail!("policy-base activation tuple/state 漂移");
+                }
+                state = RuntimePolicyStateV1::Active;
+                activation_event_id = Some(event.event_id.clone());
+            }
+            Some(ledger::RuntimeEventPayloadV1::RuntimePolicyDeactivated(payload))
+                if payload.policy == policy =>
+            {
+                if state != RuntimePolicyStateV1::Active
+                    || activation_event_id.as_deref() != Some(payload.activation_event_id.as_str())
+                    || payload.binding_sha256 != binding_sha256
+                    || payload.policy_sha256 != policy_sha256
+                {
+                    bail!("policy-base deactivation tuple/state 漂移");
+                }
+                state = RuntimePolicyStateV1::Dormant;
+                activation_event_id = None;
+            }
+            _ => {}
+        }
+    }
+    Ok(RuntimePolicyResolutionV1 {
+        policy: policy.to_string(),
+        owner_task,
+        state,
+        binding_sha256,
+        policy_sha256,
+        activation_event_id,
+        policy_base_sha: policy_base_sha.to_string(),
+        review_pool,
+    })
+}
+
+/// Bind policy resolution to the unique first DispatchIssued of one exact
+/// attempt, preventing callers from substituting current main or a later
+/// policy transition as its policy base.
+pub fn resolve_attempt_runtime_policy(
+    root: &Path,
+    round: &str,
+    events: &[EventRecord],
+    task_id: &str,
+    attempt_id: &str,
+    policy: &str,
+) -> Result<RuntimePolicyResolutionV1> {
+    card::validate_task_id(task_id)?;
+    let dispatches = events
+        .iter()
+        .filter(|event| {
+            event.kind == "DispatchIssued"
+                && event.actor == "runtime:orch"
+                && event.round.as_deref() == Some(round)
+                && event.task_id.as_deref() == Some(task_id)
+                && event
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("attemptId"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(attempt_id)
+        })
+        .collect::<Vec<_>>();
+    let [dispatch] = dispatches.as_slice() else {
+        bail!("attempt policy resolution 要求唯一 DispatchIssued");
+    };
+    let attempt_no = dispatch
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("attemptNo"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .context("DispatchIssued 缺 positive attemptNo")?;
+    if attempt_id != format!("{task_id}-A{attempt_no:04}") {
+        bail!("DispatchIssued attemptId/attemptNo 非 canonical");
+    }
+    let base_sha = dispatch
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("baseSha"))
+        .and_then(serde_json::Value::as_str)
+        .context("DispatchIssued 缺 policy baseSha")?;
+    resolve_runtime_policy_at(root, round, policy, base_sha)
+}
+
+/// Read the signed task workload from the same committed ROUND-IR used by a
+/// policy-base resolver.  Review deadlines call the existing pure derivation
+/// with this count instead of rereading a later working-tree card.
+pub fn required_evidence_count_at_policy_base(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    policy_base_sha: &str,
+) -> Result<usize> {
+    validate_policy_base_sha(policy_base_sha)?;
+    let rel = format!("coordination/rounds/{round}/ROUND-IR.yaml");
+    let bytes = gitx::show_bytes(root, policy_base_sha, &rel)?;
+    let text = std::str::from_utf8(&bytes).context("policy-base ROUND-IR 非 UTF-8")?;
+    let ir = parse_signed_round_ir(text).map_err(anyhow::Error::msg)?;
+    if ir.round != round {
+        bail!("policy-base ROUND-IR round 漂移");
+    }
+    let task = ir
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .with_context(|| format!("policy-base ROUND-IR 缺 task {task_id}"))?;
+    Ok(task.required_evidence.len())
+}
+
+/// Reject a runtime-policy transition while the signed round still owns any
+/// in-flight attempt, wake/review capacity, managed wake, merge barrier, or a
+/// terminal `RoundClosed` fact.  CLI entrypoints and ledger append authority
+/// both call this predicate so a lower-level constructor cannot bypass it.
+pub(crate) fn ensure_runtime_policy_transition_idle(
+    round: &str,
+    events: &[EventRecord],
+) -> Result<()> {
+    if events.iter().any(|event| {
+        event.kind == "RoundClosed"
+            && event.actor == "runtime:orch"
+            && event.round.as_deref() == Some(round)
+    }) {
+        bail!("runtime policy transition 拒绝已关闭 round");
+    }
+    if crate::ledger::active_merge_barrier(events).is_some() {
+        bail!("runtime policy transition 拒绝 active merge barrier");
+    }
+    let inflight = replan_invalidation_from_events(events, round)?;
+    if !inflight.is_empty() {
+        bail!(
+            "runtime policy transition 拒绝在飞 attempt: {}",
+            inflight.len()
+        );
+    }
+    let load = crate::scheduler::agent_inflight_load_from_events(events, round)
+        .map_err(anyhow::Error::msg)?;
+    if load.values().any(|items| !items.is_empty()) {
+        bail!("runtime policy transition 拒绝在飞 wake/review capacity occupant");
+    }
+    for wake in events.iter().filter(|event| {
+        event.kind == "WakeIssued"
+            && event.actor == "runtime:orch"
+            && event.round.as_deref() == Some(round)
+            && event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("controlWakeId"))
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+    }) {
+        let wake_id = wake
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("wakeId"))
+            .and_then(serde_json::Value::as_str)
+            .context("managed WakeIssued 缺 wakeId")?;
+        let terminals = events
+            .iter()
+            .filter(|event| {
+                event.kind == "ManagedWakeTerminated"
+                    && event.actor == "runtime:orch"
+                    && event.round.as_deref() == Some(round)
+                    && event
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("wakeId"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(wake_id)
+                    && event
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("managedScopeTerminated"))
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+            })
+            .count();
+        if terminals != 1 {
+            bail!("runtime policy transition 拒绝未终结 managed wake {wake_id}");
+        }
+    }
+    let mut actions = BTreeMap::<(String, String), String>::new();
+    for event in events {
+        let Some(prefix) = ["DispatchWake", "ResumeWake", "ReportCollect"]
+            .into_iter()
+            .find(|prefix| event.kind.starts_with(prefix))
+        else {
+            continue;
+        };
+        let action_id = event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("actionId"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("{} 缺 actionId", event.kind))?;
+        actions.insert(
+            (prefix.to_string(), action_id.to_string()),
+            event.kind.clone(),
+        );
+    }
+    if let Some(((prefix, action), phase)) = actions
+        .iter()
+        .find(|(_, phase)| !phase.ends_with("Released") && !phase.ends_with("Completed"))
+    {
+        bail!(
+            "runtime policy transition 拒绝未释放 durable action: {prefix}:{action} phase={phase}"
+        );
+    }
+    Ok(())
+}
+
+fn latest_policy_event<'a>(
+    events: &'a [EventRecord],
+    policy: &str,
+) -> Result<Option<(&'a EventRecord, RuntimePolicyStateV1)>> {
+    let mut latest = None;
+    for event in events {
+        match ledger::decode_runtime_event_v1(event)? {
+            Some(ledger::RuntimeEventPayloadV1::RuntimePolicyActivated(payload))
+                if payload.policy == policy =>
+            {
+                latest = Some((event, RuntimePolicyStateV1::Active));
+            }
+            Some(ledger::RuntimeEventPayloadV1::RuntimePolicyDeactivated(payload))
+                if payload.policy == policy =>
+            {
+                latest = Some((event, RuntimePolicyStateV1::Dormant));
+            }
+            _ => {}
+        }
+    }
+    Ok(latest)
+}
+
+fn read_working_round_events(root: &Path, round: &str) -> Result<Vec<EventRecord>> {
+    let read = read_ledger(&root.join(format!("coordination/rounds/{round}/events.jsonl")))?;
+    if !read.bad_lines.is_empty() {
+        bail!("runtime policy transition 拒绝坏账本");
+    }
+    Ok(read.events)
+}
+
+fn policy_transition_suffix_event(
+    root: &Path,
+    round: &str,
+    main_sha: &str,
+    working_events: &[EventRecord],
+) -> Result<Option<EventRecord>> {
+    let rel = format!("coordination/rounds/{round}/events.jsonl");
+    let committed = gitx::show_bytes(root, main_sha, &rel)?;
+    let current = fs::read(root.join(&rel))?;
+    if current == committed {
+        return Ok(None);
+    }
+    if !current.starts_with(&committed) || (!committed.is_empty() && !committed.ends_with(b"\n")) {
+        bail!("runtime policy transition working ledger 不是 main ledger 严格扩展");
+    }
+    let committed_events =
+        parse_committed_policy_ledger(&committed, "policy transition main ledger")?;
+    if working_events.len() != committed_events.len() + 1 {
+        bail!("runtime policy transition crash replay 只允许一条 uncommitted policy event");
+    }
+    Ok(working_events.last().cloned())
+}
+
+fn activate_runtime_policy_locked(
+    root: &Path,
+    policy: &str,
+) -> Result<RuntimePolicyTransitionOutcomeV1> {
+    let round = crate::current_round(root)?;
+    let main_sha = gitx::rev_parse(root, "refs/heads/main^{commit}")?;
+    let resolution = resolve_runtime_policy_at(root, &round, policy, &main_sha)?;
+    let mut events = read_working_round_events(root, &round)?;
+    ledger::validate_runtime_event_history_v1_at_root(root, &events, &round)?;
+    let pending_suffix = policy_transition_suffix_event(root, &round, &main_sha, &events)?;
+    if resolution.state == RuntimePolicyStateV1::Active {
+        if pending_suffix.is_some() {
+            bail!("active policy 存在未提交的反向/重复 transition suffix");
+        }
+        let event_id = resolution
+            .activation_event_id
+            .clone()
+            .context("active policy resolution 缺 activationEventId")?;
+        return Ok(RuntimePolicyTransitionOutcomeV1 {
+            policy: policy.to_string(),
+            state: RuntimePolicyStateV1::Active,
+            event_id,
+            commit_sha: main_sha,
+            replayed: true,
+        });
+    }
+    ensure_runtime_policy_transition_idle(&round, &events)?;
+    ledger::append_checked(root, &round, |_| Ok(Vec::new()))?;
+    let owner_recorded = events
+        .iter()
+        .filter(|event| {
+            event.kind == "TaskRecorded"
+                && event.actor == "runtime:orch"
+                && event.round.as_deref() == Some(round.as_str())
+                && event.task_id.as_deref() == Some(resolution.owner_task.as_str())
+                && event.payload.as_ref()
+                    == Some(&serde_json::json!({"postMergeGates": "all-green"}))
+        })
+        .collect::<Vec<_>>();
+    let [owner_recorded] = owner_recorded.as_slice() else {
+        bail!("runtime policy owner task 缺唯一 canonical TaskRecorded");
+    };
+    let owner_merges = events
+        .iter()
+        .filter(|event| {
+            event.kind == "MergeExecuted"
+                && event.actor == "reviewer:orch-runtime"
+                && event.round.as_deref() == Some(round.as_str())
+                && event.task_id.as_deref() == Some(resolution.owner_task.as_str())
+        })
+        .collect::<Vec<_>>();
+    let [owner_merge] = owner_merges.as_slice() else {
+        bail!("runtime policy owner task 缺唯一 canonical MergeExecuted");
+    };
+    let owner_merge_sha = owner_merge
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("mergeSha"))
+        .and_then(serde_json::Value::as_str)
+        .context("owner MergeExecuted 缺 mergeSha")?;
+    if !gitx::is_ancestor(root, owner_merge_sha, &main_sha)? {
+        bail!("runtime policy owner merge 不是 activation main ancestor");
+    }
+    let existing = pending_suffix;
+    let activation = if let Some(event) = existing {
+        let Some(ledger::RuntimeEventPayloadV1::RuntimePolicyActivated(payload)) =
+            ledger::decode_runtime_event_v1(&event)?
+        else {
+            bail!("uncommitted crash replay event 不是 RuntimePolicyActivated");
+        };
+        if payload.policy != policy
+            || payload.owner_task != resolution.owner_task
+            || payload.owner_recorded_event_id != owner_recorded.event_id
+            || payload.owner_merge_sha != owner_merge_sha
+            || payload.binding_sha256 != resolution.binding_sha256
+            || payload.policy_sha256 != resolution.policy_sha256
+            || payload.activated_at_main_sha != main_sha
+        {
+            bail!("uncommitted RuntimePolicyActivated tuple 漂移");
+        }
+        event
+    } else {
+        let event = ledger::runtime_event_v1(
+            &round,
+            None,
+            ledger::RuntimeEventPayloadV1::RuntimePolicyActivated(
+                ledger::RuntimePolicyActivatedPayloadV1 {
+                    schema_version: ledger::RUNTIME_EVENT_SCHEMA_V1,
+                    policy: policy.to_string(),
+                    owner_task: resolution.owner_task.clone(),
+                    owner_recorded_event_id: owner_recorded.event_id.clone(),
+                    owner_merge_sha: owner_merge_sha.to_string(),
+                    binding_sha256: resolution.binding_sha256.clone(),
+                    policy_sha256: resolution.policy_sha256.clone(),
+                    activated_at_main_sha: main_sha.clone(),
+                },
+            ),
+        )?;
+        ledger::append(root, &round, std::slice::from_ref(&event))?;
+        events.push(event.clone());
+        event
+    };
+    let rel = format!("coordination/rounds/{round}/events.jsonl");
+    let commit_sha = ledger::commit_scoped_accounting_paths(
+        root,
+        &round,
+        &[rel],
+        &format!("state({round}): activate runtime policy {policy}"),
+    )?;
+    let committed = resolve_runtime_policy_at(root, &round, policy, &commit_sha)?;
+    if committed.state != RuntimePolicyStateV1::Active
+        || committed.activation_event_id.as_deref() != Some(activation.event_id.as_str())
+    {
+        bail!("runtime policy activation commit readback 未投影 exact Active state");
+    }
+    Ok(RuntimePolicyTransitionOutcomeV1 {
+        policy: policy.to_string(),
+        state: RuntimePolicyStateV1::Active,
+        event_id: activation.event_id,
+        commit_sha,
+        replayed: false,
+    })
+}
+
+/// Activate one dormant signed runtime policy, append its typed event, and
+/// advance main with a ledger-only scoped accounting commit before returning.
+pub fn activate_runtime_policy(
+    root: &Path,
+    policy: &str,
+) -> Result<RuntimePolicyTransitionOutcomeV1> {
+    crate::close::with_protocol_transition(root, "runtime-policy activate", || {
+        activate_runtime_policy_locked(root, policy)
+    })
+}
+
+fn deactivate_runtime_policy_locked(
+    root: &Path,
+    policy: &str,
+    reason: &str,
+) -> Result<RuntimePolicyTransitionOutcomeV1> {
+    if reason.trim().is_empty() || reason.trim() != reason {
+        bail!("runtime-policy deactivate reason 必须非空且无首尾空白");
+    }
+    let round = crate::current_round(root)?;
+    let main_sha = gitx::rev_parse(root, "refs/heads/main^{commit}")?;
+    let resolution = resolve_runtime_policy_at(root, &round, policy, &main_sha)?;
+    let mut events = read_working_round_events(root, &round)?;
+    ledger::validate_runtime_event_history_v1_at_root(root, &events, &round)?;
+    let pending_suffix = policy_transition_suffix_event(root, &round, &main_sha, &events)?;
+    if resolution.state == RuntimePolicyStateV1::Dormant {
+        if pending_suffix.is_some() {
+            bail!("dormant policy 存在未提交的反向/重复 transition suffix");
+        }
+        if let Some((event, RuntimePolicyStateV1::Dormant)) = latest_policy_event(&events, policy)?
+        {
+            return Ok(RuntimePolicyTransitionOutcomeV1 {
+                policy: policy.to_string(),
+                state: RuntimePolicyStateV1::Dormant,
+                event_id: event.event_id.clone(),
+                commit_sha: main_sha,
+                replayed: true,
+            });
+        }
+        bail!("runtime policy 尚未激活，拒绝伪造 deactivation");
+    }
+    ensure_runtime_policy_transition_idle(&round, &events)?;
+    ledger::append_checked(root, &round, |_| Ok(Vec::new()))?;
+    let activation_event_id = resolution
+        .activation_event_id
+        .as_deref()
+        .context("active runtime policy 缺 activationEventId")?;
+    let existing = pending_suffix;
+    let deactivation = if let Some(event) = existing {
+        let Some(ledger::RuntimeEventPayloadV1::RuntimePolicyDeactivated(payload)) =
+            ledger::decode_runtime_event_v1(&event)?
+        else {
+            bail!("uncommitted crash replay event 不是 RuntimePolicyDeactivated");
+        };
+        if payload.policy != policy
+            || payload.activation_event_id != activation_event_id
+            || payload.binding_sha256 != resolution.binding_sha256
+            || payload.policy_sha256 != resolution.policy_sha256
+            || payload.deactivated_at_main_sha != main_sha
+            || payload.reason != reason
+        {
+            bail!("uncommitted RuntimePolicyDeactivated tuple 漂移");
+        }
+        event
+    } else {
+        let event = ledger::runtime_event_v1(
+            &round,
+            None,
+            ledger::RuntimeEventPayloadV1::RuntimePolicyDeactivated(
+                ledger::RuntimePolicyDeactivatedPayloadV1 {
+                    schema_version: ledger::RUNTIME_EVENT_SCHEMA_V1,
+                    policy: policy.to_string(),
+                    activation_event_id: activation_event_id.to_string(),
+                    binding_sha256: resolution.binding_sha256.clone(),
+                    policy_sha256: resolution.policy_sha256.clone(),
+                    deactivated_at_main_sha: main_sha.clone(),
+                    reason: reason.to_string(),
+                },
+            ),
+        )?;
+        ledger::append(root, &round, std::slice::from_ref(&event))?;
+        events.push(event.clone());
+        event
+    };
+    let rel = format!("coordination/rounds/{round}/events.jsonl");
+    let commit_sha = ledger::commit_scoped_accounting_paths(
+        root,
+        &round,
+        &[rel],
+        &format!("state({round}): deactivate runtime policy {policy}"),
+    )?;
+    let committed = resolve_runtime_policy_at(root, &round, policy, &commit_sha)?;
+    if committed.state != RuntimePolicyStateV1::Dormant {
+        bail!("runtime policy deactivation commit readback 未投影 Dormant state");
+    }
+    Ok(RuntimePolicyTransitionOutcomeV1 {
+        policy: policy.to_string(),
+        state: RuntimePolicyStateV1::Dormant,
+        event_id: deactivation.event_id,
+        commit_sha,
+        replayed: false,
+    })
+}
+
+/// Deactivate one active policy with a non-blank audit reason and commit the
+/// typed transition before any later task can capture a dispatch base.
+pub fn deactivate_runtime_policy(
+    root: &Path,
+    policy: &str,
+    reason: &str,
+) -> Result<RuntimePolicyTransitionOutcomeV1> {
+    crate::close::with_protocol_transition(root, "runtime-policy deactivate", || {
+        deactivate_runtime_policy_locked(root, policy, reason)
+    })
+}
+
+#[derive(Clone, Copy)]
+enum TaskLoadPurpose {
+    AuthorizedPlan,
+    ReadonlyReplay,
+}
+
+fn load_task_inputs(root: &Path, round: &str, purpose: TaskLoadPurpose) -> Result<LoadedTasks> {
     let task_ids = task_ids(root, round)?;
     let mut tasks = Vec::with_capacity(task_ids.len());
     let mut crosscheck_errors = Vec::new();
@@ -2421,6 +3688,13 @@ fn load_task_inputs(root: &Path, round: &str) -> Result<LoadedTasks> {
     let mut capabilities_by_task: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut depends_on_by_task: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut complexity_by_task: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut review_fallbacks_by_task: BTreeMap<String, Vec<card::ReviewFallback>> = BTreeMap::new();
+    let mut nongate_seats_by_task: BTreeMap<String, Vec<card::NongateSeat>> = BTreeMap::new();
+    let mut review_quorum_by_task: BTreeMap<String, Option<card::ReviewQuorumPolicy>> =
+        BTreeMap::new();
+    let mut landed_supersession_targets_by_task: BTreeMap<String, BTreeSet<String>> =
+        BTreeMap::new();
+    let mut exact_seed_targets_by_task: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for task_id in task_ids {
         let card_rel = format!("coordination/rounds/{round}/tasks/{task_id}.md");
         let card_bytes = source_file_bytes(root, &card_rel, "task card source")?;
@@ -2472,10 +3746,19 @@ fn load_task_inputs(root: &Path, round: &str) -> Result<LoadedTasks> {
             }
         }
         // Planning is an authorization boundary too: an unsafe target must not
-        // be allowed to produce either ROUND-IR or TaskValidated.  Reuse the
-        // same containment contract as seed relocation before any plan write.
+        // be allowed to produce either ROUND-IR or TaskValidated. Authorized
+        // planning performs ref-free validation here and the shared exact-main
+        // writeSet census after every card is loaded; readonly replay retains
+        // the legacy seed-path contract without that census.
         if !task_crosscheck_failed {
-            crate::oracle::validate_seed_paths(root, &loaded)?;
+            match purpose {
+                TaskLoadPurpose::AuthorizedPlan => {
+                    crate::oracle::validate_seed_paths_for_authorized_plan(root, &loaded)?
+                }
+                TaskLoadPurpose::ReadonlyReplay => {
+                    crate::oracle::validate_seed_paths(root, &loaded)?
+                }
+            }
         }
         // B141: complexity must parse into the closed enum, the whole-round
         // dependsOn graph must be acyclic and reference only round members,
@@ -2546,6 +3829,16 @@ fn load_task_inputs(root: &Path, round: &str) -> Result<LoadedTasks> {
         }
         let depends_on = loaded.meta.depends_on.clone();
         let complexity = loaded.meta.complexity.clone();
+        let review_fallbacks = loaded.meta.review_fallbacks.clone();
+        let nongate_seats = loaded.meta.nongate_seats.clone();
+        let review_quorum = loaded.meta.review_quorum.clone();
+        let landed_supersession_targets = loaded
+            .meta
+            .frozen_contract_supersessions
+            .iter()
+            .map(|declaration| declaration.target.clone())
+            .collect::<BTreeSet<_>>();
+        let exact_seed_targets = seed_targets.iter().cloned().collect::<BTreeSet<_>>();
         tasks.push(TaskInput {
             id: loaded.meta.task_id,
             agent: loaded.meta.agent.unwrap_or_default(),
@@ -2565,6 +3858,20 @@ fn load_task_inputs(root: &Path, round: &str) -> Result<LoadedTasks> {
         // LoadedTasks 侧车携带，编译后由 apply_card_metadata_overlay 覆写进 IR。
         depends_on_by_task.insert(tasks.last().expect("just pushed").id.clone(), depends_on);
         complexity_by_task.insert(tasks.last().expect("just pushed").id.clone(), complexity);
+        review_fallbacks_by_task.insert(
+            tasks.last().expect("just pushed").id.clone(),
+            review_fallbacks,
+        );
+        nongate_seats_by_task.insert(tasks.last().expect("just pushed").id.clone(), nongate_seats);
+        review_quorum_by_task.insert(tasks.last().expect("just pushed").id.clone(), review_quorum);
+        landed_supersession_targets_by_task.insert(
+            tasks.last().expect("just pushed").id.clone(),
+            landed_supersession_targets,
+        );
+        exact_seed_targets_by_task.insert(
+            tasks.last().expect("just pushed").id.clone(),
+            exact_seed_targets,
+        );
     }
     // B154 · H20：全轮任务两两配对——同写一个 IR 结构文件且无显式 dependsOn
     // 边（任一方向）即 plan 整体拒绝。runs after every card is loaded so the
@@ -2587,6 +3894,11 @@ fn load_task_inputs(root: &Path, round: &str) -> Result<LoadedTasks> {
         capabilities_by_task,
         depends_on_by_task,
         complexity_by_task,
+        review_fallbacks_by_task,
+        nongate_seats_by_task,
+        review_quorum_by_task,
+        landed_supersession_targets_by_task,
+        exact_seed_targets_by_task,
     })
 }
 
@@ -2601,6 +3913,59 @@ struct LoadedTasks {
     capabilities_by_task: BTreeMap<String, Vec<String>>,
     depends_on_by_task: BTreeMap<String, Vec<String>>,
     complexity_by_task: BTreeMap<String, Option<String>>,
+    review_fallbacks_by_task: BTreeMap<String, Vec<card::ReviewFallback>>,
+    nongate_seats_by_task: BTreeMap<String, Vec<card::NongateSeat>>,
+    review_quorum_by_task: BTreeMap<String, Option<card::ReviewQuorumPolicy>>,
+    landed_supersession_targets_by_task: BTreeMap<String, BTreeSet<String>>,
+    exact_seed_targets_by_task: BTreeMap<String, BTreeSet<String>>,
+}
+
+fn collect_landed_write_set_conflicts_for_plan(
+    root: &Path,
+    main_oid: &str,
+    loaded: &LoadedTasks,
+) -> Result<()> {
+    let mut conflicts = Vec::new();
+    for task in &loaded.tasks {
+        let superseded_targets = loaded
+            .landed_supersession_targets_by_task
+            .get(&task.id)
+            .with_context(|| format!("task {} 缺 supersession target sidecar", task.id))?;
+        let seed_targets = loaded
+            .exact_seed_targets_by_task
+            .get(&task.id)
+            .with_context(|| format!("task {} 缺 exact seed target sidecar", task.id))?;
+        let task_conflicts = crate::oracle::collect_landed_write_set_conflicts(
+            root,
+            main_oid,
+            &task.write_set,
+            superseded_targets,
+        )
+        .with_context(|| format!("task {} landed writeSet census 失败", task.id))?;
+        let task_conflicts = crate::oracle::remove_exact_own_landed_seed_replays(
+            root,
+            main_oid,
+            &task.id,
+            seed_targets,
+            task_conflicts,
+        )
+        .with_context(|| format!("task {} own-seed replay census 失败", task.id))?;
+        for target in task_conflicts {
+            conflicts.push((task.id.clone(), target));
+        }
+    }
+    conflicts.sort();
+    conflicts.dedup();
+    if !conflicts.is_empty() {
+        let errors = conflicts
+            .into_iter()
+            .map(|(task_id, target)| {
+                format!("task {task_id}: writeSet 命中 landed frozen target: {target}")
+            })
+            .collect::<Vec<_>>();
+        bail!("plan crosscheck 违规清单:\n- {}", errors.join("\n- "));
+    }
+    Ok(())
 }
 
 /// B147：把卡面 B141 元数据（dependsOn 显式边 + requirement{complexity,
@@ -2619,6 +3984,21 @@ fn apply_card_metadata_overlay(ir: &mut RoundIr, loaded: &LoadedTasks) {
                 .cloned()
                 .unwrap_or_default(),
         };
+        task.review_fallbacks = loaded
+            .review_fallbacks_by_task
+            .get(&task.id)
+            .cloned()
+            .unwrap_or_default();
+        task.nongate_seats = loaded
+            .nongate_seats_by_task
+            .get(&task.id)
+            .cloned()
+            .unwrap_or_default();
+        task.review_quorum = loaded
+            .review_quorum_by_task
+            .get(&task.id)
+            .cloned()
+            .flatten();
     }
 }
 
@@ -2648,6 +4028,166 @@ fn validate_card_capability_subset(
             .unwrap_or(&[]);
         capability_supported(required, roles)
             .map_err(|error| anyhow::anyhow!("task {}: {error}", task.id))?;
+    }
+    Ok(())
+}
+
+/// Validate the signed review-extension surface after card metadata has been
+/// overlaid onto the compiled IR. Historical tasks with no extension fields
+/// remain in strict two-formal-seat mode and bypass this validator unchanged.
+fn validate_review_contract_extensions(ir: &RoundIr) -> Result<()> {
+    for task in &ir.tasks {
+        let has_fallback = !task.review_fallbacks.is_empty();
+        let has_extension =
+            has_fallback || !task.nongate_seats.is_empty() || task.review_quorum.is_some();
+        if !has_extension {
+            continue;
+        }
+        if ir.source_bindings.harness_registry_digest.is_empty() {
+            bail!(
+                "task {} review fallback/quorum 要求 sourceBindings.harnessRegistryDigest",
+                task.id
+            );
+        }
+        let policy = task.review_quorum.as_ref().with_context(|| {
+            format!(
+                "task {} fallbackAgent/nongateSeats 必须与显式 reviewQuorum 同时签入",
+                task.id
+            )
+        })?;
+        if task.nongate_seats.is_empty() {
+            bail!("task {} reviewQuorum 要求非空 nongateSeats", task.id);
+        }
+        if policy.minimum_substantive < 2 {
+            bail!(
+                "task {} reviewQuorum.minimumSubstantive 必须至少为 2",
+                task.id
+            );
+        }
+        if !policy.nongate_may_substitute_failed_formal {
+            bail!(
+                "task {} r79 closed reviewQuorum 不接受关闭 nongate substitution",
+                task.id
+            );
+        }
+        if policy.minimum_nongate_pass_for_substitution == 0
+            || policy.minimum_nongate_pass_for_substitution > task.nongate_seats.len()
+        {
+            bail!(
+                "task {} minimumNongatePassForSubstitution 超出显式 nongateSeats 可达范围",
+                task.id
+            );
+        }
+        let maximum_voices = task.required_reviews.len() + task.nongate_seats.len();
+        if policy.minimum_substantive > maximum_voices {
+            bail!(
+                "task {} minimumSubstantive={} 超过可达 unique voices={maximum_voices}",
+                task.id,
+                policy.minimum_substantive
+            );
+        }
+
+        let mut occupied = BTreeSet::new();
+        occupied.insert(task.agent.as_str());
+        for review in &task.required_reviews {
+            occupied.insert(review.agent.as_str());
+        }
+        let formal_by_role = task
+            .required_reviews
+            .iter()
+            .map(|review| (review.role.as_str(), review))
+            .collect::<BTreeMap<_, _>>();
+        let mut fallback_roles = BTreeSet::new();
+        for fallback in &task.review_fallbacks {
+            if !safe_identity_component(&fallback.role)
+                || !safe_identity_component(&fallback.fallback_agent)
+                || !fallback_roles.insert(fallback.role.as_str())
+            {
+                bail!(
+                    "task {} reviewFallbacks role/fallbackAgent 非法或重复: {}/{}",
+                    task.id,
+                    fallback.role,
+                    fallback.fallback_agent
+                );
+            }
+            let review = formal_by_role
+                .get(fallback.role.as_str())
+                .with_context(|| {
+                    format!(
+                        "task {} reviewFallbacks role 未匹配 requiredReviews: {}",
+                        task.id, fallback.role
+                    )
+                })?;
+            let fallback = fallback.fallback_agent.as_str();
+            if !occupied.insert(fallback) {
+                bail!(
+                    "task {} fallbackAgent 重复或与 implementer/formal 重叠: {fallback}",
+                    task.id
+                );
+            }
+            let required_capability = format!("{}-review", review.role);
+            let capacity = ir.scheduling.capacities.get(fallback).with_context(|| {
+                format!(
+                    "task {} fallbackAgent {fallback} 未获 scheduling 授权",
+                    task.id
+                )
+            })?;
+            if !ir
+                .scheduling
+                .allowed_agents
+                .iter()
+                .any(|agent| agent == fallback)
+                || !capacity
+                    .roles
+                    .iter()
+                    .any(|role| role == &required_capability)
+            {
+                bail!(
+                    "task {} fallbackAgent {fallback} 缺 {required_capability} capability",
+                    task.id
+                );
+            }
+        }
+        let mut nongate_agents = BTreeSet::new();
+        for seat in &task.nongate_seats {
+            if seat.agent == "executor-dsh" && seat.preset != "minimal" {
+                bail!(
+                    "task {} executor-dsh nongate preset 必须逐字为 minimal",
+                    task.id
+                );
+            }
+            if !safe_identity_component(&seat.agent)
+                || !safe_identity_component(&seat.preset)
+                || !nongate_agents.insert(seat.agent.as_str())
+                || occupied.contains(seat.agent.as_str())
+            {
+                bail!(
+                    "task {} nongateSeats agent/preset 非法、重复或与其它声音重叠: {}/{}",
+                    task.id,
+                    seat.agent,
+                    seat.preset
+                );
+            }
+            let capacity = ir.scheduling.capacities.get(&seat.agent).with_context(|| {
+                format!(
+                    "task {} nongate reviewer {} 未获 scheduling 授权",
+                    task.id, seat.agent
+                )
+            })?;
+            if !ir
+                .scheduling
+                .allowed_agents
+                .iter()
+                .any(|agent| agent == &seat.agent)
+                || !capacity.roles.iter().any(|role| role == "nongate-review")
+            {
+                bail!(
+                    "task {} nongate reviewer {} 缺 nongate-review capability",
+                    task.id,
+                    seat.agent
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -2697,7 +4237,36 @@ fn compare_candidate_with_persisted(
         mode_binding,
         &BTreeSet::new(),
         None,
+        None,
     )
+}
+
+fn agent_pin_amendments_for_validation(
+    events: &[EventRecord],
+    round: &str,
+    revision: u32,
+    persisted_digest: &str,
+) -> Result<Vec<crate::registry::AgentPinAmendment>> {
+    let signoff_position =
+        matching_user_plan_signoff_position(events, round, revision, persisted_digest)?;
+    let mut amendments = Vec::new();
+    for (position, event) in events.iter().enumerate().filter(|(_, event)| {
+        event.kind == crate::registry::AGENT_PIN_AMENDED_EVENT_KIND
+            && event.round.as_deref() == Some(round)
+    }) {
+        let amendment = crate::registry::decode_agent_pin_amendment_event(event, round)?;
+        if amendment.ir_revision() != revision {
+            continue;
+        }
+        let Some(signoff_position) = signoff_position else {
+            bail!("AgentPinAmended 存在于尚未 PlanSignedOff 的 IR revision={revision}");
+        };
+        if position <= signoff_position {
+            bail!("AgentPinAmended 必须晚于其绑定的 PlanSignedOff");
+        }
+        amendments.push(amendment);
+    }
+    Ok(amendments)
 }
 
 fn compare_candidate_with_persisted_for_dispatch(
@@ -2710,10 +4279,14 @@ fn compare_candidate_with_persisted_for_dispatch(
     mode_binding: Option<(&str, &str)>,
     dispatched_tasks: &BTreeSet<String>,
     registry_root: Option<&Path>,
+    registry_events: Option<&[EventRecord]>,
 ) -> Result<ReadonlyIrValidation> {
     let persisted = parse_signed_round_ir(persisted_yaml).map_err(anyhow::Error::msg)?;
+    let persisted_digest = validation_digest(&persisted);
     let mut candidate =
         compile_ir_with_dispatched(round, mode_yaml, binding_yaml, tasks, dispatched_tasks)?;
+    let mut registry_digest_matches = true;
+    let mut harness_registry_digest_matches = true;
     if let Some(root) = registry_root {
         // Registry projection is deliberately non-retroactive. A persisted IR
         // without the digest predates this binding and must remain replayable;
@@ -2722,6 +4295,34 @@ fn compare_candidate_with_persisted_for_dispatch(
         // exact registry bytes and derived scheduling domains.
         if !persisted.source_bindings.agent_registry_digest.is_empty() {
             bind_agent_registry_projection(root, &mut candidate)?;
+            let amendments = match registry_events {
+                Some(events) => agent_pin_amendments_for_validation(
+                    events,
+                    round,
+                    persisted.revision,
+                    &persisted_digest,
+                )?,
+                None => Vec::new(),
+            };
+            let expected = expected_registry_digest_with_amendments(
+                &persisted.source_bindings.agent_registry_digest,
+                &amendments,
+            )?;
+            registry_digest_matches = candidate.source_bindings.agent_registry_digest == expected;
+            // The durable delta chain proves that current registry bytes are a
+            // permitted successor of the signed genesis.  Normalize only the
+            // ephemeral contract view back to that genesis so the user's
+            // original (revision, validationDigest) sign-off stays bound; all
+            // other candidate fields continue to compare byte-for-byte.
+            candidate.source_bindings.agent_registry_digest =
+                persisted.source_bindings.agent_registry_digest.clone();
+        }
+        if !persisted.source_bindings.harness_registry_digest.is_empty() {
+            bind_harness_registry_projection(root, &mut candidate)?;
+            harness_registry_digest_matches = candidate.source_bindings.harness_registry_digest
+                == persisted.source_bindings.harness_registry_digest;
+            candidate.source_bindings.harness_registry_digest =
+                persisted.source_bindings.harness_registry_digest.clone();
         }
     }
     if let Some((mode_ref, mode_path)) = mode_binding {
@@ -2729,10 +4330,12 @@ fn compare_candidate_with_persisted_for_dispatch(
     }
     validate_card_capability_subset(&candidate, &loaded.capabilities_by_task, dispatched_tasks)?;
     apply_card_metadata_overlay(&mut candidate, loaded);
+    validate_review_contract_extensions(&candidate)?;
     candidate.schema_version = persisted.schema_version;
     candidate.revision = persisted.revision;
-    let persisted_digest = validation_digest(&persisted);
-    let digest_matches = validation_digest(&candidate) == persisted_digest;
+    let digest_matches = registry_digest_matches
+        && harness_registry_digest_matches
+        && validation_digest(&candidate) == persisted_digest;
     // `verify.rs` is frozen in B156 and its expected-main byte-integrity
     // check consumes this readonly candidate field as a raw blob digest.
     // Persisted ROUND-IR keeps the canonical contract-projection hash; expose
@@ -2749,6 +4352,10 @@ fn compare_candidate_with_persisted_for_dispatch(
 
 /// 从当前 mode/binding/cards 只读重编译 candidate IR，并以 persisted revision 归一化后
 /// 比较语义 digest。不会调用 run_plan，也不会写 ROUND-IR、账本或工作区探针。
+///
+/// Readonly replay retains the historical seed-path validation contract but
+/// deliberately does not rerun authorized-plan landed write-set admission
+/// against a later, movable `main`.
 pub fn validate_round_ir_readonly(root: &Path, round: &str) -> Result<ReadonlyIrValidation> {
     let selected = selected_mode_path(root, round)?;
     let mode_path = selected.path;
@@ -2759,7 +4366,7 @@ pub fn validate_round_ir_readonly(root: &Path, round: &str) -> Result<ReadonlyIr
         source_file_bytes(root, "coordination/PROJECT-BINDING.yaml", "PROJECT-BINDING")?;
     let binding_yaml =
         std::str::from_utf8(&binding_bytes).context("PROJECT-BINDING 必须为 UTF-8")?;
-    let loaded = load_task_inputs(root, round)?;
+    let loaded = load_task_inputs(root, round, TaskLoadPurpose::ReadonlyReplay)?;
     let ledger_path = root.join(format!("coordination/rounds/{round}/events.jsonl"));
     let ledger_read = match read_ledger(&ledger_path) {
         Ok(read) => read,
@@ -2790,6 +4397,7 @@ pub fn validate_round_ir_readonly(root: &Path, round: &str) -> Result<ReadonlyIr
         mode_binding,
         &dispatched_tasks,
         Some(root),
+        Some(&ledger_read.events),
     )
 }
 
@@ -2900,6 +4508,15 @@ pub fn run_plan(root: &Path) -> Result<PlanOutcome> {
     crate::close::with_protocol_transition(root, "orch plan", || run_plan_locked(root))
 }
 
+fn plan_root_owns_git_toplevel(root: &Path) -> Result<bool> {
+    let canonical_root = fs::canonicalize(root)
+        .with_context(|| format!("解析 plan repository root 失败: {}", root.display()))?;
+    let git_toplevel = gitx::rev_parse(root, "--show-toplevel")?;
+    let canonical_toplevel = fs::canonicalize(&git_toplevel)
+        .with_context(|| format!("解析 plan Git toplevel 失败: {git_toplevel}"))?;
+    Ok(canonical_root == canonical_toplevel)
+}
+
 fn run_plan_locked(root: &Path) -> Result<PlanOutcome> {
     let round = crate::current_round(root)?;
     let selected = selected_mode_path(root, &round)?;
@@ -2911,8 +4528,14 @@ fn run_plan_locked(root: &Path) -> Result<PlanOutcome> {
         source_file_bytes(root, "coordination/PROJECT-BINDING.yaml", "PROJECT-BINDING")?;
     let binding_yaml =
         std::str::from_utf8(&binding_bytes).context("PROJECT-BINDING 必须为 UTF-8")?;
+    let admission_binding = binding::parse_binding_bytes(&binding_bytes)
+        .map_err(anyhow::Error::msg)
+        .context("解析 PROJECT-BINDING admission floor 失败")?;
+    binding::validate_rust_gate_floors_at_root(root, &admission_binding).map_err(|errors| {
+        anyhow::anyhow!("Rust 门参数 floor 校验失败:\n- {}", errors.join("\n- "))
+    })?;
 
-    let loaded = load_task_inputs(root, &round)?;
+    let loaded = load_task_inputs(root, &round, TaskLoadPurpose::AuthorizedPlan)?;
     let tasks = &loaded.tasks;
 
     let mode: ModeConfig = serde_yaml::from_str(&mode_yaml).context("解析 ModeConfig 失败")?;
@@ -2920,6 +4543,16 @@ fn run_plan_locked(root: &Path) -> Result<PlanOutcome> {
         serde_yaml::from_str(&binding_yaml).context("解析 PROJECT-BINDING 失败")?;
     if has_tier_f(&mode) {
         check_tier_f_workspace(root, &binding.workspace.worktree_root)?;
+    }
+
+    // Capture the authorization snapshot once, after all HEAD-dependent card
+    // reachability checks and before any ROUND-IR/TaskValidated publication.
+    // Every card is classified against this same immutable object id; all
+    // downstream landed helpers are forbidden from resolving movable refs.
+    if plan_root_owns_git_toplevel(root)? {
+        let main_oid = gitx::rev_parse(root, "refs/heads/main^{commit}")
+            .context("捕获 plan landed-admission main OID 失败")?;
+        collect_landed_write_set_conflicts_for_plan(root, &main_oid, &loaded)?;
     }
 
     let ledger_path = root.join(format!("coordination/rounds/{round}/events.jsonl"));
@@ -2946,12 +4579,14 @@ fn run_plan_locked(root: &Path) -> Result<PlanOutcome> {
     // signed contract. This happens before any IR bytes or validation events
     // are published, so an invalid registry/config combination fails closed.
     bind_agent_registry_projection(root, &mut ir)?;
+    bind_harness_registry_projection(root, &mut ir)?;
     // Planning upgrades the legacy one-mode layout to an explicit binding.
     // Readonly validation preserves old unbound IRs until that deliberate
     // replan, so archived/signed rounds remain replayable.
     bind_mode_source(&mut ir, &selected.mode_ref, &mode_rel);
     validate_card_capability_subset(&ir, &loaded.capabilities_by_task, &dispatched_tasks)?;
     apply_card_metadata_overlay(&mut ir, &loaded);
+    validate_review_contract_extensions(&ir)?;
     let ir_path = root.join(format!("coordination/rounds/{round}/ROUND-IR.yaml"));
     let ir_rel = ir_path.strip_prefix(root)?.to_string_lossy().to_string();
     let existing = match fs::symlink_metadata(&ir_path) {
@@ -3077,6 +4712,16 @@ fn run_plan_locked(root: &Path) -> Result<PlanOutcome> {
 fn bind_mode_source(ir: &mut RoundIr, mode_ref: &str, mode_path: &str) {
     ir.mode_ref = mode_ref.to_string();
     ir.source_bindings.mode_path = mode_path.to_string();
+}
+
+fn bind_harness_registry_projection(root: &Path, ir: &mut RoundIr) -> Result<()> {
+    let registry = root.join("coordination/harnesses.yaml");
+    if !registry.is_file() {
+        ir.source_bindings.harness_registry_digest.clear();
+        return Ok(());
+    }
+    ir.source_bindings.harness_registry_digest = crate::harness::registry_digest(root)?;
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -3414,6 +5059,84 @@ verification: {independentVerifier: required-for-write}
         input.has_seeds = false;
         let error = compile_ir("r1", MODE, BINDING, &[input]).unwrap_err();
         assert!(error.to_string().contains("seed"));
+    }
+
+    #[test]
+    fn r78_revision_five_digest_is_stable_when_review_extensions_are_absent() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("orch-host manifest has repository ancestors");
+        let bytes = fs::read(repository.join("coordination/rounds/r78/ROUND-IR.yaml"))
+            .expect("r78 revision-five IR is a committed compatibility fixture");
+        let ir: RoundIr = serde_yaml::from_slice(&bytes).expect("historical IR still parses");
+        assert_eq!(ir.revision, 5);
+        assert!(ir.tasks.iter().all(|task| task.review_fallbacks.is_empty()
+            && task.review_quorum.is_none()
+            && task.nongate_seats.is_empty()));
+        assert!(ir.source_bindings.harness_registry_digest.is_empty());
+        assert_eq!(
+            validation_digest(&ir),
+            "be0b602de73cc196b7cb0b4e3f28447331c83bc1948f7736b98604129434a8e4"
+        );
+    }
+
+    #[test]
+    fn review_extensions_are_explicit_reachable_and_closed() {
+        let mut ir = compile_ir("r79", MODE, BINDING, &[task()]).unwrap();
+        ir.source_bindings.harness_registry_digest = "a".repeat(64);
+        ir.scheduling
+            .capacities
+            .get_mut("executor-opencode")
+            .unwrap()
+            .roles
+            .push("primary-review".to_string());
+        ir.scheduling
+            .allowed_agents
+            .push("executor-dsh".to_string());
+        ir.scheduling.capacities.insert(
+            "executor-dsh".to_string(),
+            IrCapacity {
+                agent: 1,
+                quota: 1,
+                roles: vec!["nongate-review".to_string()],
+            },
+        );
+        let task = &mut ir.tasks[0];
+        task.review_fallbacks = vec![card::ReviewFallback {
+            role: "primary".to_string(),
+            fallback_agent: "executor-opencode".to_string(),
+        }];
+        task.nongate_seats = vec![card::NongateSeat {
+            agent: "executor-dsh".to_string(),
+            preset: "minimal".to_string(),
+        }];
+        task.review_quorum = Some(card::ReviewQuorumPolicy {
+            minimum_substantive: 2,
+            nongate_may_substitute_failed_formal: true,
+            minimum_nongate_pass_for_substitution: 1,
+        });
+        validate_review_contract_extensions(&ir).unwrap();
+
+        let mut too_small =
+            serde_yaml::from_str::<RoundIr>(&serde_yaml::to_string(&ir).unwrap()).unwrap();
+        too_small.tasks[0]
+            .review_quorum
+            .as_mut()
+            .unwrap()
+            .minimum_substantive = 1;
+        assert!(validate_review_contract_extensions(&too_small).is_err());
+
+        let mut overlap =
+            serde_yaml::from_str::<RoundIr>(&serde_yaml::to_string(&ir).unwrap()).unwrap();
+        overlap.tasks[0].nongate_seats[0].agent = "executor-opencode".to_string();
+        assert!(validate_review_contract_extensions(&overlap).is_err());
+
+        let mut unsigned =
+            serde_yaml::from_str::<RoundIr>(&serde_yaml::to_string(&ir).unwrap()).unwrap();
+        unsigned.tasks[0].review_quorum = None;
+        assert!(validate_review_contract_extensions(&unsigned).is_err());
     }
 
     #[test]
@@ -3857,13 +5580,155 @@ git: {pushPolicy: forbidden, mergePolicy: ff-only-else-no-ff}
     /// B147：构造空元数据的 LoadedTasks 侧车（digest 语义与 compile 直出等价）。
     fn empty_loaded(tasks: Vec<TaskInput>) -> LoadedTasks {
         let task_order = tasks.iter().map(|task| task.id.clone()).collect();
+        let empty_targets = tasks
+            .iter()
+            .map(|task| (task.id.clone(), BTreeSet::new()))
+            .collect::<BTreeMap<_, _>>();
         LoadedTasks {
             tasks,
             task_order,
             capabilities_by_task: BTreeMap::new(),
             depends_on_by_task: BTreeMap::new(),
             complexity_by_task: BTreeMap::new(),
+            review_fallbacks_by_task: BTreeMap::new(),
+            nongate_seats_by_task: BTreeMap::new(),
+            review_quorum_by_task: BTreeMap::new(),
+            landed_supersession_targets_by_task: empty_targets.clone(),
+            exact_seed_targets_by_task: empty_targets,
         }
+    }
+
+    #[test]
+    fn production_plan_captures_one_main_oid_before_landed_census() {
+        let source = include_str!("plan.rs");
+        let production = source
+            .split_once("fn run_plan_locked(")
+            .unwrap()
+            .1
+            .split_once("fn bind_mode_source(")
+            .unwrap()
+            .0;
+        assert_eq!(
+            production.matches("refs/heads/main^{commit}").count(),
+            1,
+            "authorized plan must resolve the movable main ref exactly once"
+        );
+        let captured = production
+            .find("let main_oid = gitx::rev_parse")
+            .expect("production plan must capture the exact main OID");
+        let census = production
+            .find("collect_landed_write_set_conflicts_for_plan(root, &main_oid")
+            .expect("production plan must pass that exact OID to the landed census");
+        assert!(captured < census);
+        assert!(
+            !production[census..].contains("refs/heads/main")
+                && !production[census..].contains("\"HEAD\""),
+            "the plan must not re-resolve main/HEAD after classification starts"
+        );
+    }
+
+    #[test]
+    fn landed_crosscheck_reports_every_task_target_in_tuple_order() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("orch-host manifest must have the outer repository root");
+        let main_oid = gitx::rev_parse(root, "refs/heads/main^{commit}").unwrap();
+        let mut later = task();
+        later.id = "T2".to_string();
+        later.write_set = vec![
+            "orch/crates/orch-host/tests/plan_compile.rs".to_string(),
+            "orch/crates/orch-core/tests/review_event_projection.rs".to_string(),
+        ];
+        let mut earlier = task();
+        earlier.id = "T1".to_string();
+        earlier.write_set = vec!["orch/crates/orch-host/tests/**".to_string()];
+        let loaded = empty_loaded(vec![later, earlier]);
+        let error = collect_landed_write_set_conflicts_for_plan(root, &main_oid, &loaded)
+            .unwrap_err()
+            .to_string();
+        let first = error.find("task T1:").expect("T1 conflict missing");
+        let second = error.find("task T2:").expect("T2 conflict missing");
+        assert!(first < second, "{error}");
+        for target in [
+            "orch/crates/orch-core/tests/review_event_projection.rs",
+            "orch/crates/orch-host/tests/plan_compile.rs",
+        ] {
+            assert!(error.contains(target), "{error}");
+        }
+    }
+
+    #[test]
+    fn recorded_task_may_replay_only_its_own_exact_seed_target() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("orch-host manifest must have the outer repository root");
+        let main_oid = gitx::rev_parse(root, "refs/heads/main^{commit}").unwrap();
+        let target = "orch/crates/orch-host/tests/reassignment_recovery_contract.rs";
+
+        let mut own = task();
+        own.id = "B309".to_string();
+        own.write_set = vec![target.to_string()];
+        let mut own_loaded = empty_loaded(vec![own]);
+        own_loaded
+            .exact_seed_targets_by_task
+            .insert("B309".to_string(), BTreeSet::from([target.to_string()]));
+        collect_landed_write_set_conflicts_for_plan(root, &main_oid, &own_loaded)
+            .expect("a recorded task's byte-identical own seed is replay, not new authority");
+
+        let mut foreign = task();
+        foreign.id = "B308".to_string();
+        foreign.write_set = vec![target.to_string()];
+        let mut foreign_loaded = empty_loaded(vec![foreign]);
+        foreign_loaded
+            .exact_seed_targets_by_task
+            .insert("B308".to_string(), BTreeSet::from([target.to_string()]));
+        let error = collect_landed_write_set_conflicts_for_plan(root, &main_oid, &foreign_loaded)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("B308") && error.contains(target), "{error}");
+    }
+
+    #[test]
+    fn production_plan_aggregates_locked_and_all_targets_floors() {
+        let module = "orch/crates/orch-host/src/fresh.rs";
+        let root = b170_module_site(
+            "rust-floor",
+            "B170F",
+            &[module],
+            &["coordination/**"],
+            &[module],
+            "pub mod fresh;\npub mod plan;\n",
+            &[],
+            &[],
+        );
+        fs::write(root.join("orch/Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(
+            root.join("coordination/PROJECT-BINDING.yaml"),
+            "project: {ecosystems: [rust]}\n\
+             commands:\n\
+               testFast: {argv: [cargo, test, --workspace]}\n\
+               check: {argv: [cargo, check, --workspace]}\n\
+             scope: {protectedPaths: [\"coordination/**\"]}\n\
+             git: {pushPolicy: forbidden}\n\
+             verification: {independentVerifier: required-for-write}\n",
+        )
+        .unwrap();
+        let error = run_plan_locked(&root).unwrap_err().to_string();
+        assert!(
+            error.contains("check") && error.contains("--locked"),
+            "{error}"
+        );
+        assert!(
+            error.contains("check") && error.contains("--all-targets"),
+            "{error}"
+        );
+        assert!(
+            !root.join("coordination/rounds/r57/ROUND-IR.yaml").exists(),
+            "gate floor refusal must precede ROUND-IR persistence"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

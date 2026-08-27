@@ -2,13 +2,21 @@
 //!
 //! The launched binary is the exact executable Cargo built for this integration
 //! target, including when `CARGO_TARGET_DIR` isolates the build.
+//!
+//! B287 keeps the stale-command classification checks independent from the
+//! repository's live round state. An unusable round must still reject
+//! `snapshot`, but that product-level rejection is distinct from the stale
+//! binary guard allowing the read-only command to reach round validation.
 
+mod stale_snapshot_local_fixture_support;
 mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use stale_snapshot_local_fixture_support::prepare_local_valid_materialized_round;
 
 struct StaleRepo {
     root: PathBuf,
@@ -67,6 +75,33 @@ fn git_stdout(root: &Path, args: &[&str]) -> String {
         .expect("git stdout 非 UTF-8")
         .trim()
         .to_owned()
+}
+
+fn commit_tracked_scratch_state(repo: &mut StaleRepo, message: &str) {
+    git_ok(&repo.root, &["add", "-u"]);
+    let tree = git_stdout(&repo.root, &["write-tree"]);
+    let commit = support::fixture_git_command(&repo.root)
+        .args(["commit-tree", &tree, "-p", &repo.main_sha, "-m", message])
+        .env("GIT_AUTHOR_NAME", "B287 Test")
+        .env("GIT_AUTHOR_EMAIL", "b287@example.invalid")
+        .env("GIT_COMMITTER_NAME", "B287 Test")
+        .env("GIT_COMMITTER_EMAIL", "b287@example.invalid")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("启动 scratch git commit-tree 失败");
+    assert!(
+        commit.status.success(),
+        "scratch git commit-tree 失败: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    repo.main_sha = String::from_utf8(commit.stdout)
+        .expect("scratch commit-tree stdout 非 UTF-8")
+        .trim()
+        .to_owned();
+    git_ok(
+        &repo.root,
+        &["update-ref", "refs/heads/main", &repo.main_sha],
+    );
 }
 
 fn stale_repo_fixture(name: &str, materialize_build_tree: bool) -> Option<StaleRepo> {
@@ -145,64 +180,6 @@ fn run_orch(root: &Path, args: &[&str]) -> Output {
         .expect("启动 orch 失败")
 }
 
-fn current_valid_materialized_round(root: &Path) -> String {
-    let rounds = fs::read_dir(root.join("coordination/rounds"))
-        .expect("materialized build tree 缺 coordination/rounds");
-    let mut candidates = Vec::new();
-
-    for entry in rounds {
-        let entry = entry.expect("读取 materialized round 目录失败");
-        if !entry.file_type().expect("读取 round 类型失败").is_dir() {
-            continue;
-        }
-        let Some(round) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Some(number) = round
-            .strip_prefix('r')
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        let round_root = entry.path();
-        if !round_root.join("ROUND-IR.yaml").is_file() {
-            continue;
-        }
-        let Ok(events) = fs::read_to_string(round_root.join("events.jsonl")) else {
-            continue;
-        };
-        let mut production_validated = false;
-        let mut closed = false;
-        for line in events.lines().filter(|line| !line.trim().is_empty()) {
-            let event: serde_json::Value =
-                serde_json::from_str(line).expect("materialized ledger 必须是合法 JSONL");
-            match event.get("type").and_then(serde_json::Value::as_str) {
-                Some("TaskValidated") => {
-                    let digest = event
-                        .pointer("/payload/validationDigest")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default();
-                    production_validated |= event.get("actor").and_then(serde_json::Value::as_str)
-                        == Some("runtime:orch")
-                        && digest.len() == 64
-                        && digest.bytes().all(|byte| byte.is_ascii_hexdigit());
-                }
-                Some("RoundClosed") => closed = true,
-                _ => {}
-            }
-        }
-        if production_validated && !closed {
-            candidates.push((number, round));
-        }
-    }
-
-    candidates.sort();
-    candidates
-        .pop()
-        .map(|(_, round)| round)
-        .expect("materialized build tree 中必须存在 production-validated 未关闭轮")
-}
-
 fn assert_stale_read_allowed(repo: &StaleRepo, output: &Output, command: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -242,6 +219,230 @@ fn assert_stale_override_audited(repo: &StaleRepo, output: &Output, command: &st
             && stderr.contains(&repo.build_sha)
             && stderr.contains(&repo.main_sha),
         "{command} 逃生舱必须留证并点名两 SHA: {stderr}"
+    );
+}
+
+fn prepare_stale_snapshot_probe(
+    name: &str,
+    committed_build_registry_drift: bool,
+) -> Option<(StaleRepo, String)> {
+    let mut repo = stale_repo_fixture(name, true)?;
+    if committed_build_registry_drift {
+        drift_agent_registry(&repo, "# B287 committed build-tree registry drift\n");
+        commit_tracked_scratch_state(&mut repo, "B287 committed registry drift fixture");
+    }
+    let current_round = prepare_local_valid_materialized_round(&repo.root)
+        .expect("materialized build tree 必须能在 scratch 内准备有效轮态");
+    assert_ne!(current_round, "r58", "fixture 不得退回已关闭的历史轮");
+    inject_hostile_inflight_round_state(&repo, &current_round);
+    repair_materialized_round_contract(&repo, &current_round);
+    Some((repo, current_round))
+}
+
+fn inject_hostile_inflight_round_state(repo: &StaleRepo, round: &str) {
+    let events_path = repo
+        .root
+        .join("coordination/rounds")
+        .join(round)
+        .join("events.jsonl");
+    let mut events = fs::read_to_string(&events_path).expect("读取 scratch round ledger 失败");
+    if !events.ends_with('\n') {
+        events.push('\n');
+    }
+    let probe = serde_json::json!({
+        "eventId": "01M0ZZZZZZZZZZZZZZZZZZZZZZ",
+        "ts": "2026-08-20T00:00:00Z",
+        "actor": "runtime:orch",
+        "type": "DispatchIssued",
+        "taskId": "B287-PROBE",
+        "round": round,
+        "payload": {
+            "agent": "executor-desktop",
+            "attemptId": "B287-PROBE-A0001",
+            "attemptNo": 1,
+            "goPath": format!(
+                "coordination/rounds/{round}/dispatch/executor-desktop/GO-B287-PROBE-A0001.md"
+            ),
+            "baseSha": repo.main_sha.as_str(),
+        }
+    });
+    events.push_str(&serde_json::to_string(&probe).expect("序列化 hostile inflight probe 失败"));
+    events.push('\n');
+    fs::write(&events_path, events).expect("注入 hostile inflight scratch event 失败");
+}
+
+fn remove_round_events(repo: &StaleRepo, round: &str, event_types: &[&str]) -> usize {
+    let events_path = repo
+        .root
+        .join("coordination/rounds")
+        .join(round)
+        .join("events.jsonl");
+    let events = fs::read_to_string(&events_path).expect("读取 scratch round ledger 失败");
+    let mut removed = 0usize;
+    let kept = events
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            let event: serde_json::Value =
+                serde_json::from_str(line).expect("scratch round ledger 必须是合法 JSONL");
+            let should_remove = event
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|event_type| event_types.contains(&event_type));
+            removed += usize::from(should_remove);
+            !should_remove
+        })
+        .collect::<Vec<_>>();
+    fs::write(&events_path, format!("{}\n", kept.join("\n")))
+        .expect("写回 scratch round ledger 失败");
+    removed
+}
+
+fn remove_round_event(repo: &StaleRepo, round: &str, event_type: &str) {
+    assert!(
+        remove_round_events(repo, round, &[event_type]) > 0,
+        "scratch round 必须至少有一条 {event_type}"
+    );
+}
+
+fn reset_round_for_contract_repair(repo: &StaleRepo, round: &str) {
+    let events_path = repo
+        .root
+        .join("coordination/rounds")
+        .join(round)
+        .join("events.jsonl");
+    let events = fs::read_to_string(&events_path).expect("读取 scratch round ledger 失败");
+    let mut removed_task_scoped = 0usize;
+    let kept = events
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            let event: serde_json::Value =
+                serde_json::from_str(line).expect("scratch round ledger 必须是合法 JSONL");
+            let task_scoped = event
+                .get("taskId")
+                .and_then(serde_json::Value::as_str)
+                .is_some();
+            removed_task_scoped += usize::from(task_scoped);
+            let inherited_authorization = matches!(
+                event.get("type").and_then(serde_json::Value::as_str),
+                Some(
+                    "TaskValidated"
+                        | "PlanSignedOff"
+                        | "AgentPinAmended"
+                        | "RuntimePolicyActivated"
+                        | "RuntimePolicyDeactivated"
+                )
+            );
+            !task_scoped && !inherited_authorization
+        })
+        .collect::<Vec<_>>();
+    fs::write(&events_path, format!("{}\n", kept.join("\n")))
+        .expect("写回 scratch contract-repair ledger 失败");
+    assert!(
+        removed_task_scoped > 0,
+        "materialized round 必须带至少一条 hostile task-scoped runtime event"
+    );
+    let repaired = fs::read_to_string(&events_path).expect("重读 scratch repair ledger 失败");
+    assert!(
+        repaired
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .all(|line| {
+                let event = serde_json::from_str::<serde_json::Value>(line)
+                    .expect("repair ledger 必须保持合法 JSONL");
+                event.get("taskId").is_none()
+                    && !matches!(
+                        event.get("type").and_then(serde_json::Value::as_str),
+                        Some(
+                            "TaskValidated"
+                                | "PlanSignedOff"
+                                | "AgentPinAmended"
+                                | "RuntimePolicyActivated"
+                                | "RuntimePolicyDeactivated"
+                        )
+                    )
+            }),
+        "contract repair 前置必须清空 inherited task lifecycle 与 round-scoped authorization"
+    );
+}
+
+fn drift_agent_registry(repo: &StaleRepo, marker: &str) {
+    let registry_path = repo.root.join("coordination/agents.yaml");
+    let mut registry =
+        fs::read_to_string(&registry_path).expect("读取 scratch agent registry 失败");
+    registry.push('\n');
+    registry.push_str(marker);
+    fs::write(&registry_path, registry).expect("写 scratch agent registry drift 失败");
+}
+
+fn repair_materialized_round_contract(repo: &StaleRepo, round: &str) {
+    // A materialized template may itself have been built in T1 or T2. Drop
+    // inherited authorization/delta facts, then let the production planner
+    // bind the exact scratch bytes and sign that freshly validated revision.
+    // This makes the control state local to the fixture instead of assuming
+    // the build commit happened to carry a usable live round.
+    reset_round_for_contract_repair(repo, round);
+
+    let planned = run_orch(&repo.root, &["--allow-stale-binary", "plan"]);
+    assert!(
+        planned.status.success(),
+        "B287 scratch plan 必须修复继承轮态；stdout={}; stderr={}",
+        String::from_utf8_lossy(&planned.stdout),
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let signed = run_orch(
+        &repo.root,
+        &[
+            "--allow-stale-binary",
+            "round",
+            "sign-off",
+            "--note",
+            "B287 scratch self-consistent round",
+        ],
+    );
+    assert!(
+        signed.status.success(),
+        "B287 scratch sign-off 必须绑定新鲜 IR；stdout={}; stderr={}",
+        String::from_utf8_lossy(&signed.stdout),
+        String::from_utf8_lossy(&signed.stderr)
+    );
+
+    let control = run_orch(&repo.root, &["snapshot"]);
+    assert_stale_read_allowed(repo, &control, "snapshot self-consistent control");
+}
+
+fn assert_round_independent_stale_read(repo: &StaleRepo, scenario: &str) {
+    let schema = run_orch(&repo.root, &["schema"]);
+    assert_stale_read_allowed(repo, &schema, &format!("schema ({scenario})"));
+}
+
+fn assert_snapshot_reaches_round_validation(
+    repo: &StaleRepo,
+    scenario: &str,
+    expected_round_error: &[&str],
+) {
+    let snapshot = run_orch(&repo.root, &["snapshot"]);
+    let stderr = String::from_utf8_lossy(&snapshot.stderr);
+    assert!(
+        !snapshot.status.success(),
+        "{scenario}: 不可用轮态下 snapshot 必须 fail-closed"
+    );
+    assert!(
+        stderr.contains("read-only command is allowed")
+            && stderr.contains(&repo.build_sha)
+            && stderr.contains(&repo.main_sha),
+        "{scenario}: 陈旧 guard 必须先把只读 snapshot 放行到轮态校验: {stderr}"
+    );
+    assert!(
+        !stderr.contains("stale binary refused state-changing command"),
+        "{scenario}: 只读 snapshot 不得被误分成写命令: {stderr}"
+    );
+    assert!(
+        expected_round_error
+            .iter()
+            .any(|expected| stderr.contains(expected)),
+        "{scenario}: snapshot 必须因轮态本身拒绝，而非其他原因: {stderr}"
     );
 }
 
@@ -359,55 +560,56 @@ fn stale_ledger_recover_distinguishes_dry_run_from_apply() {
 
 #[test]
 fn stale_snapshot_distinguishes_read_from_write() {
-    let Some(repo) = stale_repo_fixture("snapshot", true) else {
+    let Some((repo, current_round)) = prepare_stale_snapshot_probe("snapshot-unsigned", true)
+    else {
         eprintln!("skip: build outside git has no ORCH_BUILD_GIT_SHA");
         return;
     };
-    let runtime_dir = repo.root.join("coordination/runtime");
-    fs::create_dir_all(&runtime_dir).expect("创建 snapshot runtime fixture 失败");
-    let current_round = current_valid_materialized_round(&repo.root);
-    assert_ne!(current_round, "r58", "fixture 不得退回已关闭的历史轮");
-    fs::write(
-        runtime_dir.join("CURRENT-ROUND"),
-        format!("{current_round}\n"),
-    )
-    .expect("写 snapshot CURRENT-ROUND fixture 失败");
-    let read = run_orch(&repo.root, &["snapshot"]);
-    assert_stale_read_allowed(&repo, &read, "snapshot");
+    remove_round_event(&repo, &current_round, "PlanSignedOff");
 
-    fs::write(runtime_dir.join("CURRENT-ROUND"), "r58\n")
-        .expect("写历史 snapshot CURRENT-ROUND fixture 失败");
-    let historical = run_orch(&repo.root, &["snapshot"]);
-    let historical_stderr = String::from_utf8_lossy(&historical.stderr);
-    assert!(
-        !historical.status.success(),
-        "历史 r58 必须保持 IR 漂移拒绝"
-    );
-    // 归档卡可能引用后来已改名的模块，因此历史轮既可能在 IR 漂移校验处拒绝，
-    // 也可能更早在 plan crosscheck 处拒绝。两者都必须响亮失败；绝不能为了让
-    // 归档卡通过当前 HEAD 的校验而恢复已经删除的旧模块。
-    assert!(
-        historical_stderr.contains("ROUND-IR 与 mode/binding/cards 漂移")
-            || historical_stderr.contains("plan crosscheck 违规清单"),
-        "历史轮必须响亮拒绝: {historical_stderr}"
-    );
-
-    fs::write(
-        runtime_dir.join("CURRENT-ROUND"),
-        format!("{current_round}\n"),
-    )
-    .expect("恢复当前 snapshot CURRENT-ROUND fixture 失败");
+    // T1: a stale read-only command remains usable while snapshot itself keeps
+    // rejecting an unsigned round. The two decisions must not be conflated.
+    assert_round_independent_stale_read(&repo, "unsigned round");
+    assert_snapshot_reaches_round_validation(&repo, "unsigned round", &["尚未绑定 PlanSignedOff"]);
 
     let snapshot_path = repo.root.join("coordination/runtime/snapshot.json");
     let denied = run_orch(&repo.root, &["snapshot", "--write"]);
     assert_stale_write_rejected(&repo, &denied, "snapshot --write");
     assert!(!snapshot_path.exists(), "拒绝必须发生在 snapshot 写盘之前");
 
-    let allowed = run_orch(&repo.root, &["--allow-stale-binary", "snapshot", "--write"]);
-    assert_stale_override_audited(&repo, &allowed, "snapshot --write");
+    let overridden = run_orch(&repo.root, &["--allow-stale-binary", "snapshot", "--write"]);
+    let overridden_stderr = String::from_utf8_lossy(&overridden.stderr);
     assert!(
-        snapshot_path.is_file(),
-        "逃生舱放行后 snapshot 必须真实写盘"
+        !overridden.status.success()
+            && overridden_stderr.contains("--allow-stale-binary")
+            && overridden_stderr.contains("尚未绑定 PlanSignedOff"),
+        "逃生舱只绕过 stale guard，不得绕过 unsigned round 校验: {overridden_stderr}"
+    );
+    assert!(!snapshot_path.exists(), "轮态校验失败时不得写 snapshot");
+}
+
+#[test]
+fn stale_snapshot_stays_read_only_during_registry_drift() {
+    let Some((mut repo, _current_round)) =
+        prepare_stale_snapshot_probe("snapshot-registry-drift", false)
+    else {
+        eprintln!("skip: build outside git has no ORCH_BUILD_GIT_SHA");
+        return;
+    };
+    drift_agent_registry(&repo, "# B287 committed T2 registry drift probe\n");
+    commit_tracked_scratch_state(&mut repo, "B287 committed T2 registry drift");
+
+    // T2: registry bytes have moved beyond the signed IR. This used to make
+    // the cloned repository's live state decide whether the stale test passed.
+    assert_round_independent_stale_read(&repo, "registry drift");
+    assert_snapshot_reaches_round_validation(
+        &repo,
+        "registry drift",
+        &[
+            "ROUND-IR 与 mode/binding/cards 漂移",
+            "agent registry",
+            "agentRegistryDigest",
+        ],
     );
 }
 

@@ -5,14 +5,55 @@
 //! `AgentProfile` shapes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use orch_core::{read_ledger, EventRecord};
+use serde::{Deserialize, Serialize};
 
 use crate::agent_profile::{validate_profiles, AgentProfile, QualityClass};
 use crate::wake::{render_wake_argv, WakeSpec};
+
+/// Durable ledger fact emitted after an audited agent pin amendment commits.
+pub const AGENT_PIN_AMENDED_EVENT_KIND: &str = "AgentPinAmended";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AgentPin {
+    provider: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+/// Replayable description of one surgical provider/model/effort amendment.
+///
+/// Production records carry a real round, revision, and runtime actor.  The
+/// lower-level [`amend_agent_pin`] primitive deliberately returns an unscoped
+/// record so fixture callers can prove the byte edit and digest transition;
+/// [`run_agent_pin_amendment`] is the only production entry point that scopes
+/// the record and appends it to the ledger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentPinAmendment {
+    agent: String,
+    before: AgentPin,
+    after: AgentPin,
+    registry_digest_before: String,
+    registry_digest_after: String,
+    round: String,
+    ir_revision: u32,
+    actor: String,
+    reason: String,
+}
+
+impl AgentPinAmendment {
+    pub(crate) fn ir_revision(&self) -> u32 {
+        self.ir_revision
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelSource {
@@ -86,6 +127,10 @@ pub struct ObservationDefinition {
 pub struct AgentDefinition {
     pub profile: AgentProfile,
     pub tool: Option<String>,
+    /// Signed provider identity requested for this agent, when it is declared.
+    pub provider: Option<String>,
+    /// Absolute provider executable pinned for the managed invocation envelope, when declared.
+    pub provider_bin: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub expected_model: Option<String>,
@@ -103,6 +148,8 @@ pub struct AgentDefinition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedInvocationBinding {
+    /// Provider pin that must reach a provider-aware legacy wrapper unchanged.
+    pub requested_provider: Option<String>,
     pub requested_model: Option<String>,
     pub requested_effort: Option<String>,
     pub observation_source: Option<String>,
@@ -110,10 +157,13 @@ pub struct SignedInvocationBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RenderedInvocation {
+pub struct RenderedInvocation
+{
     pub tool: Option<String>,
     pub argv: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// Provider pin carried with the rendered invocation for durable auditing.
+    pub requested_provider: Option<String>,
     pub requested_model: Option<String>,
     pub requested_effort: Option<String>,
 }
@@ -142,6 +192,10 @@ struct RawAgentDefinition {
     poke_hint: String,
     #[serde(default)]
     tool: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(rename = "providerBin", default)]
+    provider_bin: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -272,6 +326,14 @@ pub fn load_agent_definitions(root: &Path) -> Result<BTreeMap<String, AgentDefin
         if id.trim().is_empty() {
             bail!("AgentRegistry 含空 agent id");
         }
+        let provider = nonempty(raw.provider, "provider", &id)?;
+        let provider_bin = nonempty(raw.provider_bin, "providerBin", &id)?;
+        if provider_bin
+            .as_deref()
+            .is_some_and(|value| !Path::new(value).is_absolute())
+        {
+            bail!("agent {id} providerBin 必须是绝对路径");
+        }
         let model = nonempty(raw.model, "model", &id)?;
         let effort = nonempty(raw.effort, "effort", &id)?;
         let expected_model = nonempty(raw.expected_model, "expectedModel", &id)?;
@@ -327,8 +389,11 @@ pub fn load_agent_definitions(root: &Path) -> Result<BTreeMap<String, AgentDefin
             if expected_model.is_some() || expected_effort.is_some() {
                 bail!("legacy agent {id} 不得声明 expectedModel/expectedEffort 字段");
             }
-            if model.is_some() && observation.is_none() {
-                bail!("legacy agent {id} 声明 model 时必须同时声明 observation.source/policy");
+            if (provider.is_some() || model.is_some() || effort.is_some()) && observation.is_none()
+            {
+                bail!(
+                    "legacy agent {id} 声明 provider/model/effort 时必须同时声明 observation.source/policy"
+                );
             }
             if let Some(observation) = observation.as_ref() {
                 validate_observation(observation, &format!("legacy agent {id}"))?;
@@ -355,6 +420,8 @@ pub fn load_agent_definitions(root: &Path) -> Result<BTreeMap<String, AgentDefin
             AgentDefinition {
                 profile,
                 tool: raw.tool,
+                provider,
+                provider_bin,
                 model,
                 effort,
                 expected_model,
@@ -375,6 +442,586 @@ pub fn load_agent_definitions(root: &Path) -> Result<BTreeMap<String, AgentDefin
     Ok(definitions)
 }
 
+fn pin_of(definition: &AgentDefinition) -> AgentPin {
+    AgentPin {
+        provider: definition.provider.clone(),
+        model: definition.model.clone(),
+        effort: definition.effort.clone(),
+    }
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_pin_scalar(value: Option<&str>, field: &str) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.trim().is_empty() || value != value.trim() {
+        bail!("agent pin {field} 不能为空、全空白或带首尾空白");
+    }
+    if !value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':')
+    }) {
+        bail!("agent pin {field} 含不能安全外科写入 YAML plain scalar 的字符: {value:?}");
+    }
+    Ok(())
+}
+
+fn invocation_argv(definition: &AgentDefinition) -> Option<&[String]> {
+    definition
+        .legacy_wake
+        .as_ref()
+        .map(|wake| wake.argv.as_slice())
+        .or_else(|| {
+            definition
+                .tool_definition
+                .as_ref()
+                .map(|tool| tool.launch.argv.as_slice())
+        })
+}
+
+fn argv_has_literal_after(argv: &[String], flags: &[&str], placeholder: &str) -> bool {
+    argv.iter().enumerate().any(|(index, argument)| {
+        if flags.contains(&argument.as_str()) {
+            return argv
+                .get(index + 1)
+                .is_some_and(|value| !value.contains(placeholder));
+        }
+        flags.iter().any(|flag| {
+            argument
+                .strip_prefix(&format!("{flag}="))
+                .is_some_and(|value| !value.contains(placeholder))
+        })
+    })
+}
+
+fn reject_inline_pin_literal(
+    definition: &AgentDefinition,
+    provider: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<()> {
+    let Some(argv) = invocation_argv(definition) else {
+        return Ok(());
+    };
+    let contains_current = |current: Option<&str>| {
+        current.is_some_and(|value| {
+            argv.iter()
+                .any(|argument| argument == value || argument.contains(&format!("={value}")))
+        })
+    };
+    let model_literal = model.is_some()
+        && (argv_has_literal_after(argv, &["-m", "--model"], "{model}")
+            || contains_current(definition.model.as_deref()));
+    let effort_literal = effort.is_some()
+        && (argv_has_literal_after(
+            argv,
+            &["--effort", "--variant", "--thought-level"],
+            "{effort}",
+        ) || contains_current(definition.effort.as_deref())
+            || argv.iter().any(|argument| {
+                argument.contains("effort=") || argument.contains("reasoning_effort=")
+            }));
+    let provider_literal = provider.is_some()
+        && (argv_has_literal_after(argv, &["--provider"], "{provider}")
+            || contains_current(definition.provider.as_deref()));
+    if model_literal || effort_literal || provider_literal {
+        bail!(
+            "agent {} 的 invocation argv 内联了待修订 pin；agent set-pin 不同步 argv，必须走完整 orch plan + 重签",
+            definition.profile.id
+        );
+    }
+    Ok(())
+}
+
+fn tool_definition_equal(left: &ToolDefinition, right: &ToolDefinition) -> bool {
+    left.api_version == right.api_version
+        && left.kind == right.kind
+        && left.tool == right.tool
+        && left.model_source == right.model_source
+        && left.effort_semantic == right.effort_semantic
+        && left.startup_spacing_ms == right.startup_spacing_ms
+        && left.max_concurrent == right.max_concurrent
+        && left.env == right.env
+        && left.launch.argv == right.launch.argv
+        && left.observation == right.observation
+}
+
+fn optional_tool_definition_equal(
+    left: Option<&ToolDefinition>,
+    right: Option<&ToolDefinition>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => tool_definition_equal(left, right),
+        _ => false,
+    }
+}
+
+fn non_pin_definition_equal(left: &AgentDefinition, right: &AgentDefinition) -> bool {
+    left.profile == right.profile
+        && left.tool == right.tool
+        && left.expected_model == right.expected_model
+        && left.expected_effort == right.expected_effort
+        && left.roles == right.roles
+        && left.responsibility == right.responsibility
+        && left.injectable == right.injectable
+        && left.mode == right.mode
+        && left.session_id == right.session_id
+        && left.poke_hint == right.poke_hint
+        && left.legacy_wake == right.legacy_wake
+        && optional_tool_definition_equal(
+            left.tool_definition.as_ref(),
+            right.tool_definition.as_ref(),
+        )
+        && left.observation == right.observation
+}
+
+fn validate_only_requested_pins_changed(
+    before: &BTreeMap<String, AgentDefinition>,
+    after: &BTreeMap<String, AgentDefinition>,
+    agent: &str,
+    expected: &AgentPin,
+) -> Result<()> {
+    if before.len() != after.len() || before.keys().ne(after.keys()) {
+        bail!("agent set-pin 不得增删或重命名 registry agent");
+    }
+    for (id, before_definition) in before {
+        let after_definition = &after[id];
+        if !non_pin_definition_equal(before_definition, after_definition) {
+            bail!("agent set-pin 检出第四字段差异: agent={id}");
+        }
+        let after_pin = pin_of(after_definition);
+        if id == agent {
+            if &after_pin != expected {
+                bail!("agent set-pin 写后 pin 与请求不一致: agent={agent}");
+            }
+        } else if after_pin != pin_of(before_definition) {
+            bail!("agent set-pin 不得改动未指名 agent 的 pin: agent={id}");
+        }
+    }
+    Ok(())
+}
+
+fn line_body(line: &str) -> (&str, &str) {
+    if let Some(body) = line.strip_suffix("\r\n") {
+        (body, "\r\n")
+    } else if let Some(body) = line.strip_suffix('\n') {
+        (body, "\n")
+    } else {
+        (line, "")
+    }
+}
+
+fn direct_agent_field(line: &str, field: &str) -> bool {
+    let (body, _) = line_body(line);
+    body.starts_with("    ")
+        && !body.starts_with("      ")
+        && body
+            .trim_start()
+            .strip_prefix(field)
+            .is_some_and(|rest| rest.starts_with(':'))
+}
+
+fn agent_block(lines: &[String], agent: &str) -> Result<(usize, usize)> {
+    let header = format!("  {agent}:");
+    let start = lines
+        .iter()
+        .position(|line| line_body(line).0 == header)
+        .with_context(|| format!("agents.yaml 未找到可外科编辑的 agent block: {agent}"))?;
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(index, line)| {
+            let body = line_body(line).0;
+            (body.starts_with("  ")
+                && !body.starts_with("    ")
+                && !body.trim_start().starts_with('#'))
+            .then_some(index)
+        })
+        .unwrap_or(lines.len());
+    Ok((start, end))
+}
+
+fn replace_scalar_line(line: &str, field: &str, value: &str) -> Result<String> {
+    let (body, newline) = line_body(line);
+    let prefix = format!("    {field}:");
+    let rest = body
+        .strip_prefix(&prefix)
+        .with_context(|| format!("agents.yaml {field} 行缩进/形状异常"))?;
+    let suffix = rest
+        .find(" #")
+        .map(|position| &rest[position..])
+        .unwrap_or("");
+    Ok(format!("{prefix} {value}{suffix}{newline}"))
+}
+
+fn surgical_registry_text(
+    source: &str,
+    agent: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<String> {
+    let mut lines = source
+        .split_inclusive('\n')
+        .map(String::from)
+        .collect::<Vec<_>>();
+    if source.is_empty() {
+        bail!("agents.yaml 不能为空");
+    }
+    for (field, value) in [("provider", provider), ("model", model), ("effort", effort)] {
+        let Some(value) = value else {
+            continue;
+        };
+        let (start, end) = agent_block(&lines, agent)?;
+        if let Some(index) = lines[start + 1..end]
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, line)| direct_agent_field(line, field).then_some(start + 1 + index))
+        {
+            lines[index] = replace_scalar_line(&lines[index], field, value)?;
+        } else {
+            let newline = lines
+                .get(end.saturating_sub(1))
+                .map(|line| line_body(line).1)
+                .filter(|newline| !newline.is_empty())
+                .unwrap_or("\n");
+            lines.insert(end, format!("    {field}: {value}{newline}"));
+        }
+    }
+    Ok(lines.concat())
+}
+
+fn atomic_replace_registry(path: &Path, bytes: &[u8]) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("检查 AgentRegistry target 失败: {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("AgentRegistry target 必须是 regular non-symlink file");
+    }
+    let parent = path.parent().context("AgentRegistry target 缺 parent")?;
+    let temporary = parent.join(format!(
+        ".agents.yaml.pin-tmp-{}-{}",
+        std::process::id(),
+        ulid::Ulid::new()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .with_context(|| format!("创建 AgentRegistry 临时文件失败: {}", temporary.display()))?;
+        file.write_all(bytes)
+            .context("写 AgentRegistry 临时文件失败")?;
+        file.sync_all()
+            .context("fsync AgentRegistry 临时文件失败")?;
+        drop(file);
+        fs::rename(&temporary, path).context("原子替换 AgentRegistry 失败")?;
+        File::open(parent)
+            .context("打开 AgentRegistry parent 以 fsync 失败")?
+            .sync_all()
+            .context("fsync AgentRegistry parent 失败")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn rollback_registry(path: &Path, original: &[u8], cause: anyhow::Error) -> anyhow::Error {
+    match atomic_replace_registry(path, original) {
+        Ok(()) => cause.context("agent pin amendment 已完整回滚"),
+        Err(rollback) => anyhow::anyhow!(
+            "agent pin amendment 失败: {cause:#}; AgentRegistry rollback 也失败: {rollback:#}"
+        ),
+    }
+}
+
+/// Surgically amend one registry pin and return the replayable digest delta.
+///
+/// This primitive validates the parsed registry before and after the edit and
+/// rolls the file back on every modeled error.  It does not append a ledger
+/// fact or check round state; production callers must use
+/// [`run_agent_pin_amendment`] so the byte change and durable event are one
+/// protocol transition.
+pub fn amend_agent_pin(
+    root: &Path,
+    agent: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    reason: &str,
+) -> Result<AgentPinAmendment> {
+    if agent.trim().is_empty() || agent != agent.trim() {
+        bail!("agent id 不能为空或带首尾空白");
+    }
+    if reason.trim().is_empty() {
+        bail!("agent set-pin --reason 不得为空白");
+    }
+    validate_pin_scalar(provider, "provider")?;
+    validate_pin_scalar(model, "model")?;
+    validate_pin_scalar(effort, "effort")?;
+    if provider.is_none() && model.is_none() && effort.is_none() {
+        bail!("agent set-pin 至少指定 provider/model/effort 之一");
+    }
+
+    let definitions_before = load_agent_definitions(root)?;
+    let definition = definitions_before
+        .get(agent)
+        .with_context(|| format!("AgentRegistry 未注册 agent: {agent}"))?;
+    let before = pin_of(definition);
+    let after = AgentPin {
+        provider: provider
+            .map(String::from)
+            .or_else(|| before.provider.clone()),
+        model: model.map(String::from).or_else(|| before.model.clone()),
+        effort: effort.map(String::from).or_else(|| before.effort.clone()),
+    };
+    if before == after {
+        bail!("agent set-pin 请求与现值完全相同，拒绝空转");
+    }
+    reject_inline_pin_literal(definition, provider, model, effort)?;
+
+    let path = root.join("coordination/agents.yaml");
+    let original = fs::read(&path)
+        .with_context(|| format!("读取 AgentRegistry bytes 失败: {}", path.display()))?;
+    let original_text = std::str::from_utf8(&original).context("AgentRegistry 必须为 UTF-8")?;
+    let candidate = surgical_registry_text(original_text, agent, provider, model, effort)?;
+    let digest_before = crate::plan::agent_registry_digest(root)?;
+
+    if let Err(error) = atomic_replace_registry(&path, candidate.as_bytes()) {
+        let current = fs::read(&path).unwrap_or_default();
+        return if current == original {
+            Err(error)
+        } else {
+            Err(rollback_registry(&path, &original, error))
+        };
+    }
+    let validated = (|| -> Result<AgentPinAmendment> {
+        let definitions_after = load_agent_definitions(root)?;
+        validate_only_requested_pins_changed(
+            &definitions_before,
+            &definitions_after,
+            agent,
+            &after,
+        )?;
+        let digest_after = crate::plan::agent_registry_digest(root)?;
+        if digest_before == digest_after {
+            bail!("agent set-pin 改写后 registry digest 未变化");
+        }
+        Ok(AgentPinAmendment {
+            agent: agent.to_string(),
+            before,
+            after,
+            registry_digest_before: digest_before,
+            registry_digest_after: digest_after,
+            round: "unscoped".to_string(),
+            ir_revision: 0,
+            actor: "runtime:orch".to_string(),
+            reason: reason.trim().to_string(),
+        })
+    })();
+    validated.map_err(|error| rollback_registry(&path, &original, error))
+}
+
+pub(crate) fn fold_agent_pin_amendments(
+    genesis: &str,
+    amendments: &[AgentPinAmendment],
+) -> Result<String> {
+    if !valid_digest(genesis) {
+        bail!("registry amendment genesis digest 必须为 64 位小写 hex");
+    }
+    let mut expected = genesis.to_string();
+    let mut latest_pin = BTreeMap::<String, AgentPin>::new();
+    for amendment in amendments {
+        if amendment.agent.trim().is_empty()
+            || amendment.reason.trim().is_empty()
+            || amendment.before == amendment.after
+            || !valid_digest(&amendment.registry_digest_before)
+            || !valid_digest(&amendment.registry_digest_after)
+            || amendment.registry_digest_before == amendment.registry_digest_after
+        {
+            bail!("AgentPinAmended record 非 canonical 或为空转");
+        }
+        if amendment.registry_digest_before != expected {
+            bail!(
+                "AgentPinAmended digest 链断裂/乱序: expected={} actual={}",
+                expected,
+                amendment.registry_digest_before
+            );
+        }
+        if let Some(previous) = latest_pin.get(&amendment.agent) {
+            if previous != &amendment.before {
+                bail!("AgentPinAmended before pin 与同 agent 上一条 after 不连续");
+            }
+        }
+        latest_pin.insert(amendment.agent.clone(), amendment.after.clone());
+        expected = amendment.registry_digest_after.clone();
+    }
+    Ok(expected)
+}
+
+pub(crate) fn decode_agent_pin_amendment_event(
+    event: &EventRecord,
+    round: &str,
+) -> Result<AgentPinAmendment> {
+    if event.kind != AGENT_PIN_AMENDED_EVENT_KIND
+        || event.actor != "runtime:orch"
+        || event.task_id.is_some()
+        || event.round.as_deref() != Some(round)
+    {
+        bail!("AgentPinAmended {} envelope 非 canonical", event.event_id);
+    }
+    let amendment: AgentPinAmendment = serde_json::from_value(
+        event
+            .payload
+            .clone()
+            .with_context(|| format!("AgentPinAmended {} 缺 payload", event.event_id))?,
+    )
+    .with_context(|| format!("AgentPinAmended {} payload 非 canonical", event.event_id))?;
+    if amendment.round != round
+        || amendment.ir_revision == 0
+        || amendment.actor != "runtime:orch"
+        || amendment.reason.trim().is_empty()
+    {
+        bail!(
+            "AgentPinAmended {} attribution 非 canonical",
+            event.event_id
+        );
+    }
+    fold_agent_pin_amendments(
+        &amendment.registry_digest_before,
+        std::slice::from_ref(&amendment),
+    )?;
+    Ok(amendment)
+}
+
+fn append_amendment_event(
+    root: &Path,
+    round: &str,
+    initial_event_ids: &[String],
+    event: &EventRecord,
+) -> Result<()> {
+    let event_id = event.event_id.clone();
+    let candidate = event.clone();
+    let appended = crate::ledger::append_checked(root, round, |fresh| {
+        if fresh.iter().any(|item| item.event_id == event_id) {
+            return Ok(Vec::new());
+        }
+        if fresh.len() != initial_event_ids.len()
+            || fresh
+                .iter()
+                .zip(initial_event_ids)
+                .any(|(item, expected)| &item.event_id != expected)
+        {
+            bail!("AgentPinAmended 事务内账本快照漂移");
+        }
+        Ok(vec![candidate])
+    })?;
+    if appended > 1 {
+        bail!("AgentPinAmended append count 非法: {appended}");
+    }
+    Ok(())
+}
+
+/// Amend an agent pin inside an open, user-signed round and durably record it.
+///
+/// The protocol transition serializes the round check, surgical file change,
+/// and WAL-backed ledger append.  A failed append is retried once for atomic
+/// ledger recovery/idempotency; if no exact event committed, the original
+/// registry bytes are restored before the error is returned.
+pub fn run_agent_pin_amendment(
+    root: &Path,
+    agent: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    reason: &str,
+) -> Result<AgentPinAmendment> {
+    crate::close::with_protocol_transition(root, "orch agent set-pin", || {
+        let round = crate::current_round(root)?;
+        let ledger_path = root.join(format!("coordination/rounds/{round}/events.jsonl"));
+        let ledger = read_ledger(&ledger_path)
+            .with_context(|| format!("读取 AgentPinAmended 账本失败: {}", ledger_path.display()))?;
+        if !ledger.bad_lines.is_empty() {
+            bail!("agent set-pin 拒绝坏账本");
+        }
+        if orch_core::fold(&ledger.events).round_closed {
+            bail!("轮 {round} 已收轮，拒绝 agent set-pin");
+        }
+        let active = crate::plan::require_active_round_ir(root, &round, &ledger.events)?;
+        let initial_event_ids = ledger
+            .events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<Vec<_>>();
+        let registry_path = root.join("coordination/agents.yaml");
+        let original = fs::read(&registry_path).with_context(|| {
+            format!(
+                "读取 agent set-pin rollback bytes 失败: {}",
+                registry_path.display()
+            )
+        })?;
+
+        let mut amendment = amend_agent_pin(root, agent, provider, model, effort, reason)?;
+        amendment.round = round.clone();
+        amendment.ir_revision = active.persisted_revision;
+        amendment.actor = "runtime:orch".to_string();
+        let event = crate::ledger::event(
+            AGENT_PIN_AMENDED_EVENT_KIND,
+            "runtime:orch",
+            None,
+            Some(&round),
+            serde_json::to_value(&amendment)?,
+        );
+
+        let first = append_amendment_event(root, &round, &initial_event_ids, &event);
+        if let Err(first_error) = first {
+            if let Err(second_error) =
+                append_amendment_event(root, &round, &initial_event_ids, &event)
+            {
+                let fresh = read_ledger(&ledger_path).ok();
+                let committed = fresh.as_ref().is_some_and(|ledger| {
+                    ledger.bad_lines.is_empty()
+                        && ledger
+                            .events
+                            .iter()
+                            .any(|item| item.event_id == event.event_id)
+                });
+                if !committed {
+                    let cause = anyhow::anyhow!(
+                        "AgentPinAmended append 两次失败: first={first_error:#}; second={second_error:#}"
+                    );
+                    return Err(rollback_registry(&registry_path, &original, cause));
+                }
+            }
+        }
+
+        let committed = read_ledger(&ledger_path)
+            .with_context(|| format!("回读 AgentPinAmended 账本失败: {}", ledger_path.display()))?;
+        if !committed.bad_lines.is_empty()
+            || !committed
+                .events
+                .iter()
+                .any(|item| item.event_id == event.event_id)
+        {
+            let cause = anyhow::anyhow!("AgentPinAmended 未出现在提交后账本");
+            return Err(rollback_registry(&registry_path, &original, cause));
+        }
+        crate::plan::require_active_round_ir(root, &round, &committed.events)
+            .context("AgentPinAmended 后 active ROUND-IR 校验失败")?;
+        Ok(amendment)
+    })
+}
+
 pub fn signed_invocation_binding(def: &AgentDefinition) -> SignedInvocationBinding {
     let observation = def
         .tool_definition
@@ -388,10 +1035,54 @@ pub fn signed_invocation_binding(def: &AgentDefinition) -> SignedInvocationBindi
         .unwrap_or(true);
 
     SignedInvocationBinding {
+        requested_provider: requested_by_orch.then(|| def.provider.clone()).flatten(),
         requested_model: requested_by_orch.then(|| def.model.clone()).flatten(),
         requested_effort: requested_by_orch.then(|| def.effort.clone()).flatten(),
         observation_source: observation.map(|value| value.source.clone()),
         observation_policy: observation.map(|value| value.policy.clone()),
+    }
+}
+
+fn legacy_pin_env(argv: &[String], binding: &SignedInvocationBinding) -> BTreeMap<String, String> {
+    let Some(prefix) = (match argv.get(1).map(String::as_str) {
+        Some("orch/scripts/wake-pi-stream.sh") => Some("ORCH_PI"),
+        Some("orch/scripts/wake-zcode-stream.sh") => Some("ORCH_ZCODE"),
+        Some("orch/scripts/wake-dsh-stream.sh") => Some("ORCH_DSH"),
+        _ => None,
+    }) else {
+        return BTreeMap::new();
+    };
+
+    let mut env = BTreeMap::new();
+    if let Some(provider) = binding.requested_provider.as_ref() {
+        env.insert(format!("{prefix}_PROVIDER"), provider.clone());
+    }
+    if let Some(model) = binding.requested_model.as_ref() {
+        env.insert(format!("{prefix}_MODEL"), model.clone());
+    }
+    if let Some(effort) = binding.requested_effort.as_ref() {
+        env.insert(format!("{prefix}_EFFORT"), effort.clone());
+    }
+    env
+}
+
+/// Render a legacy wake after its session mode has selected the final argv.
+///
+/// The function preserves the declared argv verbatim while forwarding only
+/// signed provider/model/effort pins to the two managed legacy wrappers. A
+/// missing declaration stays missing so the wrapper can reject before a model
+/// process is started instead of inheriting a local default.
+pub fn render_legacy_invocation(def: &AgentDefinition, argv: Vec<String>) -> RenderedInvocation
+{
+    let binding = signed_invocation_binding(def);
+    let env = legacy_pin_env(&argv, &binding);
+    RenderedInvocation {
+        tool: None,
+        argv,
+        env,
+        requested_provider: binding.requested_provider,
+        requested_model: binding.requested_model,
+        requested_effort: binding.requested_effort,
     }
 }
 
@@ -445,16 +1136,13 @@ pub fn render_invocation(
     session: &str,
     message: &str,
 ) -> Result<RenderedInvocation> {
-    let binding = signed_invocation_binding(def);
     if let Some(wake) = def.legacy_wake.as_ref() {
-        return Ok(RenderedInvocation {
-            tool: None,
-            argv: render_wake_argv(wake, message).map_err(anyhow::Error::msg)?,
-            env: BTreeMap::new(),
-            requested_model: binding.requested_model,
-            requested_effort: binding.requested_effort,
-        });
+        return Ok(render_legacy_invocation(
+            def,
+            render_wake_argv(wake, message).map_err(anyhow::Error::msg)?,
+        ));
     }
+    let binding = signed_invocation_binding(def);
     let tool = def
         .tool_definition
         .as_ref()
@@ -484,6 +1172,7 @@ pub fn render_invocation(
         tool: def.tool.clone(),
         argv,
         env,
+        requested_provider: binding.requested_provider,
         requested_model: binding.requested_model,
         requested_effort: binding.requested_effort,
     })

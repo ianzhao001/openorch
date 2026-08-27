@@ -178,6 +178,7 @@ initializing_linked_head_update() {
 # input, and expose only separator-safe identities to the shell caller.
 pending_verdict_barrier() {
     transaction_old=$1
+    transaction_new=$2
     current_round_file=$root/coordination/runtime/CURRENT-ROUND
     if [ ! -e "$current_round_file" ]; then
         return 1
@@ -214,18 +215,100 @@ pending_verdict_barrier() {
         ""|0*|*[!0-9]*) echo "CURRENT-ROUND must match r<positive integer>"; return 2 ;;
     esac
 
-    ledger_file=$root/coordination/rounds/$current_round/events.jsonl
-    if [ ! -f "$ledger_file" ] || [ -L "$ledger_file" ] || [ ! -r "$ledger_file" ]; then
-        echo "active round ledger is missing, unreadable, or not a regular non-symlink file"
+    ledger_rel=coordination/rounds/$current_round/events.jsonl
+    ledger_file=$(mktemp "${TMPDIR:-/tmp}/orch-main-ledger.XXXXXX") || {
+        echo "cannot allocate protected main-ledger snapshot"
+        return 2
+    }
+    old_ledger_file=$(mktemp "${TMPDIR:-/tmp}/orch-old-main-ledger.XXXXXX") || {
+        rm -f "$ledger_file"
+        echo "cannot allocate protected old-ledger snapshot"
+        return 2
+    }
+    ledger_prefix_file=$(mktemp "${TMPDIR:-/tmp}/orch-main-ledger-prefix.XXXXXX") || {
+        rm -f "$ledger_file" "$old_ledger_file"
+        echo "cannot allocate protected ledger-prefix snapshot"
+        return 2
+    }
+    working_ledger=$root/$ledger_rel
+    legacy_untracked_ledger=false
+    if ! git show "$transaction_new:$ledger_rel" >"$ledger_file" 2>/dev/null; then
+        if git show "$transaction_old:$ledger_rel" >"$old_ledger_file" 2>/dev/null; then
+            rm -f "$ledger_file" "$old_ledger_file" "$ledger_prefix_file"
+            echo "transaction new commit deletes the tracked active round ledger"
+            return 2
+        fi
+        if [ ! -f "$working_ledger" ] || [ -L "$working_ledger" ] || [ ! -r "$working_ledger" ]; then
+            rm -f "$ledger_file" "$old_ledger_file" "$ledger_prefix_file"
+            echo "untracked-bootstrap active ledger is missing or unsafe"
+            return 2
+        fi
+        if ! cp "$working_ledger" "$ledger_file"; then
+            rm -f "$ledger_file" "$old_ledger_file" "$ledger_prefix_file"
+            echo "cannot snapshot untracked-bootstrap active ledger"
+            return 2
+        fi
+        : >"$old_ledger_file"
+        legacy_untracked_ledger=true
+    elif ! git show "$transaction_old:$ledger_rel" >"$old_ledger_file" 2>/dev/null; then
+        : >"$old_ledger_file"
+    fi
+    old_ledger_bytes=$(wc -c <"$old_ledger_file" 2>/dev/null | tr -d '[:space:]') || old_ledger_bytes=""
+    old_ledger_lines=$(wc -l <"$old_ledger_file" 2>/dev/null | tr -d '[:space:]') || old_ledger_lines=""
+    case "$old_ledger_bytes:$old_ledger_lines" in
+        *[!0-9:]*)
+            rm -f "$ledger_file" "$old_ledger_file" "$ledger_prefix_file"
+            echo "transaction old ledger size metadata is invalid"
+            return 2
+            ;;
+    esac
+    if [ "$old_ledger_bytes" -gt 0 ]; then
+        if ! dd if="$ledger_file" of="$ledger_prefix_file" bs="$old_ledger_bytes" count=1 2>/dev/null ||
+           ! cmp -s "$old_ledger_file" "$ledger_prefix_file"; then
+            rm -f "$ledger_file" "$old_ledger_file" "$ledger_prefix_file"
+            echo "transaction new ledger is not an append-only extension of old main"
+            return 2
+        fi
+    fi
+    if [ ! -f "$working_ledger" ] || [ -L "$working_ledger" ] || [ ! -r "$working_ledger" ]; then
+        rm -f "$ledger_file" "$old_ledger_file" "$ledger_prefix_file"
+        echo "active working ledger is missing, unreadable, or not a regular non-symlink file"
+        return 2
+    fi
+    new_ledger_bytes=$(wc -c <"$ledger_file" 2>/dev/null | tr -d '[:space:]') || new_ledger_bytes=""
+    case "$new_ledger_bytes" in
+        ""|*[!0-9]*)
+            rm -f "$ledger_file" "$old_ledger_file" "$ledger_prefix_file"
+            echo "transaction new ledger byte count is invalid"
+            return 2
+            ;;
+    esac
+    if ! cp "$working_ledger" "$ledger_prefix_file"; then
+        rm -f "$ledger_file" "$old_ledger_file" "$ledger_prefix_file"
+        echo "cannot snapshot active working ledger"
+        return 2
+    fi
+    if [ "$legacy_untracked_ledger" != "true" ] && [ "$new_ledger_bytes" -gt 0 ]; then
+        if ! dd if="$ledger_prefix_file" of="$old_ledger_file" bs="$new_ledger_bytes" count=1 2>/dev/null ||
+           ! cmp -s "$ledger_file" "$old_ledger_file"; then
+            rm -f "$ledger_file" "$old_ledger_file" "$ledger_prefix_file"
+            echo "active working ledger is not an append-only extension of transaction new"
+            return 2
+        fi
+    fi
+    if ! mv -f "$ledger_prefix_file" "$ledger_file"; then
+        rm -f "$ledger_file" "$old_ledger_file" "$ledger_prefix_file"
+        echo "cannot promote active working-ledger snapshot"
         return 2
     fi
     ledger_lines=$(wc -l <"$ledger_file" 2>/dev/null | tr -d '[:space:]') || {
+        rm -f "$ledger_file" "$old_ledger_file" "$ledger_prefix_file"
         echo "cannot read active round ledger"
         return 2
     }
     case "$ledger_lines" in
-        ""|*[!0-9]*) echo "active round ledger line count is invalid"; return 2 ;;
-        0) echo "active round ledger is empty"; return 2 ;;
+        ""|*[!0-9]*) rm -f "$ledger_file" "$old_ledger_file" "$ledger_prefix_file"; echo "active round ledger line count is invalid"; return 2 ;;
+        0) rm -f "$ledger_file" "$old_ledger_file" "$ledger_prefix_file"; echo "active round ledger is empty"; return 2 ;;
     esac
 
     # The ledger carries non-ASCII payload text (reasons, escalation messages).
@@ -237,7 +320,7 @@ pending_verdict_barrier() {
     # (JSON keys, SHAs, event kinds) is ASCII, so byte semantics are sufficient
     # and non-ASCII payload bytes simply pass through untouched.
     barrier_detail=$(LC_ALL=C awk -v expected_lines="$ledger_lines" -v current_round="$current_round" \
-        -v transaction_old="$transaction_old" '
+        -v transaction_old="$transaction_old" -v old_lines="$old_ledger_lines" '
         function reject(message) {
             if (parse_error == "") {
                 parse_error = message
@@ -260,6 +343,8 @@ pending_verdict_barrier() {
             for (key in payload_number) delete payload_number[key]
             for (key in payload_array_count) delete payload_array_count[key]
             for (key in payload_array_nonempty_strings) delete payload_array_nonempty_strings[key]
+            for (key in payload_array_value) delete payload_array_value[key]
+            for (key in parsed_array_value) delete parsed_array_value[key]
             top_count = 0
             payload_count = 0
             object_serial = 0
@@ -391,6 +476,7 @@ pending_verdict_barrier() {
             json_pos++
             count = 0
             all_nonempty_strings = 1
+            for (character in parsed_array_value) delete parsed_array_value[character]
             if (substr(json_text, json_pos, 1) == "]") {
                 json_pos++
                 parsed_type = "array"
@@ -403,6 +489,7 @@ pending_verdict_barrier() {
                 value_type = parsed_type
                 value_string = parsed_string
                 count++
+                parsed_array_value[count] = value_string
                 if (value_type != "string" || value_string == "")
                     all_nonempty_strings = 0
                 character = substr(json_text, json_pos, 1)
@@ -423,7 +510,8 @@ pending_verdict_barrier() {
         }
 
         function remember_value(mode, key, value_type, value_string, value_escaped,
-                                value_number, value_array_count, value_array_nonempty_strings) {
+                                value_number, value_array_count, value_array_nonempty_strings,
+                                array_index) {
             if (mode == 1) {
                 top_present[key] = 1
                 top_type[key] = value_type
@@ -439,6 +527,8 @@ pending_verdict_barrier() {
                 payload_number[key] = value_number
                 payload_array_count[key] = value_array_count
                 payload_array_nonempty_strings[key] = value_array_nonempty_strings
+                for (array_index = 1; array_index <= value_array_count; array_index++)
+                    payload_array_value[key, array_index] = parsed_array_value[array_index]
                 payload_count++
             }
         }
@@ -507,11 +597,13 @@ pending_verdict_barrier() {
             if (substr(literal, 1, 4) == "true") {
                 json_pos += 4
                 parsed_type = "boolean"
+                parsed_string = "true"
                 return 1
             }
             if (substr(literal, 1, 5) == "false") {
                 json_pos += 5
                 parsed_type = "boolean"
+                parsed_string = "false"
                 return 1
             }
             if (substr(literal, 1, 4) == "null") {
@@ -536,6 +628,22 @@ pending_verdict_barrier() {
 
         function positive_integer(value) {
             return value ~ /^[1-9][0-9]*$/
+        }
+
+        function nonnegative_integer(value) {
+            return value ~ /^(0|[1-9][0-9]*)$/
+        }
+
+        function canonical_nonblank(value,    trimmed) {
+            trimmed = value
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", trimmed)
+            return trimmed != "" && trimmed == value
+        }
+
+        function canonical_relative(value) {
+            return value != "" && substr(value, 1, 1) != "/" &&
+                   value !~ /(^|\/)\.\.?($|\/)/ && index(value, "//") == 0 &&
+                   value !~ /\/$/
         }
 
         function canonical_task(value) {
@@ -740,6 +848,510 @@ pending_verdict_barrier() {
             return 1
         }
 
+        function runtime_v1_kind(kind) {
+            return kind == "RuntimePolicyActivated" || kind == "RuntimePolicyDeactivated" ||
+                   kind == "ReviewSpoolPromoted" || kind == "ReviewPanelSelected" ||
+                   kind == "ReviewSeatRouted" || kind == "ReviewSeatTerminated" ||
+                   kind == "ReviewPanelClosed" || kind == "GateLaneEscalated" ||
+                   kind == "GateReused" || kind == "GateReuseMiss"
+        }
+
+        function runtime_attempt(task) {
+            return canonical_task(task) && direct_string("payload", "attemptId") &&
+                   payload_type["attemptNo"] == "number" &&
+                   attempt_ordinal(payload_string["attemptId"], task) == payload_number["attemptNo"]
+        }
+
+        function open_attempt(task, attempt,    key) {
+            key = task "|" attempt
+            if (!(key in attempt_open)) {
+                attempt_open[key] = 1
+                open_attempt_count++
+            }
+        }
+
+        function close_attempt(task, attempt,    key) {
+            key = task "|" attempt
+            if (key in attempt_open) {
+                delete attempt_open[key]
+                open_attempt_count--
+            }
+        }
+
+        function close_task_attempts(task,    key, prefix) {
+            prefix = task "|"
+            for (key in attempt_open) {
+                if (index(key, prefix) == 1) {
+                    delete attempt_open[key]
+                    open_attempt_count--
+                }
+            }
+        }
+
+        function open_wake_id(wake, task) {
+            if (!(wake in wake_open)) {
+                wake_open[wake] = 1
+                open_wake_count++
+            }
+            if (task != "") wake_task[wake] = task
+        }
+
+        function close_wake_id(wake) {
+            if (wake in wake_open) {
+                delete wake_open[wake]
+                open_wake_count--
+            }
+            delete wake_task[wake]
+        }
+
+        function close_task_wakes(task,    wake) {
+            for (wake in wake_open) {
+                if (wake_task[wake] == task) {
+                    delete wake_open[wake]
+                    delete wake_task[wake]
+                    open_wake_count--
+                }
+            }
+        }
+
+        # B310 hook-side closed shape. Relational replay is repeated by the
+        # Rust append/doctor/archive validator; the hook still names every kind
+        # explicitly so no future event can fall through an unknown-kind arm.
+        function validate_runtime_v1(kind, task,    state, route, target, source, actual,
+                                     role, lineage, artifact, canonical, staging) {
+            if (payload_type["schemaVersion"] != "number" || payload_number["schemaVersion"] != 1)
+                return reject(kind " schemaVersion is not exact V1")
+
+            if (kind == "RuntimePolicyActivated") {
+                if (task != "" || payload_count != 8 ||
+                    !direct_string("payload", "policy") ||
+                    !direct_string("payload", "ownerTask") ||
+                    !direct_string("payload", "ownerRecordedEventId") ||
+                    !direct_string("payload", "ownerMergeSha") ||
+                    !direct_string("payload", "bindingSha256") ||
+                    !direct_string("payload", "policySha256") ||
+                    !direct_string("payload", "activatedAtMainSha") ||
+                    !safe_id(payload_string["policy"]) ||
+                    !canonical_task(payload_string["ownerTask"]) ||
+                    !safe_id(payload_string["ownerRecordedEventId"]) ||
+                    !full_sha(payload_string["ownerMergeSha"]) ||
+                    !full_digest(payload_string["bindingSha256"]) ||
+                    !full_digest(payload_string["policySha256"]) ||
+                    !full_sha(payload_string["activatedAtMainSha"]) ||
+                    (NR > old_lines && payload_string["activatedAtMainSha"] != transaction_old))
+                    return reject("RuntimePolicyActivated payload is not canonical")
+                if (policy_active[payload_string["policy"]] != "")
+                    return reject("RuntimePolicyActivated repeats an active policy")
+                if (task_recorded_owner[payload_string["ownerRecordedEventId"]] != \
+                        payload_string["ownerTask"] ||
+                    merge_owner[payload_string["ownerTask"] "|" payload_string["ownerMergeSha"]] != 1)
+                    return reject("RuntimePolicyActivated owner record/merge authority is not closed")
+                policy_active[payload_string["policy"]] = top_string["eventId"] "|" \
+                    payload_string["bindingSha256"] "|" payload_string["policySha256"]
+                return 1
+            }
+            if (kind == "RuntimePolicyDeactivated") {
+                if (task != "" || payload_count != 7 ||
+                    !direct_string("payload", "policy") ||
+                    !direct_string("payload", "activationEventId") ||
+                    !direct_string("payload", "bindingSha256") ||
+                    !direct_string("payload", "policySha256") ||
+                    !direct_string("payload", "deactivatedAtMainSha") ||
+                    payload_type["reason"] != "string" ||
+                    !safe_id(payload_string["policy"]) ||
+                    !safe_id(payload_string["activationEventId"]) ||
+                    !full_digest(payload_string["bindingSha256"]) ||
+                    !full_digest(payload_string["policySha256"]) ||
+                    !full_sha(payload_string["deactivatedAtMainSha"]) ||
+                    (NR > old_lines && payload_string["deactivatedAtMainSha"] != transaction_old) ||
+                    !canonical_nonblank(payload_string["reason"]))
+                    return reject("RuntimePolicyDeactivated payload is not canonical")
+                state = payload_string["activationEventId"] "|" \
+                    payload_string["bindingSha256"] "|" payload_string["policySha256"]
+                if (policy_active[payload_string["policy"]] != "" &&
+                    policy_active[payload_string["policy"]] != state)
+                    return reject("RuntimePolicyDeactivated does not bind current activation")
+                policy_active[payload_string["policy"]] = ""
+                return 1
+            }
+            if (task == "" || !runtime_attempt(task))
+                return reject(kind " lacks canonical task/attempt identity")
+
+            if (kind == "ReviewPanelSelected") {
+                if (payload_count != 10 || !direct_string("payload", "panelId") ||
+                    !direct_string("payload", "reviewedHead") ||
+                    !direct_string("payload", "policyBaseSha") ||
+                    !direct_string("payload", "policy") ||
+                    !direct_string("payload", "policySha256") ||
+                    payload_type["seatCount"] != "number" || payload_number["seatCount"] != 3 ||
+                    payload_type["seatIds"] != "array" || payload_array_count["seatIds"] != 3 ||
+                    !payload_array_nonempty_strings["seatIds"] ||
+                    !safe_id(payload_array_value["seatIds", 1]) ||
+                    !safe_id(payload_array_value["seatIds", 2]) ||
+                    !safe_id(payload_array_value["seatIds", 3]) ||
+                    payload_array_value["seatIds", 1] == payload_array_value["seatIds", 2] ||
+                    payload_array_value["seatIds", 1] == payload_array_value["seatIds", 3] ||
+                    payload_array_value["seatIds", 2] == payload_array_value["seatIds", 3] ||
+                    !safe_id(payload_string["panelId"]) ||
+                    !full_sha(payload_string["reviewedHead"]) ||
+                    !full_sha(payload_string["policyBaseSha"]) ||
+                    !safe_id(payload_string["policy"]) || !full_digest(payload_string["policySha256"]))
+                    return reject("ReviewPanelSelected payload is not canonical")
+                state = task "|" payload_string["attemptId"]
+                if (current_attempt[task] != payload_string["attemptId"] ||
+                    current_attempt_no[task] != payload_number["attemptNo"] ||
+                    current_attempt_base[task] != payload_string["policyBaseSha"] ||
+                    attempt_terminal[state] || attempt_verdict[state] ||
+                    collect_head[state] != payload_string["reviewedHead"])
+                    return reject("ReviewPanelSelected does not bind current collect-complete attempt")
+                if (panel_id_seen[payload_string["panelId"]])
+                    return reject("ReviewPanelSelected repeats panelId")
+                panel_id_seen[payload_string["panelId"]] = 1
+                panel_selected[top_string["eventId"]] = payload_string["panelId"]
+                panel_selected_task[top_string["eventId"]] = task
+                panel_selected_attempt[top_string["eventId"]] = payload_string["attemptId"]
+                panel_selected_attempt_no[top_string["eventId"]] = payload_number["attemptNo"]
+                panel_selected_head[top_string["eventId"]] = payload_string["reviewedHead"]
+                panel_selected_base[top_string["eventId"]] = payload_string["policyBaseSha"]
+                pending_panel_id = payload_string["panelId"]
+                pending_panel_event = top_string["eventId"]
+                pending_panel_routes = 0
+                pending_panel_formal = 0
+                pending_panel_primary = 0
+                for (state in pending_panel_seat) delete pending_panel_seat[state]
+                for (state in pending_panel_agent) delete pending_panel_agent[state]
+                pending_panel_seat[payload_array_value["seatIds", 1]] = 1
+                pending_panel_seat[payload_array_value["seatIds", 2]] = 1
+                pending_panel_seat[payload_array_value["seatIds", 3]] = 1
+                return 1
+            }
+            if (kind == "ReviewSeatRouted") {
+                route = payload_string["routeKind"]
+                role = payload_string["role"]
+                lineage = payload_string["lineage"]
+                if (payload_count != 19 || !direct_string("payload", "panelId") ||
+                    !direct_string("payload", "seatId") || payload_type["generation"] != "number" ||
+                    !direct_string("payload", "wakeId") || !direct_string("payload", "role") ||
+                    !direct_string("payload", "agent") || !direct_string("payload", "lineage") ||
+                    !direct_string("payload", "reviewedHead") ||
+                    !direct_string("payload", "policyBaseSha") ||
+                    payload_type["deadlineSecs"] != "number" ||
+                    payload_type["retryEligible"] != "boolean" ||
+                    !direct_string("payload", "routeKind") ||
+                    !direct_string("payload", "selectedEventId") ||
+                    !(route == "initial" || route == "retry" || route == "backfill") ||
+                    !(role == "primary" || role == "secondary" || role == "nongate") ||
+                    lineage != role || !safe_id(payload_string["panelId"]) ||
+                    !safe_id(payload_string["seatId"]) || !safe_id(payload_string["wakeId"]) ||
+                    !safe_id(payload_string["agent"]) ||
+                    !safe_id(payload_string["selectedEventId"]) ||
+                    panel_selected[payload_string["selectedEventId"]] != payload_string["panelId"] ||
+                    panel_selected_task[payload_string["selectedEventId"]] != task ||
+                    panel_selected_attempt[payload_string["selectedEventId"]] != payload_string["attemptId"] ||
+                    panel_selected_attempt_no[payload_string["selectedEventId"]] != payload_number["attemptNo"] ||
+                    panel_selected_head[payload_string["selectedEventId"]] != payload_string["reviewedHead"] ||
+                    panel_selected_base[payload_string["selectedEventId"]] != payload_string["policyBaseSha"] ||
+                    !positive_integer(payload_number["generation"]) ||
+                    !positive_integer(payload_number["deadlineSecs"]) ||
+                    !full_sha(payload_string["reviewedHead"]) ||
+                    !full_sha(payload_string["policyBaseSha"]))
+                    return reject("ReviewSeatRouted payload is not canonical")
+                if (route == "initial") {
+                    if (payload_number["generation"] != 1 ||
+                        payload_type["sourceSeatId"] != "null" ||
+                        payload_type["sourceGeneration"] != "null" ||
+                        payload_type["sourceTerminalEventId"] != "null")
+                        return reject("initial ReviewSeatRouted carries source provenance")
+                } else if (!direct_string("payload", "sourceSeatId") ||
+                           payload_type["sourceGeneration"] != "number" ||
+                           !direct_string("payload", "sourceTerminalEventId") ||
+                           !safe_id(payload_string["sourceSeatId"]) ||
+                           !positive_integer(payload_number["sourceGeneration"]) ||
+                           !safe_id(payload_string["sourceTerminalEventId"]) ||
+                           (route == "retry" && payload_number["generation"] != 2) ||
+                           (route == "backfill" && payload_number["generation"] != 1)) {
+                    return reject("retry/backfill ReviewSeatRouted lacks source provenance")
+                }
+                state = payload_string["panelId"] "|" payload_string["seatId"] "|" \
+                    payload_number["generation"]
+                if (route_key_seen[state] || route_wake_seen[payload_string["wakeId"]] ||
+                    wake_issued_seen[payload_string["wakeId"]] ||
+                    managed_terminal_wake[payload_string["wakeId"]] ||
+                    action_rejected_wake[payload_string["wakeId"]])
+                    return reject("ReviewSeatRouted repeats identity or follows wake/terminal authority")
+                route_key_seen[state] = 1
+                route_wake_seen[payload_string["wakeId"]] = 1
+                route_event_key[top_string["eventId"]] = state
+                route_task[state] = task
+                route_panel[state] = payload_string["panelId"]
+                route_seat[state] = payload_string["seatId"]
+                route_generation[state] = payload_number["generation"]
+                route_attempt[state] = payload_string["attemptId"]
+                route_attempt_no[state] = payload_number["attemptNo"]
+                route_wake[state] = payload_string["wakeId"]
+                route_role[state] = role
+                route_agent[state] = payload_string["agent"]
+                route_lineage[state] = lineage
+                route_head[state] = payload_string["reviewedHead"]
+                route_base[state] = payload_string["policyBaseSha"]
+                return 1
+            }
+            if (kind == "ReviewSeatTerminated") {
+                state = payload_string["state"]
+                role = payload_string["role"]
+                lineage = payload_string["lineage"]
+                if (payload_count != 16 || !direct_string("payload", "panelId") ||
+                    !direct_string("payload", "seatId") || payload_type["generation"] != "number" ||
+                    !direct_string("payload", "wakeId") || !direct_string("payload", "role") ||
+                    !direct_string("payload", "agent") || !direct_string("payload", "lineage") ||
+                    !direct_string("payload", "reviewedHead") ||
+                    !direct_string("payload", "policyBaseSha") ||
+                    !direct_string("payload", "state") ||
+                    !direct_string("payload", "terminalEventId") || payload_type["reason"] != "string" ||
+                    !(state == "pass" || state == "fail" || state == "blocked" ||
+                      state == "business-invalid" || state == "system-terminal-invalid") ||
+                    !(role == "primary" || role == "secondary" || role == "nongate") ||
+                    !(lineage == "primary" || lineage == "secondary" || lineage == "nongate") ||
+                    !safe_id(payload_string["panelId"]) ||
+                    !safe_id(payload_string["seatId"]) || !safe_id(payload_string["wakeId"]) ||
+                    !safe_id(payload_string["agent"]) ||
+                    !safe_id(payload_string["terminalEventId"]) ||
+                    !positive_integer(payload_number["generation"]) ||
+                    !full_sha(payload_string["reviewedHead"]) ||
+                    !full_sha(payload_string["policyBaseSha"]) ||
+                    !canonical_nonblank(payload_string["reason"]))
+                    return reject("ReviewSeatTerminated payload is not canonical")
+                if ((state == "pass" || state == "fail" || state == "blocked") &&
+                    !direct_string("payload", "deliveryEventId"))
+                    return reject("substantive ReviewSeatTerminated lacks deliveryEventId")
+                if ((state == "business-invalid" || state == "system-terminal-invalid") &&
+                    payload_type["deliveryEventId"] != "null")
+                    return reject("invalid ReviewSeatTerminated invents deliveryEventId")
+                target = payload_string["panelId"] "|" payload_string["seatId"] "|" \
+                    payload_number["generation"]
+                if (closed_panel[payload_string["panelId"]] || seat_terminal_seen[target] ||
+                    !route_key_seen[target] || route_task[target] != task ||
+                    route_attempt[target] != payload_string["attemptId"] ||
+                    route_attempt_no[target] != payload_number["attemptNo"] ||
+                    route_wake[target] != payload_string["wakeId"] ||
+                    route_role[target] != role || route_agent[target] != payload_string["agent"] ||
+                    route_lineage[target] != lineage ||
+                    route_head[target] != payload_string["reviewedHead"] ||
+                    route_base[target] != payload_string["policyBaseSha"])
+                    return reject("ReviewSeatTerminated does not bind one open route generation")
+                source = payload_string["terminalEventId"]
+                if (managed_terminal_task[source] != task ||
+                    managed_terminal_wake_id[source] != payload_string["wakeId"] ||
+                    managed_terminal_agent[source] != payload_string["agent"] ||
+                    !managed_terminal_scope[source]) {
+                    if (!(state == "system-terminal-invalid" &&
+                          action_rejected_task[source] == task &&
+                          action_rejected_wake_id[source] == payload_string["wakeId"] &&
+                          action_rejected_attempt[source] == payload_string["attemptId"]))
+                        return reject("ReviewSeatTerminated terminalEventId is not exact authority")
+                }
+                if (state == "pass" || state == "fail" || state == "blocked") {
+                    if (managed_terminal_state[source] != "answered" ||
+                        pending_promotion_terminal_key != target ||
+                        pending_promotion_delivery != payload_string["deliveryEventId"] ||
+                        pending_promotion_source != source ||
+                        pending_promotion_state != state)
+                        return reject("substantive ReviewSeatTerminated is not adjacent to its promotion/delivery")
+                } else if (pending_promotion_terminal_key != "") {
+                    return reject("invalid ReviewSeatTerminated cannot consume a pending promotion")
+                }
+                seat_terminal_seen[target] = 1
+                return 1
+            }
+            if (kind == "ReviewSpoolPromoted") {
+                role = payload_string["role"]
+                artifact = payload_string["attemptId"] "-" payload_string["seatId"] "-g" \
+                    payload_number["generation"] "-" payload_string["wakeId"] ".md"
+                canonical = "coordination/rounds/" top_string["round"] "/reviews/" artifact
+                staging = "/.cowork-temp/review-spool/" artifact
+                if (payload_count != 19 || !direct_string("payload", "panelId") ||
+                    !direct_string("payload", "seatId") || payload_type["generation"] != "number" ||
+                    !direct_string("payload", "wakeId") || !direct_string("payload", "role") ||
+                    !direct_string("payload", "agent") || !direct_string("payload", "reviewedHead") ||
+                    !direct_string("payload", "policyBaseSha") ||
+                    !direct_string("payload", "stagingPath") ||
+                    !direct_string("payload", "canonicalPath") ||
+                    !direct_string("payload", "sha256") || payload_type["bytes"] != "number" ||
+                    payload_type["bodyLen"] != "number" || !direct_string("payload", "verdict") ||
+                    !direct_string("payload", "terminalEventId") ||
+                    !direct_string("payload", "deliveryEventId") ||
+                    !(role == "primary" || role == "secondary" || role == "nongate") ||
+                    !safe_id(payload_string["panelId"]) ||
+                    !safe_id(payload_string["seatId"]) || !safe_id(payload_string["wakeId"]) ||
+                    !safe_id(payload_string["agent"]) ||
+                    !safe_id(payload_string["terminalEventId"]) ||
+                    !safe_id(payload_string["deliveryEventId"]) ||
+                    !positive_integer(payload_number["generation"]) ||
+                    !full_sha(payload_string["reviewedHead"]) ||
+                    !full_sha(payload_string["policyBaseSha"]) ||
+                    !full_digest(payload_string["sha256"]) ||
+                    !positive_integer(payload_number["bytes"]) ||
+                    !positive_integer(payload_number["bodyLen"]) ||
+                    payload_number["bodyLen"] > payload_number["bytes"] ||
+                    !(payload_string["verdict"] == "PASS" ||
+                      payload_string["verdict"] == "FAIL" ||
+                      payload_string["verdict"] == "BLOCKED") ||
+                    !canonical_relative(payload_string["stagingPath"]) ||
+                    !canonical_relative(payload_string["canonicalPath"]) ||
+                    payload_string["canonicalPath"] != canonical ||
+                    index(payload_string["stagingPath"], ".worktrees/") != 1 ||
+                    length(payload_string["stagingPath"]) <= length(staging) ||
+                    substr(payload_string["stagingPath"],
+                           length(payload_string["stagingPath"]) - length(staging) + 1) != staging)
+                    return reject("ReviewSpoolPromoted payload is not canonical")
+                target = payload_string["panelId"] "|" payload_string["seatId"] "|" \
+                    payload_number["generation"]
+                source = payload_string["terminalEventId"]
+                if (closed_panel[payload_string["panelId"]] || seat_terminal_seen[target] ||
+                    promotion_key_seen[target "|" payload_string["wakeId"]] ||
+                    promotion_delivery_seen[payload_string["deliveryEventId"]] ||
+                    !route_key_seen[target] || route_task[target] != task ||
+                    route_attempt[target] != payload_string["attemptId"] ||
+                    route_attempt_no[target] != payload_number["attemptNo"] ||
+                    route_wake[target] != payload_string["wakeId"] ||
+                    route_role[target] != role || route_agent[target] != payload_string["agent"] ||
+                    route_head[target] != payload_string["reviewedHead"] ||
+                    route_base[target] != payload_string["policyBaseSha"] ||
+                    managed_terminal_task[source] != task ||
+                    managed_terminal_wake_id[source] != payload_string["wakeId"] ||
+                    managed_terminal_agent[source] != payload_string["agent"] ||
+                    managed_terminal_state[source] != "answered" ||
+                    !managed_terminal_scope[source] ||
+                    managed_terminal_sha[source] != payload_string["sha256"] ||
+                    index(managed_terminal_output[source], payload_string["stagingPath"]) == 0)
+                    return reject("ReviewSpoolPromoted route/terminal authority is not closed")
+                promotion_key_seen[target "|" payload_string["wakeId"]] = 1
+                promotion_delivery_seen[payload_string["deliveryEventId"]] = 1
+                pending_promotion_delivery = payload_string["deliveryEventId"]
+                pending_promotion_terminal_key = target
+                pending_promotion_source = source
+                pending_promotion_task = task
+                pending_promotion_attempt = payload_string["attemptId"]
+                pending_promotion_role = role
+                pending_promotion_agent = payload_string["agent"]
+                pending_promotion_panel = payload_string["panelId"]
+                pending_promotion_seat = payload_string["seatId"]
+                pending_promotion_generation = payload_number["generation"]
+                pending_promotion_wake = payload_string["wakeId"]
+                pending_promotion_base = payload_string["policyBaseSha"]
+                pending_promotion_head = payload_string["reviewedHead"]
+                pending_promotion_body_len = payload_number["bodyLen"]
+                pending_promotion_state = payload_string["verdict"] == "PASS" ? "pass" : \
+                    (payload_string["verdict"] == "FAIL" ? "fail" : "blocked")
+                return 1
+            }
+            if (kind == "ReviewPanelClosed") {
+                state = payload_string["outcome"]
+                if (payload_count != 11 || !direct_string("payload", "panelId") ||
+                    !direct_string("payload", "reviewedHead") ||
+                    !direct_string("payload", "policyBaseSha") ||
+                    !direct_string("payload", "outcome") || payload_type["reason"] != "string" ||
+                    payload_type["terminalSeatCount"] != "number" ||
+                    payload_type["passCount"] != "number" || payload_type["primaryPass"] != "boolean" ||
+                    !(state == "pass" || state == "veto" || state == "pool-exhausted") ||
+                    !safe_id(payload_string["panelId"]) ||
+                    !positive_integer(payload_number["terminalSeatCount"]) ||
+                    !nonnegative_integer(payload_number["passCount"]) ||
+                    payload_number["passCount"] > payload_number["terminalSeatCount"] ||
+                    !full_sha(payload_string["reviewedHead"]) ||
+                    !full_sha(payload_string["policyBaseSha"]) ||
+                    !canonical_nonblank(payload_string["reason"]))
+                    return reject("ReviewPanelClosed payload is not canonical")
+                if (closed_panel[payload_string["panelId"]])
+                    return reject("ReviewPanelClosed repeats panelId")
+                closed_panel[payload_string["panelId"]] = 1
+                return 1
+            }
+            if (kind == "GateLaneEscalated") {
+                if (payload_count != 8 || payload_string["fromLane"] != "candidate" ||
+                    payload_string["toLane"] != "fast" || payload_type["reason"] != "string" ||
+                    !direct_string("payload", "policyBaseSha") ||
+                    !direct_string("payload", "resolvedCommandDigest") ||
+                    !canonical_nonblank(payload_string["reason"]) ||
+                    !full_sha(payload_string["policyBaseSha"]) ||
+                    !full_digest(payload_string["resolvedCommandDigest"]))
+                    return reject("GateLaneEscalated payload is not canonical")
+                state = task "|" payload_string["attemptId"]
+                if (dispatch_seen[state] != 1 ||
+                    dispatch_base[state] != payload_string["policyBaseSha"] ||
+                    gate_lane_seen[state])
+                    return reject("GateLaneEscalated lacks unique dispatch authority")
+                gate_lane_seen[state] = 1
+                return 1
+            }
+            if (kind == "GateReused") {
+                source = payload_string["sourcePhase"]
+                target = payload_string["targetPhase"]
+                if (payload_count != 12 || !direct_string("payload", "sourceGateEventId") ||
+                    !direct_string("payload", "sourcePhase") ||
+                    !direct_string("payload", "targetPhase") ||
+                    !direct_string("payload", "inputIdentitySha256") ||
+                    !direct_string("payload", "commandRef") ||
+                    !direct_string("payload", "subjectTreeSha") ||
+                    !direct_string("payload", "logSha256") || payload_type["logBytes"] != "number" ||
+                    payload_type["savedMs"] != "number" ||
+                    !((source == "collect" && target == "root") ||
+                      (source == "trial" && target == "postmerge")) ||
+                    !full_digest(payload_string["inputIdentitySha256"]) ||
+                    !safe_id(payload_string["sourceGateEventId"]) ||
+                    !safe_id(payload_string["commandRef"]) ||
+                    !full_sha(payload_string["subjectTreeSha"]) ||
+                    !full_digest(payload_string["logSha256"]) ||
+                    !positive_integer(payload_number["logBytes"]) ||
+                    !nonnegative_integer(payload_number["savedMs"]))
+                    return reject("GateReused payload is not canonical")
+                state = task "|" payload_string["attemptId"]
+                actual = payload_string["sourceGateEventId"]
+                if (dispatch_seen[state] != 1 || gate_source_count[actual] != 1 ||
+                    gate_source_task[actual] != task || gate_source_phase[actual] != source ||
+                    gate_source_command[actual] != payload_string["commandRef"] ||
+                    gate_source_tree[actual] != payload_string["subjectTreeSha"] ||
+                    gate_source_log_sha[actual] != payload_string["logSha256"] ||
+                    gate_source_log_bytes[actual] != payload_number["logBytes"])
+                    return reject("GateReused lacks exact dispatch/source GateExecuted authority")
+                return 1
+            }
+            if (kind == "GateReuseMiss") {
+                actual = payload_string["actualSha256"]
+                if (payload_count != 11 || !direct_string("payload", "phase") ||
+                    !direct_string("payload", "commandRef") || payload_type["missNo"] != "number" ||
+                    !direct_string("payload", "reason") ||
+                    !direct_string("payload", "inputIdentitySha256") ||
+                    !direct_string("payload", "expectedSha256") ||
+                    !direct_string("payload", "actualSha256") ||
+                    !direct_string("payload", "policyBaseSha") ||
+                    !(payload_string["phase"] == "root" ||
+                      payload_string["phase"] == "trial" ||
+                      payload_string["phase"] == "postmerge") ||
+                    !(payload_string["reason"] == "input-tree" ||
+                      payload_string["reason"] == "contract" ||
+                      payload_string["reason"] == "command" ||
+                      payload_string["reason"] == "toolchain" ||
+                      payload_string["reason"] == "environment") ||
+                    !safe_id(payload_string["commandRef"]) ||
+                    !positive_integer(payload_number["missNo"]) ||
+                    payload_number["missNo"] > 2 ||
+                    !full_digest(payload_string["inputIdentitySha256"]) ||
+                    !full_digest(payload_string["expectedSha256"]) || !full_digest(actual) ||
+                    !full_sha(payload_string["policyBaseSha"]))
+                    return reject("GateReuseMiss payload is not canonical")
+                state = task "|" payload_string["attemptId"]
+                if (dispatch_seen[state] != 1 ||
+                    dispatch_base[state] != payload_string["policyBaseSha"])
+                    return reject("GateReuseMiss lacks unique dispatch authority")
+                gate_miss_count[state]++
+                if (gate_miss_count[state] != payload_number["missNo"])
+                    return reject("GateReuseMiss missNo is not attempt-scoped monotonic")
+                return 1
+            }
+            return reject("unhandled runtime V1 event " kind)
+        }
+
         function process_event(    kind, actor, task, verdict, stage) {
             kind = top_string["type"]
             actor = top_string["actor"]
@@ -747,6 +1359,213 @@ pending_verdict_barrier() {
             stage = ""
             if (("stage" in payload_present) && direct_string("payload", "stage"))
                 stage = payload_string["stage"]
+
+            if (pending_promotion_delivery != "" && !pending_promotion_delivery_seen) {
+                source = pending_promotion_role == "nongate" ? \
+                    "NongateReviewDelivered" : "ReviewDelivered"
+                if (kind != source || actor != "runtime:orch" || task != pending_promotion_task ||
+                    top_string["eventId"] != pending_promotion_delivery ||
+                    !direct_string("payload", "attemptId") ||
+                    payload_string["attemptId"] != pending_promotion_attempt ||
+                    !direct_string("payload", "role") ||
+                    payload_string["role"] != pending_promotion_role ||
+                    !direct_string("payload", "agent") ||
+                    payload_string["agent"] != pending_promotion_agent ||
+                    !direct_string("payload", "panelId") ||
+                    payload_string["panelId"] != pending_promotion_panel ||
+                    !direct_string("payload", "seatId") ||
+                    payload_string["seatId"] != pending_promotion_seat ||
+                    payload_type["generation"] != "number" ||
+                    payload_number["generation"] != pending_promotion_generation ||
+                    !direct_string("payload", "wakeId") ||
+                    payload_string["wakeId"] != pending_promotion_wake ||
+                    !direct_string("payload", "policyBaseSha") ||
+                    payload_string["policyBaseSha"] != pending_promotion_base ||
+                    !direct_string("payload", "reviewedHead") ||
+                    payload_string["reviewedHead"] != pending_promotion_head ||
+                    payload_type["bodyLen"] != "number" ||
+                    payload_number["bodyLen"] != pending_promotion_body_len)
+                    return reject("ReviewSpoolPromoted lacks adjacent exact delivery")
+                pending_promotion_delivery_seen = 1
+                return 1
+            }
+            if (pending_promotion_delivery_seen) {
+                if (kind != "ReviewSeatTerminated" || actor != "runtime:orch" ||
+                    !validate_runtime_v1(kind, task))
+                    return reject("ReviewSpoolPromoted delivery lacks adjacent exact seat terminal")
+                close_wake_id(payload_string["wakeId"])
+                pending_promotion_delivery = ""
+                pending_promotion_delivery_seen = 0
+                pending_promotion_terminal_key = ""
+                pending_promotion_source = ""
+                pending_promotion_task = ""
+                pending_promotion_attempt = ""
+                pending_promotion_role = ""
+                pending_promotion_agent = ""
+                pending_promotion_panel = ""
+                pending_promotion_seat = ""
+                pending_promotion_generation = 0
+                pending_promotion_wake = ""
+                pending_promotion_base = ""
+                pending_promotion_head = ""
+                pending_promotion_body_len = 0
+                pending_promotion_state = ""
+                return 1
+            }
+
+            if (pending_panel_id != "") {
+                if (kind != "ReviewSeatRouted" || actor != "runtime:orch" ||
+                    !validate_runtime_v1(kind, task) ||
+                    payload_string["routeKind"] != "initial" ||
+                    payload_string["panelId"] != pending_panel_id ||
+                    payload_string["selectedEventId"] != pending_panel_event ||
+                    pending_panel_seat[payload_string["seatId"]] != 1 ||
+                    pending_panel_agent[payload_string["agent"]])
+                    return reject("ReviewPanelSelected lacks three adjacent exact initial routes")
+                pending_panel_seat[payload_string["seatId"]] = 2
+                pending_panel_agent[payload_string["agent"]] = 1
+                if (payload_string["role"] != "nongate") pending_panel_formal++
+                if (payload_string["lineage"] == "primary") pending_panel_primary++
+                pending_panel_routes++
+                open_wake_id(payload_string["wakeId"], task)
+                if (pending_panel_routes == 3) {
+                    if (pending_panel_formal < 2 || pending_panel_primary < 1)
+                        return reject("ReviewPanelSelected initial routes lack formal/primary floor")
+                    pending_panel_id = ""
+                    pending_panel_event = ""
+                    pending_panel_routes = 0
+                }
+                return 1
+            }
+
+            if (kind == "DispatchIssued") {
+                if (actor != "runtime:orch" || task == "" || !runtime_attempt(task))
+                    return reject("DispatchIssued cannot seed policy-idle projection")
+                open_attempt(task, payload_string["attemptId"])
+                current_attempt[task] = payload_string["attemptId"]
+                current_attempt_no[task] = payload_number["attemptNo"]
+                current_attempt_base[task] = direct_string("payload", "baseSha") ? \
+                    payload_string["baseSha"] : ""
+                target = task "|" payload_string["attemptId"]
+                dispatch_seen[target]++
+                dispatch_base[target] = current_attempt_base[task]
+            } else if (kind == "TaskRecorded") {
+                if (actor == "runtime:orch" && task != "" && payload_count == 1 &&
+                    direct_string("payload", "postMergeGates") &&
+                    payload_string["postMergeGates"] == "all-green") {
+                    close_task_attempts(task)
+                    close_task_wakes(task)
+                    current_attempt[task] = ""
+                    task_recorded_owner[top_string["eventId"]] = task
+                }
+            } else if (kind == "AttemptBlocked" || kind == "AttemptCrashed" ||
+                       kind == "AttemptTimedOut" || kind == "AttemptFailed") {
+                if (task != "" && direct_string("payload", "attemptId")) {
+                    close_attempt(task, payload_string["attemptId"])
+                    attempt_terminal[task "|" payload_string["attemptId"]] = 1
+                    if (current_attempt[task] == payload_string["attemptId"])
+                        current_attempt[task] = ""
+                }
+            } else if (kind == "ReportCollectCompleted") {
+                if (actor == "runtime:orch" && task != "" &&
+                    direct_string("payload", "attemptId") &&
+                    direct_string("payload", "branchSha") &&
+                    full_sha(payload_string["branchSha"])) {
+                    target = task "|" payload_string["attemptId"]
+                    if (collect_head[target] != "" &&
+                        collect_head[target] != payload_string["branchSha"])
+                        return reject("ReportCollectCompleted carries conflicting branchSha")
+                    collect_head[target] = payload_string["branchSha"]
+                }
+            } else if (kind == "WakeIssued") {
+                if (!direct_string("payload", "wakeId") ||
+                    !safe_id(payload_string["wakeId"]))
+                    return reject("WakeIssued cannot seed policy-idle projection")
+                wake_issued_seen[payload_string["wakeId"]] = 1
+                if (payload_present["routeEventId"]) {
+                    source = payload_string["routeEventId"]
+                    target = route_event_key[source]
+                    if (!direct_string("payload", "routeEventId") || target == "" ||
+                        route_task[target] != task ||
+                        route_wake[target] != payload_string["wakeId"] ||
+                        route_attempt[target] != payload_string["attemptId"] ||
+                        route_agent[target] != payload_string["agent"] ||
+                        route_role[target] == "" ||
+                        route_panel[target] != payload_string["panelId"] ||
+                        route_seat[target] != payload_string["seatId"] ||
+                        route_generation[target] != payload_number["generation"] ||
+                        route_head[target] != payload_string["reviewedHead"] ||
+                        route_base[target] != payload_string["policyBaseSha"])
+                        return reject("WakeIssued does not exactly bind its prior panel route")
+                }
+                open_wake_id(payload_string["wakeId"], task)
+            } else if (kind == "ManagedWakeTerminated") {
+                if (!direct_string("payload", "wakeId") ||
+                    !safe_id(payload_string["wakeId"]))
+                    return reject("ManagedWakeTerminated cannot close policy-idle projection")
+                managed_terminal_wake[payload_string["wakeId"]] = 1
+                managed_terminal_task[top_string["eventId"]] = task
+                managed_terminal_wake_id[top_string["eventId"]] = payload_string["wakeId"]
+                managed_terminal_agent[top_string["eventId"]] = payload_string["agent"]
+                managed_terminal_state[top_string["eventId"]] = payload_string["state"]
+                managed_terminal_scope[top_string["eventId"]] = \
+                    payload_type["managedScopeTerminated"] == "boolean" &&
+                    payload_string["managedScopeTerminated"] == "true"
+                managed_terminal_output[top_string["eventId"]] = payload_string["outputPath"]
+                managed_terminal_sha[top_string["eventId"]] = payload_string["outputSha256"]
+                close_wake_id(payload_string["wakeId"])
+            } else if (kind == "ActionRejected" && direct_string("payload", "actionId")) {
+                action_rejected_wake[payload_string["actionId"]] = 1
+                action_rejected_task[top_string["eventId"]] = task
+                action_rejected_wake_id[top_string["eventId"]] = payload_string["actionId"]
+                action_rejected_attempt[top_string["eventId"]] = payload_string["attemptId"]
+            } else if (kind == "GateExecuted" && actor == "runtime:orch" && task != "" &&
+                       payload_count == 10 && direct_string("payload", "commandRef") &&
+                       direct_string("payload", "phase") && direct_string("payload", "gateRunId") &&
+                       payload_type["exitCode"] == "number" &&
+                       payload_type["durationMs"] == "number" &&
+                       direct_string("payload", "subjectTreeSha") &&
+                       direct_string("payload", "logSha256") &&
+                       payload_type["logBytes"] == "number" &&
+                       direct_string("payload", "toolchainDigest") &&
+                       direct_string("payload", "environmentDigest") &&
+                       full_sha(payload_string["subjectTreeSha"]) &&
+                       full_digest(payload_string["logSha256"]) &&
+                       full_digest(payload_string["toolchainDigest"]) &&
+                       full_digest(payload_string["environmentDigest"])) {
+                source = top_string["eventId"]
+                gate_source_count[source]++
+                gate_source_task[source] = task
+                gate_source_phase[source] = payload_string["phase"]
+                gate_source_command[source] = payload_string["commandRef"]
+                gate_source_tree[source] = payload_string["subjectTreeSha"]
+                gate_source_log_sha[source] = payload_string["logSha256"]
+                gate_source_log_bytes[source] = payload_number["logBytes"]
+            } else if (kind == "GateExecuted") {
+                return reject("GateExecuted payload is not canonical")
+            }
+
+            if (runtime_v1_kind(kind)) {
+                if (actor != "runtime:orch")
+                    return reject(kind " envelope is not runtime authority")
+                if (round_closed)
+                    return reject(kind " is forbidden after RoundClosed")
+                if ((kind == "RuntimePolicyActivated" || kind == "RuntimePolicyDeactivated") &&
+                    (open_attempt_count != 0 || open_wake_count != 0 || pending_task != "" ||
+                     postmerge_task != ""))
+                    return reject(kind " is forbidden while attempt/wake/barrier is in flight")
+                if (pending_started)
+                    return reject(kind " is forbidden before MergeExecuted in an active barrier")
+                if (postmerge_task != "" &&
+                    !(kind == "GateReused" && payload_string["targetPhase"] == "postmerge"))
+                    return reject(kind " is forbidden inside the postmerge barrier")
+                if (!validate_runtime_v1(kind, task)) return 0
+                if (kind == "ReviewSeatRouted")
+                    open_wake_id(payload_string["wakeId"], task)
+                else if (kind == "ReviewSeatTerminated")
+                    close_wake_id(payload_string["wakeId"])
+                return 1
+            }
 
             # close.rs publishes a no-merge closure and its attempt terminal
             # in one B205 batch, hence their ledger lines are adjacent.  Do
@@ -765,11 +1584,21 @@ pending_verdict_barrier() {
                 return 1
             }
 
+            if (kind == "RoundClosed") {
+                if (round_closed || actor != "runtime:orch" || task != "" ||
+                    pending_task != "" || pending_started || postmerge_task != "" ||
+                    open_attempt_count != 0 || open_wake_count != 0)
+                    return reject("RoundClosed phase/envelope is not canonical")
+                round_closed = 1
+                return 1
+            }
+
             if (kind == "VerdictIssued") {
                 if (actor != "verifier:root" || task == "")
                     return reject("VerdictIssued envelope is not canonical root authority")
                 if (!validate_root_verdict(task)) return 0
                 verdict = payload_string["verdict"]
+                attempt_verdict[task "|" payload_string["attemptId"]] = 1
                 if (verdict == "PASS") {
                     if (pending_task != "") return reject("multiple unresolved root PASS verdicts")
                     pending_task = task
@@ -809,8 +1638,27 @@ pending_verdict_barrier() {
                     return reject("MergeExecuted envelope/payload is not canonical")
                 if (pending_task == "" || !pending_started || task != pending_task)
                     return reject("MergeExecuted does not canonically close pending root PASS")
+                merge_owner[task "|" payload_string["mergeSha"]]++
+                postmerge_task = task
                 pending_task = ""
                 pending_started = 0
+                return 1
+            }
+
+            if (kind == "TaskRecorded" && postmerge_task != "") {
+                if (actor != "runtime:orch" || task != postmerge_task || payload_count != 1 ||
+                    !direct_string("payload", "postMergeGates") ||
+                    payload_string["postMergeGates"] != "all-green")
+                    return reject("TaskRecorded does not canonically close postmerge barrier")
+                postmerge_task = ""
+                return 1
+            }
+
+            if (kind == "EscalationRaised" && stage == "post-merge-gate-released" &&
+                postmerge_task != "") {
+                if (actor != "reviewer:orch-runtime" || task != postmerge_task)
+                    return reject("post-merge-gate-released does not bind postmerge barrier")
+                postmerge_task = ""
                 return 1
             }
 
@@ -918,6 +1766,14 @@ pending_verdict_barrier() {
                 print "pending merge barrier closure lacks adjacent exact AttemptBlocked"
                 exit 2
             }
+            if (pending_promotion_delivery != "" || pending_promotion_delivery_seen) {
+                print "ReviewSpoolPromoted lacks adjacent exact delivery/seat terminal"
+                exit 2
+            }
+            if (pending_panel_id != "") {
+                print "ReviewPanelSelected lacks three adjacent exact initial routes"
+                exit 2
+            }
             if (pending_task != "") {
                 if (pending_started && pending_main != transaction_old) {
                     print "pending MergeStarted.mainHeadSha does not equal transaction old SHA"
@@ -931,6 +1787,7 @@ pending_verdict_barrier() {
         }
     ' "$ledger_file")
     barrier_status=$?
+    rm -f "$ledger_file" "$old_ledger_file" "$ledger_prefix_file"
     case "$barrier_status" in
         0) printf '%s\n' "$barrier_detail"; return 0 ;;
         1) return 1 ;;
@@ -1017,11 +1874,39 @@ do
         continue
     fi
 
+    if [ "$refname" = "refs/heads/main" ]; then
+        seal_intent=$root/coordination/runtime/locks/seal-owner.intent
+        if [ -e "$seal_intent" ]; then
+            if [ ! -f "$seal_intent" ] || [ -L "$seal_intent" ]; then
+                reason="active seal owner intent is not a regular non-symlink file"
+                record_violation "$refname" "$old" "$new" "seal-owner" "$reason"
+                exit 1
+            fi
+            seal_lines=$(wc -l <"$seal_intent" 2>/dev/null | tr -d '[:space:]') || seal_lines=""
+            seal_pid=$(sed -n '1s/^pid=//p' "$seal_intent" 2>/dev/null)
+            seal_token=$(sed -n '2s/^token=//p' "$seal_intent" 2>/dev/null)
+            case "$seal_lines" in 2) ;; *) seal_pid="" ;; esac
+            case "$seal_pid" in ""|0*|*[!0-9]*) seal_pid="" ;; esac
+            case "$seal_token" in ""|*[!A-Z0-9]*) seal_token="" ;; esac
+            if [ -z "$seal_pid" ] || [ "${#seal_token}" -ne 26 ]; then
+                reason="active seal owner intent has malformed pid/token bytes"
+                record_violation "$refname" "$old" "$new" "seal-owner" "$reason"
+                exit 1
+            fi
+            if [ "$authorized_orch_merge" != "true" ] ||
+               [ "${ORCH_SEAL_OWNER_TOKEN-}" != "$seal_token" ]; then
+                reason="active seal owner pid=$seal_pid rejects non-owner main update"
+                record_violation "$refname" "$old" "$new" "seal-owner" "$reason"
+                exit 1
+            fi
+        fi
+    fi
+
     if [ "$new" != "$zero" ]; then
         git merge-base --is-ancestor "$old" "$new" >/dev/null 2>&1
         ancestry_status=$?
         if [ "$ancestry_status" -eq 0 ]; then
-            barrier_detail=$(pending_verdict_barrier "$old")
+            barrier_detail=$(pending_verdict_barrier "$old" "$new")
             barrier_status=$?
             if [ "$barrier_status" -eq 1 ]; then
                 continue

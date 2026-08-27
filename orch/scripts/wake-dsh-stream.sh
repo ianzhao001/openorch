@@ -1,6 +1,18 @@
 #!/bin/sh
 # wake-dsh-stream.sh <message> -- DeepSeek Harness completed-tool projection.
 #
+# Reserved wrapper outcomes. Provider-native non-zero codes are preserved as
+# failed exact reasons and therefore deliberately remain outside this manifest.
+# orch-exit-code: 0 answered exact-terminal
+# orch-exit-code: 3 failed launch-failure
+# orch-exit-code: 64 failed invalid-arguments
+# orch-exit-code: 65 failed invalid-workspace
+# orch-exit-code: 66 failed invalid-envelope
+# orch-exit-code: 70 empty zero-frame-eof
+# orch-exit-code: 71 empty truncated-no-terminal
+# orch-exit-code: 72 timedOut hard-deadline
+# orch-exit-code: 74 failed identity-drift
+#
 # This is intentionally a narrow, nongate-review transport.  It parses the
 # review site and runtime target from their authoritative message lines.  It
 # keeps ambient DSH_HOME for the installed profile/credentials, but uses DSH's
@@ -55,6 +67,43 @@ MAX_FRAME_BYTES = 64 * 1024
 
 def diag(text):
     print("[wake-dsh-stream] " + text, file=sys.stderr, flush=True)
+
+
+ENVELOPE_KEYS = (
+    "ORCH_HARNESS_ID",
+    "ORCH_HARNESS_ACTION_ID",
+    "ORCH_HARNESS_WAKE_ID",
+    "ORCH_HARNESS_ROUND",
+    "ORCH_HARNESS_TASK_ID",
+    "ORCH_HARNESS_ATTEMPT_ID",
+    "ORCH_HARNESS_ROLE",
+    "ORCH_HARNESS_CWD",
+    "ORCH_HARNESS_FIXED_HEAD",
+    "ORCH_HARNESS_PROVIDER",
+    "ORCH_HARNESS_MODEL",
+    "ORCH_HARNESS_EFFORT",
+    "ORCH_HARNESS_PROVIDER_BIN",
+    "ORCH_HARNESS_REVIEW_OUTPUT_PATH",
+    "ORCH_HARNESS_ORCH_BIN",
+    "ORCH_HARNESS_DEADLINE_SECS",
+)
+
+
+def exact_executable(value, key):
+    if not isinstance(value, str) or not os.path.isabs(value):
+        diag("%s 必须是绝对可执行路径: %r" % (key, value))
+        sys.exit(66)
+    resolved = os.path.realpath(value)
+    if not os.path.isfile(resolved) or not os.access(resolved, os.X_OK):
+        diag("%s 不存在或不可执行: %s" % (key, value))
+        sys.exit(66)
+    return resolved
+
+
+def legacy_conflict(alias, envelope_key, selected):
+    legacy = os.environ.get(alias)
+    if legacy is not None and legacy != selected:
+        diag("legacy alias conflict: %s ignored; %s wins" % (alias, envelope_key))
 
 
 def executable(value, label):
@@ -213,8 +262,58 @@ def completed_tool_text(record):
 
 
 message = os.environ["MSG"]
-workdir = message_directory(message, "WORKTREE")
-runtime_target = message_directory(message, "CARGO_TARGET_DIR")
+present_envelope_keys = [key for key in ENVELOPE_KEYS if key in os.environ]
+envelope_mode = bool(present_envelope_keys)
+if envelope_mode:
+    missing = [
+        key
+        for key in ENVELOPE_KEYS
+        if not isinstance(os.environ.get(key), str) or not os.environ[key].strip()
+    ]
+    if missing:
+        diag("incomplete invocation envelope; missing/blank: %s" % ",".join(missing))
+        sys.exit(66)
+    if os.environ["ORCH_HARNESS_ID"] != "dsh":
+        diag("ORCH_HARNESS_ID 与 dsh wrapper 不匹配")
+        sys.exit(66)
+    workdir = os.environ["ORCH_HARNESS_CWD"]
+    dsh_bin = exact_executable(
+        os.environ["ORCH_HARNESS_PROVIDER_BIN"], "ORCH_HARNESS_PROVIDER_BIN"
+    )
+    pin_provider = os.environ["ORCH_HARNESS_PROVIDER"]
+    pin_model = os.environ["ORCH_HARNESS_MODEL"]
+    pin_effort = os.environ["ORCH_HARNESS_EFFORT"]
+    timeout_text = os.environ["ORCH_HARNESS_DEADLINE_SECS"]
+    for alias, envelope_key, selected in (
+        ("ORCH_DSH_CWD", "ORCH_HARNESS_CWD", workdir),
+        ("ORCH_DSH_BIN", "ORCH_HARNESS_PROVIDER_BIN", dsh_bin),
+        ("ORCH_DSH_PROVIDER", "ORCH_HARNESS_PROVIDER", pin_provider),
+        ("ORCH_DSH_MODEL", "ORCH_HARNESS_MODEL", pin_model),
+        ("ORCH_DSH_EFFORT", "ORCH_HARNESS_EFFORT", pin_effort),
+        ("ORCH_DSH_TIMEOUT", "ORCH_HARNESS_DEADLINE_SECS", timeout_text),
+    ):
+        legacy_conflict(alias, envelope_key, selected)
+else:
+    workdir = message_directory(message, "WORKTREE")
+    dsh_bin = executable(os.environ.get("ORCH_DSH_BIN") or "dsh", "DSH 入口")
+    pin_provider = os.environ.get("ORCH_DSH_PROVIDER")
+    pin_model = os.environ.get("ORCH_DSH_MODEL")
+    pin_effort = os.environ.get("ORCH_DSH_EFFORT")
+    timeout_text = os.environ.get("ORCH_DSH_TIMEOUT") or "7200"
+
+if not os.path.isdir(workdir) or not os.path.isabs(workdir):
+    diag("ORCH_HARNESS_CWD/WORKTREE 必须是绝对目录: %s" % workdir)
+    sys.exit(65)
+if envelope_mode:
+    # ORCH_HARNESS_ORCH_BIN is an already validated absolute executable such
+    # as <target>/debug/orch.  The parent of its profile directory is the
+    # runtime-owned Cargo target root; envelope mode must not keep borrowing a
+    # second, unauthenticated path from human prompt text.
+    runtime_target = os.path.dirname(
+        os.path.dirname(os.path.realpath(os.environ["ORCH_HARNESS_ORCH_BIN"]))
+    )
+else:
+    runtime_target = message_directory(message, "CARGO_TARGET_DIR")
 try:
     target_is_in_workspace = os.path.commonpath([workdir, runtime_target]) == workdir
     temporary_roots = {
@@ -227,7 +326,11 @@ try:
 except ValueError:
     target_is_in_workspace = True
     target_is_temporary = True
-if target_is_in_workspace or target_is_temporary:
+manual_envelope = envelope_mode and (
+    os.environ["ORCH_HARNESS_TASK_ID"] == "MANUAL"
+    and os.environ["ORCH_HARNESS_ATTEMPT_ID"] == "MANUAL-A0000"
+)
+if (target_is_in_workspace and not manual_envelope) or target_is_temporary:
     diag("CARGO_TARGET_DIR 必须位于 WORKTREE 与 /tmp 之外: %s" % runtime_target)
     sys.exit(65)
 
@@ -257,27 +360,42 @@ session_store = private_directory(
 patch_path = os.path.join(
     runtime_target, ".orch-dsh-session-patch-" + launch_nonce + ".json"
 )
+patch_entries = [
+    {"id": "session-persistence-jsonl", "config": {"root": session_store}}
+]
+preset = os.environ.get("ORCH_DSH_PRESET") or "minimal"
+if envelope_mode:
+    patch_entries.extend(
+        [
+            {
+                "id": "agent-default-model",
+                "config": {
+                    "provider": pin_provider,
+                    "model": pin_model,
+                    "reasoningEffort": pin_effort,
+                },
+            },
+            {"id": "agent-presets", "config": {"default": preset}},
+        ]
+    )
 patch_payload = (
     json.dumps(
-        [{"id": "session-persistence-jsonl", "config": {"root": session_store}}],
-        ensure_ascii=False,
-        separators=(",", ":"),
+        patch_entries, ensure_ascii=False, separators=(",", ":")
     )
     + "\n"
 ).encode("utf-8")
 install_exact_file(patch_path, patch_payload, "DSH session-root patch")
 
-dsh_bin = executable(os.environ.get("ORCH_DSH_BIN") or "dsh", "DSH 入口")
 zstd_bin = executable(
     os.environ.get("ORCH_DSH_ZSTD_BIN") or "zstd", "zstd 解码器"
 )
 try:
-    timeout = float(os.environ.get("ORCH_DSH_TIMEOUT") or 7200)
+    timeout = float(timeout_text)
 except ValueError:
-    diag("ORCH_DSH_TIMEOUT 必须是秒数")
+    diag("调用 deadline 必须是秒数")
     sys.exit(64)
 if timeout <= 0:
-    diag("ORCH_DSH_TIMEOUT 必须大于 0")
+    diag("调用 deadline 必须大于 0")
     sys.exit(64)
 
 session_root = os.path.join(session_store, cwd_slug(workdir))
@@ -295,8 +413,8 @@ argv = [dsh_bin, "--profile", profile, "--patch", patch_path, message]
 child_env = os.environ.copy()
 child_env["DSH_HOME"] = dsh_home
 diag(
-    "cwd=%s sessionRoot=%s profile=%s timeout=%.0fs"
-    % (workdir, session_store, profile, timeout)
+    "cwd=%s sessionRoot=%s profile=%s preset=%s provider=%s model=%s effort=%s timeout=%.0fs"
+    % (workdir, session_store, profile, preset, pin_provider, pin_model, pin_effort, timeout)
 )
 try:
     process = subprocess.Popen(
@@ -320,6 +438,7 @@ seen_records = 0
 record_frames = 0
 projected = 0
 terminal_seen = False
+terminal_record = None
 timed_out = False
 selection_error = None
 started_wall = time.time()
@@ -391,7 +510,7 @@ def new_candidates():
 
 
 def project_record(record):
-    global projected, terminal_seen
+    global projected, terminal_seen, terminal_record
     kind = record.get("type")
     if kind == "turn/start":
         print("turn.started", flush=True)
@@ -402,6 +521,7 @@ def project_record(record):
             projected += 1
     elif kind == "turn/end":
         terminal_seen = True
+        terminal_record = record
 
 
 def scan_selected_session():
@@ -510,6 +630,23 @@ if not terminal_seen:
     )
     sys.exit(code)
 
+usage = terminal_record.get("usage") if isinstance(terminal_record, dict) else None
+print(
+    json.dumps(
+        {
+            "type": "dsh.terminal",
+            "sessionId": selected_id,
+            "exactReason": "turn/end",
+            "usage": usage if isinstance(usage, dict) else None,
+            "usageAbsentReason": None
+            if isinstance(usage, dict)
+            else "dsh turn/end record omitted usage",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ),
+    flush=True,
+)
 diag(
     "session=%s frames=%d projected=%d terminal=yes cause=terminal rc=0 exit=0"
     % (selected_id, record_frames, projected)

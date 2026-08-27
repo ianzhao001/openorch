@@ -24,13 +24,27 @@ use crate::binding::CommandSpec;
 
 pub const MARKER_FILE: &str = ".orch-build-identity.json";
 pub const TRIAL_SLOT_COUNT: usize = 4;
+/// One complete gate build is budgeted at 38 GiB by the storage admission layer.  A single
+/// retained trial slot larger than that cannot be justified as a warm-start cache: it consumes
+/// more space than the operation whose rebuild it is meant to avoid.
+pub const DEFAULT_TRIAL_SLOT_BUDGET_BYTES: u64 = 38 * 1024 * 1024 * 1024;
 const GENERATION_PREFIX: &str = "generation-";
 const BUILD_IDENTITY_SCHEMA: u32 = 1;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrialCacheSweepReport {
     pub removed: usize,
     pub freed_bytes: u64,
+    /// Logical bytes observed under every slot immediately before and after a budgeted sweep.
+    /// This is deterministic cache visibility, not a claim about APFS physical blocks released.
+    pub slot_usage: Vec<TrialCacheSlotUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrialCacheSlotUsage {
+    pub slot: String,
+    pub logical_bytes_before: u64,
+    pub logical_bytes_after: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1076,10 +1090,26 @@ fn open_slot_lock(root: &Path) -> Result<File> {
 }
 
 /// Remove old private build generations while preserving each slot's newest `keep_latest`
-/// generations.  The stable `source/` worktree and `slot.lock` live beside `generations/`, so the
-/// traversal never enters or removes either of them.  Existing production slot locks are acquired
-/// before deletion; fixture/legacy slots without a lock remain sweepable without creating one.
+/// generations within the default per-slot budget.  The stable `source/` worktree and `slot.lock`
+/// live beside `generations/`, so the traversal never removes either of them.  Existing production
+/// slot locks are acquired before deletion; fixture/legacy slots without a lock remain sweepable
+/// without creating one.  The original report shape remains terse for existing callers; round
+/// close uses [`sweep_trial_cache_with_budget`] to obtain per-slot visibility.
 pub fn sweep_trial_cache(repo_root: &Path, keep_latest: usize) -> Result<TrialCacheSweepReport> {
+    let mut report =
+        sweep_trial_cache_with_budget(repo_root, keep_latest, DEFAULT_TRIAL_SLOT_BUDGET_BYTES)?;
+    report.slot_usage.clear();
+    Ok(report)
+}
+
+/// Remove generations until every slot retains at most `keep_latest` newest generations whose
+/// cumulative logical size is within `slot_budget_bytes`.  An oversized newest generation is
+/// therefore reclaimed even when it is the slot's only generation.
+pub fn sweep_trial_cache_with_budget(
+    repo_root: &Path,
+    keep_latest: usize,
+    slot_budget_bytes: u64,
+) -> Result<TrialCacheSweepReport> {
     let slots_root = repo_root.join(".cowork-temp/trial-cache/slots");
     let entries = match fs::read_dir(&slots_root) {
         Ok(entries) => entries,
@@ -1104,7 +1134,8 @@ pub fn sweep_trial_cache(repo_root: &Path, keep_latest: usize) -> Result<TrialCa
 
     let mut report = TrialCacheSweepReport::default();
     for slot in slots {
-        sweep_trial_slot(&slot, keep_latest, &mut report)?;
+        let usage = sweep_trial_slot(&slot, keep_latest, slot_budget_bytes, &mut report)?;
+        report.slot_usage.push(usage);
     }
     Ok(report)
 }
@@ -1112,8 +1143,9 @@ pub fn sweep_trial_cache(repo_root: &Path, keep_latest: usize) -> Result<TrialCa
 fn sweep_trial_slot(
     slot: &Path,
     keep_latest: usize,
+    slot_budget_bytes: u64,
     report: &mut TrialCacheSweepReport,
-) -> Result<()> {
+) -> Result<TrialCacheSlotUsage> {
     let lock_path = slot.join("slot.lock");
     match OpenOptions::new().read(true).write(true).open(&lock_path) {
         Ok(file) => {
@@ -1124,10 +1156,10 @@ fn sweep_trial_slot(
                     lock_path.display()
                 )
             })?;
-            sweep_slot_generations(slot, keep_latest, report)
+            sweep_slot_generations(slot, keep_latest, slot_budget_bytes, report)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            sweep_slot_generations(slot, keep_latest, report)
+            sweep_slot_generations(slot, keep_latest, slot_budget_bytes, report)
         }
         Err(error) => Err(error).with_context(|| {
             format!(
@@ -1141,12 +1173,24 @@ fn sweep_trial_slot(
 fn sweep_slot_generations(
     slot: &Path,
     keep_latest: usize,
+    slot_budget_bytes: u64,
     report: &mut TrialCacheSweepReport,
-) -> Result<()> {
+) -> Result<TrialCacheSlotUsage> {
+    let logical_bytes_before = apparent_tree_bytes(slot)?;
     let generations_root = slot.join("generations");
     let entries = match fs::read_dir(&generations_root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(TrialCacheSlotUsage {
+                slot: slot
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                logical_bytes_before,
+                logical_bytes_after: logical_bytes_before,
+            })
+        }
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
@@ -1175,13 +1219,23 @@ fn sweep_slot_generations(
         if name != format!("{GENERATION_PREFIX}{number:06}") {
             continue;
         }
-        generations.push((number, entry.path()));
+        let path = entry.path();
+        let bytes = apparent_tree_bytes(&path)?;
+        generations.push((number, path, bytes));
     }
     generations.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
 
-    let remove_count = generations.len().saturating_sub(keep_latest);
-    for (_, generation) in generations.into_iter().take(remove_count) {
-        let bytes = apparent_tree_bytes(&generation)?;
+    let mut remove_count = generations.len().saturating_sub(keep_latest);
+    let mut retained_bytes = generations
+        .iter()
+        .skip(remove_count)
+        .fold(0u64, |total, (_, _, bytes)| total.saturating_add(*bytes));
+    while retained_bytes > slot_budget_bytes && remove_count < generations.len() {
+        retained_bytes = retained_bytes.saturating_sub(generations[remove_count].2);
+        remove_count += 1;
+    }
+
+    for (_, generation, bytes) in generations.into_iter().take(remove_count) {
         crate::util::remove_dir_all_with_enotempty_retry(&generation).with_context(|| {
             format!(
                 "remove old trial cache generation failed: {}",
@@ -1191,7 +1245,15 @@ fn sweep_slot_generations(
         report.removed = report.removed.saturating_add(1);
         report.freed_bytes = report.freed_bytes.saturating_add(bytes);
     }
-    Ok(())
+    Ok(TrialCacheSlotUsage {
+        slot: slot
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        logical_bytes_before,
+        logical_bytes_after: apparent_tree_bytes(slot)?,
+    })
 }
 
 pub(crate) fn apparent_tree_bytes(root: &Path) -> Result<u64> {
@@ -2093,6 +2155,26 @@ mod tests {
             sweep_trial_cache(&repo, 2).unwrap(),
             TrialCacheSweepReport::default()
         );
+    }
+
+    #[test]
+    fn budgeted_sweep_keeps_the_newest_suffix_that_fits() {
+        let repo = crate::util::test_scratch_dir("buildcache-sweep-budget-suffix");
+        let slot = repo.join(".cowork-temp/trial-cache/slots/slot-00");
+        for (generation, bytes) in [(1, 900usize), (2, 700), (3, 600)] {
+            let target = slot.join(format!("generations/generation-{generation:06}/target"));
+            fs::create_dir_all(&target).unwrap();
+            fs::write(target.join("artifact"), vec![generation as u8; bytes]).unwrap();
+        }
+
+        let report = sweep_trial_cache_with_budget(&repo, 3, 1_400).unwrap();
+        assert_eq!(report.removed, 1);
+        assert!(report.freed_bytes >= 900);
+        assert_eq!(report.slot_usage.len(), 1);
+        assert!(report.slot_usage[0].logical_bytes_after <= 1_400);
+        assert!(!slot.join("generations/generation-000001").exists());
+        assert!(slot.join("generations/generation-000002").is_dir());
+        assert!(slot.join("generations/generation-000003").is_dir());
     }
 
     #[test]

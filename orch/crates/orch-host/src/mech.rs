@@ -1490,6 +1490,28 @@ fn branch_has_upstream(root: &Path, branch: &str) -> Result<bool> {
     Ok(status.success())
 }
 
+fn is_full_commit_oid(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Resolve one caller-supplied revision to an immutable commit object ID.
+///
+/// The `^{commit}` peel rejects trees/blobs and makes annotated tags resolve to
+/// their commit.  Requiring Git's complete canonical SHA prevents downstream
+/// helpers from accidentally accepting another movable revision expression.
+fn resolve_commit_oid(root: &Path, revision: &str, label: &str) -> Result<String> {
+    let peeled = format!("{revision}^{{commit}}");
+    let oid = gitx::rev_parse(root, &peeled)
+        .with_context(|| format!("解析 {label} commit 失败: {revision}"))?;
+    if !is_full_commit_oid(&oid) {
+        bail!("{label} 未解析为完整 40 位小写 commit OID: {oid:?}");
+    }
+    Ok(oid)
+}
+
 pub fn check(
     root: &Path,
     c: &card::Card,
@@ -1497,9 +1519,41 @@ pub fn check(
     report_rel: &str,
     expected_base: Option<&str>,
 ) -> Result<MechOutcome> {
-    crate::oracle::validate_seed_paths(root, c)?;
+    // Capture both movable inputs exactly once, before any oracle or Git-tree
+    // inspection.  Every content/history check below consumes only these
+    // immutable object IDs.  `branch` survives solely as the name whose
+    // upstream configuration is checked for pushPolicy=forbidden.
+    let main_oid = resolve_commit_oid(root, "refs/heads/main", "main")?;
+    let candidate_oid = resolve_commit_oid(root, branch, "candidate")?;
+    let signed_card =
+        crate::oracle::load_exact_main_signed_card(root, c, &main_oid)?;
+    let c = signed_card.as_ref().unwrap_or(c);
+    check_resolved(
+        root,
+        c,
+        branch,
+        &main_oid,
+        &candidate_oid,
+        report_rel,
+        expected_base,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_resolved(
+    root: &Path,
+    c: &card::Card,
+    branch_for_upstream_policy: &str,
+    main_oid: &str,
+    candidate_oid: &str,
+    report_rel: &str,
+    expected_base: Option<&str>,
+) -> Result<MechOutcome> {
+    debug_assert!(is_full_commit_oid(main_oid));
+    debug_assert!(is_full_commit_oid(candidate_oid));
+    crate::oracle::validate_seed_paths_for_candidate(root, c, main_oid, candidate_oid)?;
     let mut notes = Vec::new();
-    let mb = gitx::merge_base(root, "main", branch)?;
+    let mb = gitx::merge_base(root, main_oid, candidate_oid)?;
     if let Some(exp) = expected_base {
         if mb != exp {
             // A task can be dispatched before a prerequisite is Recorded.  A later
@@ -1523,7 +1577,7 @@ pub fn check(
         }
     }
     // 域检（E4：merge-base 为基）；绑定缺失/损坏时按旧仓兼容语义降级为空 protected。
-    let changed = gitx::diff_names(root, &mb, branch)?;
+    let changed = gitx::diff_names(root, &mb, candidate_oid)?;
     let project_binding = binding::load(root).ok();
     let protected = project_binding
         .as_ref()
@@ -1540,15 +1594,17 @@ pub fn check(
 
     if let Some(project_binding) = &project_binding {
         if project_binding.git.push_policy == "forbidden" {
-            if branch_has_upstream(root, branch)? {
-                bail!("分支已配置 upstream，pushPolicy=forbidden 违约: {branch}");
+            if branch_has_upstream(root, branch_for_upstream_policy)? {
+                bail!(
+                    "分支已配置 upstream，pushPolicy=forbidden 违约: {branch_for_upstream_policy}"
+                );
             }
             notes.push("pushPolicy=forbidden ✅ 任务分支无 upstream".into());
         }
     }
 
     // 提交形状 + 种子字节
-    let commits = gitx::commits_after(root, &mb, branch)?;
+    let commits = gitx::commits_after(root, &mb, candidate_oid)?;
     if commits.is_empty() {
         bail!("分支无提交");
     }
@@ -1572,7 +1628,7 @@ pub fn check(
             commits.len()
         ));
         for s in &c.meta.seeds {
-            let branch_bytes = gitx::show_bytes(root, branch, &s.target)?;
+            let branch_bytes = gitx::show_bytes(root, candidate_oid, &s.target)?;
             let src_bytes = crate::oracle::read_bound_seed_bytes(root, &s.src)?;
             if branch_bytes != src_bytes {
                 bail!("种子字节不一致: {} vs {}", s.src, s.target);
@@ -2571,5 +2627,89 @@ agents:
             "executor-pi",
             &evidence,
         ));
+    }
+
+    fn b270_git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git must be available for B270 exact-P unit test");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn b270_commit_all(root: &Path, subject: &str) -> String {
+        b270_git(root, &["add", "-A"]);
+        b270_git(
+            root,
+            &[
+                "-c",
+                "user.name=B270",
+                "-c",
+                "user.email=b270@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                subject,
+            ],
+        );
+        b270_git(root, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn resolved_check_is_unchanged_when_main_and_task_refs_move_after_capture() {
+        let root = crate::util::test_scratch_dir("b270-resolved-main-task-move");
+        b270_git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(root.join("coordination")).unwrap();
+        std::fs::write(
+            root.join("coordination/PROJECT-BINDING.yaml"),
+            "git:\n  pushPolicy: allowed\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        let captured_main = b270_commit_all(&root, "base");
+
+        b270_git(&root, &["checkout", "-q", "-b", "task/T1"]);
+        std::fs::write(root.join("allowed.txt"), "candidate P\n").unwrap();
+        let captured_candidate = b270_commit_all(&root, "candidate P");
+        b270_git(&root, &["checkout", "-q", "main"]);
+
+        // Move both refs only after the object IDs were captured.  Advancing
+        // main all the way to P makes any accidental merge-base re-read yield
+        // an empty commit range; rewinding task/T1 makes any candidate re-read
+        // inspect the wrong tree.  The fixed-ID core must remain unaffected.
+        b270_git(
+            &root,
+            &["update-ref", "refs/heads/main", &captured_candidate],
+        );
+        b270_git(&root, &["update-ref", "refs/heads/task/T1", &captured_main]);
+
+        let meta: card::CardMeta = serde_json::from_value(serde_json::json!({
+            "taskId": "T1",
+            "writeSet": ["allowed.txt"],
+            "gates": {"fast": []}
+        }))
+        .unwrap();
+        let task = card::Card {
+            meta,
+            body: String::new(),
+            rel_path: "coordination/rounds/r-test/tasks/T1.md".to_string(),
+        };
+        check_resolved(
+            &root,
+            &task,
+            "task/T1",
+            &captured_main,
+            &captured_candidate,
+            "coordination/rounds/r-test/reports/T1-REPORT.md",
+            None,
+        )
+        .expect("main/task ref movement must not alter the captured exact-P result");
     }
 }

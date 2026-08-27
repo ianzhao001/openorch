@@ -156,19 +156,54 @@ pub fn archive_set_for_round(events: &[EventRecord], round: &str) -> Vec<PathBuf
     }
     for task_id in task_ids_for_round(events, round) {
         let base = Path::new("coordination/runtime/logs");
-        paths.insert(base.join(format!("{task_id}-gate-testFast.log")));
-        paths.insert(base.join(format!("{task_id}-gate-check.log")));
+        let scoped_tag = crate::gate::round_scoped_log_tag(round, &task_id);
+        for gate in ["testFast", "check"] {
+            for extension in ["log", "hb", "orphans", "fixtures"] {
+                paths.insert(base.join(format!("{scoped_tag}-gate-{gate}.{extension}")));
+            }
+        }
         paths.insert(base.join(format!("{task_id}-verify.jsonl")));
     }
     paths.into_iter().collect()
 }
 
+fn task_tag_name(tag: &str, task_id: &str) -> bool {
+    tag == task_id
+        || tag.starts_with(&format!("{task_id}-"))
+        || tag == format!("_oracle-{task_id}")
+        || tag.starts_with(&format!("_oracle-{task_id}-"))
+        || tag == format!("review-{task_id}")
+        || tag.starts_with(&format!("review-{task_id}-"))
+}
+
+fn scoped_gate_identity(name: &str) -> Option<(&str, &str)> {
+    let stem = [".log", ".hb", ".orphans", ".fixtures"]
+        .into_iter()
+        .find_map(|extension| name.strip_suffix(extension))?;
+    let (tag_and_round, gate_name) = stem.rsplit_once("-gate-")?;
+    if gate_name.is_empty() {
+        return None;
+    }
+    let (tag, round) = tag_and_round.rsplit_once("-round-")?;
+    (!tag.is_empty() && safe_component(round)).then_some((tag, round))
+}
+
 fn task_log_name(name: &str, task_id: &str) -> bool {
+    // Canonical round-scoped gate artifacts are attributed by their parsed exact round before the
+    // broad legacy task-prefix matcher runs.  Falling through would recreate the cross-round
+    // conflict this namespace is designed to prevent.
+    if scoped_gate_identity(name).is_some() {
+        return false;
+    }
     let direct = name.starts_with(&format!("{task_id}-"));
     let oracle = name.starts_with(&format!("_oracle-{task_id}-"));
     let review = name.starts_with(&format!("review-{task_id}-"));
     (direct || oracle || review)
-        && (name.ends_with(".log") || name.ends_with(".jsonl") || name.ends_with(".hb"))
+        && (name.ends_with(".log")
+            || name.ends_with(".jsonl")
+            || name.ends_with(".hb")
+            || name.ends_with(".orphans")
+            || name.ends_with(".fixtures"))
 }
 
 fn direct_runtime_log(log_dir: &Path, candidate: &Path) -> Option<PathBuf> {
@@ -355,6 +390,7 @@ pub fn rotate_closed_round_logs(root: &Path) -> Result<RotateReport> {
     let mut protected = BTreeSet::<PathBuf>::new();
     let mut referenced = BTreeSet::<PathBuf>::new();
     let mut closed_tasks = Vec::<(String, BTreeSet<String>)>::new();
+    let mut open_round_tasks = Vec::<(String, BTreeSet<String>)>::new();
     let mut open_tasks = BTreeSet::<String>::new();
     let mut current_opened_at = None;
 
@@ -386,7 +422,8 @@ pub fn rotate_closed_round_logs(root: &Path) -> Result<RotateReport> {
         if closed {
             closed_tasks.push((round.clone(), tasks));
         } else {
-            open_tasks.extend(tasks);
+            open_tasks.extend(tasks.iter().cloned());
+            open_round_tasks.push((round.clone(), tasks));
         }
     }
 
@@ -409,6 +446,29 @@ pub fn rotate_closed_round_logs(root: &Path) -> Result<RotateReport> {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
+        if let Some((tag, scoped_round)) = scoped_gate_identity(name) {
+            let mut attributed = false;
+            for (round, tasks) in &open_round_tasks {
+                if round == scoped_round && tasks.iter().any(|task| task_tag_name(tag, task)) {
+                    protected.insert(path.clone());
+                    candidates.remove(path);
+                    attributed = true;
+                }
+            }
+            for (round, tasks) in &closed_tasks {
+                if round == scoped_round && tasks.iter().any(|task| task_tag_name(tag, task)) {
+                    insert_candidate(&mut candidates, &mut conflicts, path.clone(), round);
+                    attributed = true;
+                }
+            }
+            if !attributed {
+                // A syntactically scoped file whose exact round/task cannot be proved from a good
+                // ledger is evidence, not an orphan eligible for age-based reassignment.
+                protected.insert(path.clone());
+                candidates.remove(path);
+            }
+            continue;
+        }
         if open_tasks.iter().any(|task| task_log_name(name, task)) {
             protected.insert(path.clone());
             candidates.remove(path);
@@ -529,6 +589,12 @@ mod tests {
         let set = archive_set_for_round(&events, "r9");
         assert_eq!(set, archive_set_for_round(&events, "r9"));
         assert!(set.iter().any(|path| path.ends_with("B9-verify.jsonl")));
+        assert!(set
+            .iter()
+            .any(|path| path.ends_with("B9-round-r9-gate-testFast.log")));
+        assert!(set
+            .iter()
+            .any(|path| path.ends_with("B9-round-r9-gate-check.fixtures")));
         assert!(archive_set_for_round(&events, "r10").is_empty());
     }
 
@@ -741,5 +807,63 @@ mod tests {
         assert!(!heartbeat.exists());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scoped_gate_artifacts_claim_only_their_exact_round_while_legacy_conflicts() {
+        let root = crate::util::test_scratch_dir("b272-logrotate-round-scope");
+        let logs = root.join("coordination/runtime/logs");
+        fs::create_dir_all(&logs).unwrap();
+        for round in ["r9", "r10"] {
+            let round_dir = root.join(format!("coordination/rounds/{round}"));
+            fs::create_dir_all(&round_dir).unwrap();
+            let events = [
+                event("RoundOpened", round, None, serde_json::json!({})),
+                event("DispatchIssued", round, Some("B9"), serde_json::json!({})),
+                event("RoundClosed", round, None, serde_json::json!({})),
+            ];
+            let ledger = events
+                .iter()
+                .map(|event| serde_json::to_string(event).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(round_dir.join("events.jsonl"), format!("{ledger}\n")).unwrap();
+        }
+
+        for extension in ["log", "hb", "orphans", "fixtures"] {
+            fs::write(
+                logs.join(format!("B9-trial-round-r9-gate-testFast.{extension}")),
+                format!("r9 {extension}\n"),
+            )
+            .unwrap();
+        }
+        let r10_log = logs.join("B9-trial-round-r10-gate-testFast.log");
+        fs::write(&r10_log, "r10 log\n").unwrap();
+        let legacy = logs.join("B9-trial-gate-testFast.log");
+        fs::write(&legacy, "legacy ambiguous\n").unwrap();
+
+        let error = rotate_closed_round_logs(&root).unwrap_err();
+        let unresolved = error.downcast_ref::<RotateUnresolved>().unwrap();
+        assert_eq!(unresolved.report.conflicts.len(), 1);
+        assert_eq!(unresolved.report.conflicts[0].source, legacy);
+        assert_eq!(
+            unresolved.report.conflicts[0].rounds,
+            vec!["r10".to_string(), "r9".to_string()]
+        );
+        assert_eq!(unresolved.report.archived.len(), 5);
+        for mapping in &unresolved.report.archived {
+            let name = mapping.source.file_name().unwrap().to_string_lossy();
+            if name.contains("-round-r9-") {
+                assert_eq!(mapping.round, "r9");
+            } else if name.contains("-round-r10-") {
+                assert_eq!(mapping.round, "r10");
+            } else {
+                panic!("unexpected scoped archive source: {name}");
+            }
+        }
+        assert!(
+            legacy.is_file(),
+            "ambiguous legacy evidence must remain in place"
+        );
     }
 }

@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -14,8 +15,138 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use fd_lock::RwLock;
 use orch_core::{fold, read_ledger, EventRecord, TaskState};
+use sha2::{Digest, Sha256};
 
-use crate::{binding, buildcache, card, gate, gitx, ledger, wake};
+use crate::{binding, buildcache, card, cas, gate, gitx, ledger, plan, wake};
+
+const GATE_EXECUTED_SCHEMA: (&str, &[&str]) = (
+    "GateExecuted",
+    &[
+        "commandRef",
+        "phase",
+        "gateRunId",
+        "exitCode",
+        "durationMs",
+        "subjectTreeSha",
+        "logSha256",
+        "logBytes",
+        "toolchainDigest",
+        "environmentDigest",
+    ],
+);
+
+/// Version of the seal-time final-tree proof contract.
+///
+/// Callers persist this discriminator in the derived input identity so a
+/// future proof-shape change cannot silently reuse a V1 observation.
+pub const FINAL_TREE_GATE_CONTRACT_V1: u32 = 1;
+
+/// Immutable proof subject captured after the seal lifecycle has authorized
+/// one pending root PASS and before the irreversible merge begins.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TestedMergeTreeV1 {
+    /// Exact Git tree object that completed the merge/full lane.
+    pub tree_sha: String,
+    /// Main commit used to synthesize `tree_sha`.
+    pub main_sha: String,
+    /// Authorized candidate commit used to synthesize `tree_sha`.
+    pub candidate_sha: String,
+    /// SHA-256 binding the tree, command, toolchain, environment, and attempt.
+    pub input_identity_sha256: String,
+}
+
+/// Decision made after the real no-ff merge exposes its actual tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalTreeDecisionV1 {
+    /// The actual merge tree is byte-for-byte the tree whose full lane passed.
+    Reuse,
+    /// The actual tree differs, so the ordinary real post-merge lane must run.
+    RunPostMerge {
+        /// Tree that completed the seal-time full lane.
+        tested_tree_sha: String,
+        /// Tree read from the real merge commit.
+        actual_tree_sha: String,
+    },
+}
+
+/// Compare complete Git object identities; abbreviated or prefix equality is
+/// never sufficient to reuse a final-tree proof.
+pub fn compare_actual_merge_tree_v1(
+    tested: &TestedMergeTreeV1,
+    actual_tree_sha: &str,
+) -> FinalTreeDecisionV1 {
+    let canonical = |value: &str| {
+        value.len() == 40
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if canonical(&tested.tree_sha)
+        && canonical(actual_tree_sha)
+        && tested.tree_sha == actual_tree_sha
+    {
+        FinalTreeDecisionV1::Reuse
+    } else {
+        FinalTreeDecisionV1::RunPostMerge {
+            tested_tree_sha: tested.tree_sha.clone(),
+            actual_tree_sha: actual_tree_sha.to_string(),
+        }
+    }
+}
+
+/// Attempt-scoped response to a seal input recheck.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateReuseMissDecisionV1 {
+    /// No input moved; the current proof remains eligible.
+    Stable {
+        /// Durable miss count already charged to this attempt.
+        miss_count: u32,
+    },
+    /// A ref compare-and-swap race retries without charging the input budget.
+    RetryRefCas {
+        /// Unchanged durable miss count for this attempt.
+        miss_count: u32,
+    },
+    /// The first proven input change is durable and permits one fresh proof.
+    RetryInput {
+        /// Updated durable miss count for this attempt.
+        miss_count: u32,
+    },
+    /// The second proven input change closes the root PASS and requires the
+    /// existing exact `approved-reattempt` recovery path.
+    ApprovedReattempt {
+        /// Capped terminal miss count for this attempt.
+        miss_count: u32,
+    },
+}
+
+/// Apply the V1 miss budget without allowing a ref-CAS race or a repeated
+/// `orch seal` invocation to consume or reset an attempt's durable count.
+pub fn decide_gate_reuse_miss_v1(
+    prior_miss_count: u32,
+    input_drift: bool,
+    ref_cas_contention: bool,
+) -> GateReuseMissDecisionV1 {
+    let prior_miss_count = prior_miss_count.min(2);
+    if input_drift {
+        let miss_count = prior_miss_count.saturating_add(1).min(2);
+        return if miss_count < 2 {
+            GateReuseMissDecisionV1::RetryInput { miss_count }
+        } else {
+            GateReuseMissDecisionV1::ApprovedReattempt { miss_count }
+        };
+    }
+    if ref_cas_contention {
+        GateReuseMissDecisionV1::RetryRefCas {
+            miss_count: prior_miss_count,
+        }
+    } else {
+        return GateReuseMissDecisionV1::Stable {
+            miss_count: prior_miss_count,
+        };
+    }
+}
 
 fn note_gate_orphan_evidence(log_dir: &Path, tag: &str, gate_name: &str, observation: &str) {
     if let Err(error) = gate::append_gate_orphan_evidence(log_dir, tag, gate_name, observation) {
@@ -130,12 +261,52 @@ fn with_close_orphan_watch<T>(
     }
 }
 
-/// Round-close production policy for trial build generations.  Keeping one generation per slot
-/// preserves the next warm-start opportunity while bounding all older evidence generations.
+/// Round-close paths own a typed round before either orphan accounting or a gate spawn begins.
+/// Scope the phase tag here and pass the same value to both consumers so recovery variants cannot
+/// accidentally split `.orphans` from the runner's `.hb/.log/.fixtures` siblings.
+#[cfg(test)]
+fn with_round_scoped_close_gate<T>(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    log_dir: &Path,
+    raw_tag: &str,
+    gate_name: &str,
+    run: impl FnOnce(&str) -> Result<T>,
+) -> Result<T> {
+    let scoped_tag = gate::round_scoped_log_tag(round, raw_tag);
+    with_close_orphan_watch(
+        root,
+        round,
+        task_id,
+        log_dir,
+        &scoped_tag,
+        gate_name,
+        || run(&scoped_tag),
+    )
+}
+
+/// Round-close production policy for trial build generations.  A newest generation remains warm
+/// only while the complete retained suffix fits the per-slot gate-build budget.  The per-slot
+/// before/after lines make cache growth visible even when no generation is reclaimed.
 pub fn sweep_trial_cache_before_round_close(
     root: &Path,
 ) -> Result<buildcache::TrialCacheSweepReport> {
-    buildcache::sweep_trial_cache(root, 1)
+    let report = buildcache::sweep_trial_cache_with_budget(
+        root,
+        1,
+        buildcache::DEFAULT_TRIAL_SLOT_BUDGET_BYTES,
+    )?;
+    for usage in &report.slot_usage {
+        println!(
+            "· 收轮前 trial-cache slot：slot={} logicalBytesBefore={} logicalBytesAfter={} budgetBytes={}",
+            usage.slot,
+            usage.logical_bytes_before,
+            usage.logical_bytes_after,
+            buildcache::DEFAULT_TRIAL_SLOT_BUDGET_BYTES
+        );
+    }
+    Ok(report)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +329,127 @@ thread_local! {
     /// already owns the shared or exclusive protocol lease.
     static PROTOCOL_LEASE_STATE: RefCell<ProtocolLeaseState> =
         const { RefCell::new(ProtocolLeaseState::None) };
+    static SEAL_OWNER_TOKEN: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+struct SealOwnerIntentGuard {
+    path: PathBuf,
+    token: String,
+}
+
+impl SealOwnerIntentGuard {
+    fn publish(root: &Path) -> Result<Self> {
+        let mut directory = root.to_path_buf();
+        for component in ["coordination", "runtime", "locks"] {
+            directory.push(component);
+            match fs::symlink_metadata(&directory) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    bail!("seal owner intent parent 必须是 real directory")
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&directory).with_context(|| {
+                        format!(
+                            "create seal owner intent parent failed: {}",
+                            directory.display()
+                        )
+                    })?;
+                }
+                Err(error) => return Err(error).context("stat seal owner intent parent failed"),
+            }
+        }
+        let path = root.join("coordination/runtime/locks/seal-owner.intent");
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                bail!("seal owner intent 必须是 regular non-symlink file");
+            }
+            let existing = fs::read_to_string(&path)?;
+            let Some(pid) = existing
+                .lines()
+                .find_map(|line| line.strip_prefix("pid="))
+                .and_then(|value| value.parse::<u32>().ok())
+            else {
+                bail!("protocol-transition lease busy: seal owner intent publication incomplete");
+            };
+            let alive = Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|status| status.success());
+            if alive {
+                bail!("protocol-transition lease busy: seal owner intent 由 live pid={pid} 持有");
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    bail!("protocol-transition lease busy: seal owner intent removal raced")
+                }
+                Err(error) => return Err(error).context("remove stale seal owner intent failed"),
+            }
+        }
+        let token = ulid::Ulid::new().to_string();
+        let mut file = match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!("protocol-transition lease busy: seal owner intent publication raced")
+            }
+            Err(error) => return Err(error).context("create seal owner intent failed"),
+        };
+        writeln!(file, "pid={}", std::process::id())?;
+        writeln!(file, "token={token}")?;
+        file.sync_all()?;
+        SEAL_OWNER_TOKEN.with(|current| {
+            if current.borrow().is_some() {
+                bail!("nested seal owner intent rejected");
+            }
+            *current.borrow_mut() = Some(token.clone());
+            Ok(())
+        })?;
+        Ok(Self { path, token })
+    }
+}
+
+impl Drop for SealOwnerIntentGuard {
+    fn drop(&mut self) {
+        let matches = fs::read_to_string(&self.path).ok().is_some_and(|contents| {
+            contents
+                .lines()
+                .any(|line| line == format!("token={}", self.token))
+        });
+        if matches {
+            let _ = fs::remove_file(&self.path);
+        }
+        SEAL_OWNER_TOKEN.with(|current| {
+            if current.borrow().as_deref() == Some(self.token.as_str()) {
+                current.borrow_mut().take();
+            }
+        });
+    }
+}
+
+fn seal_owner_token() -> Option<String> {
+    SEAL_OWNER_TOKEN.with(|current| current.borrow().clone())
+}
+
+fn current_seal_owner_intent_matches(root: &Path) -> Result<bool> {
+    let Some(token) = seal_owner_token() else {
+        return Ok(false);
+    };
+    let path = root.join("coordination/runtime/locks/seal-owner.intent");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("stat current seal owner intent failed"),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Ok(false);
+    }
+    let expected = format!("pid={}\ntoken={token}\n", std::process::id());
+    Ok(fs::read_to_string(path)? == expected)
 }
 
 struct ProtocolLeaseScope {
@@ -191,6 +483,40 @@ impl Drop for ProtocolLeaseScope {
 
 fn protocol_lease_state() -> ProtocolLeaseState {
     PROTOCOL_LEASE_STATE.with(|state| state.borrow().clone())
+}
+
+/// Process-local protocol lease class exposed to tightly scoped accounting
+/// commits.  It conveys serialization only, never merge-lifecycle authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolLeaseKind {
+    /// No protocol lease is held by this thread.
+    None,
+    /// A reversible shared effect lease is held.
+    Shared,
+    /// An exclusive transition lease is held.
+    Exclusive,
+}
+
+/// Return the current thread's lease class after verifying it belongs to the
+/// requested repository root.  Cross-root nesting remains a hard error.
+pub fn protocol_lease_kind(root: &Path) -> Result<ProtocolLeaseKind> {
+    let identity = protocol_root(root)?;
+    match protocol_lease_state() {
+        ProtocolLeaseState::None => Ok(ProtocolLeaseKind::None),
+        ProtocolLeaseState::Shared { root, .. } if root == identity => {
+            Ok(ProtocolLeaseKind::Shared)
+        }
+        ProtocolLeaseState::Exclusive { root, .. } if root == identity => {
+            Ok(ProtocolLeaseKind::Exclusive)
+        }
+        ProtocolLeaseState::Shared { root, .. } | ProtocolLeaseState::Exclusive { root, .. } => {
+            bail!(
+                "protocol lease root mismatch: requested={} held={}",
+                identity.display(),
+                root.display()
+            )
+        }
+    }
 }
 
 fn protocol_root(root: &Path) -> Result<PathBuf> {
@@ -293,6 +619,12 @@ fn with_protocol_transition_mode<T>(
         ProtocolLeaseState::None => {}
     }
 
+    // Publish before acquiring the flock and declare before its guard: raw Git
+    // does not honor merge.lock, so the hook-visible owner must cover both the
+    // entry boundary and (by reverse drop order) outlive flock release.
+    let _seal_owner = merge_lifecycle
+        .then(|| SealOwnerIntentGuard::publish(root))
+        .transpose()?;
     let (locked_identity, mut transition_lock) = protocol_lock(root)?;
     debug_assert_eq!(locked_identity, identity);
     let _transition_guard = match transition_lock.try_write() {
@@ -447,10 +779,15 @@ pub struct MergeOutcome {
 
 /// Result of the one-command root verdict/merge/record lifecycle.
 pub struct SealOutcome {
+    /// Short SHA of the merge commit proven by the completed lifecycle.
     pub merge_sha_short: String,
+    /// Post-merge gate results produced by this invocation, empty on replay.
     pub gates: Vec<gate::GateResult>,
     /// True when the complete durable chain already existed on entry.
     pub replayed_complete: bool,
+    /// Advisory receipt warnings for expected nongate seats. These never
+    /// change whether the seal lifecycle succeeds or which facts it records.
+    pub nongate_receipt_warnings: Vec<String>,
 }
 
 impl std::fmt::Debug for SealOutcome {
@@ -459,6 +796,10 @@ impl std::fmt::Debug for SealOutcome {
             .field("merge_sha_short", &self.merge_sha_short)
             .field("gates", &self.gates.len())
             .field("replayed_complete", &self.replayed_complete)
+            .field(
+                "nongate_receipt_warnings",
+                &self.nongate_receipt_warnings.len(),
+            )
             .finish()
     }
 }
@@ -500,6 +841,16 @@ fn merge_no_ff_without_hooks(
     head: &str,
     message: &str,
 ) -> std::result::Result<(), MergeCommandFailure> {
+    let owner_token = match seal_owner_token() {
+        Some(token) => token,
+        None => {
+            return Err(MergeCommandFailure {
+                status: -1,
+                stdout: String::new(),
+                stderr: "authorized no-ff merge lacks seal owner intent".to_string(),
+            })
+        }
+    };
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -509,6 +860,7 @@ fn merge_no_ff_without_hooks(
         // command; ORCH_MAIN_GUARD_BYPASS remains an operator-only emergency
         // escape hatch and is never injected by ordinary runtime plumbing.
         .env("ORCH_MAIN_GUARD_CONTEXT", "authorized-no-ff-merge")
+        .env("ORCH_SEAL_OWNER_TOKEN", owner_token)
         .output();
     let output = match output {
         Ok(output) => output,
@@ -734,15 +1086,55 @@ pub fn task_recorded_event(task: &str, round: &str) -> EventRecord {
     )
 }
 
-fn task_recorded_batch(events: &[EventRecord], task: &str, round: &str) -> Vec<EventRecord> {
+fn canonical_task_recorded_batch(
+    root: &Path,
+    events: &[EventRecord],
+    task: &str,
+    round: &str,
+    authorization: &crate::verify::RootRecordAuthorization,
+    effective_main_sha: &str,
+    relaxation: Option<&RecordRelaxationProof>,
+) -> Result<Vec<EventRecord>> {
+    if authorization.already_recorded {
+        bail!("canonical recorded batch 不得重复既有 TaskRecorded");
+    }
+    match relaxation {
+        Some(proof)
+            if proof.merge_sha == authorization.merge_sha
+                && proof.tip_sha == effective_main_sha => {}
+        Some(_) => bail!("canonical recorded batch RecordGateRelaxed proof 与 authorization 漂移"),
+        None if effective_main_sha != authorization.merge_sha => {
+            bail!("非 mergeSha gate point 必须携带 RecordGateRelaxed proof")
+        }
+        None => {}
+    }
     let recorded = task_recorded_event(task, round);
     let mut batch = vec![recorded.clone()];
+    batch.extend(crate::verify::build_frozen_contract_superseded_events(
+        root,
+        round,
+        task,
+        events,
+        authorization,
+        effective_main_sha,
+        &recorded,
+    )?);
     batch.extend(crate::sites::retire_task_sites(
         events,
         task,
         &recorded.event_id,
     ));
-    batch
+    if let Some(proof) = relaxation {
+        batch.push(record_gate_relaxed_event(
+            task,
+            round,
+            &proof.merge_sha,
+            &proof.tip_sha,
+            &proof.reason,
+            &proof.files,
+        ));
+    }
+    Ok(batch)
 }
 
 /// Prove the exact successful lifecycle suffix for one attempt.
@@ -1192,7 +1584,7 @@ pub fn run_seal(
     attempt_id: &str,
     expected_head: &str,
 ) -> Result<SealOutcome> {
-    let outcome = with_merge_lifecycle_transition(root, "orch seal", || {
+    let mut outcome = with_merge_lifecycle_transition(root, "orch seal", || {
         let round = crate::current_round(root)?;
         let ledger_rel = format!("coordination/rounds/{round}/events.jsonl");
         let ledger_path = root.join(&ledger_rel);
@@ -1308,13 +1700,23 @@ pub fn run_seal(
         {
             bail!("seal postcondition did not bind current attempt/TaskRecorded");
         }
+        validate_completed_final_tree_reuse_if_present(
+            root,
+            &final_ledger.events,
+            &round,
+            task_id,
+            &authorization,
+        )?;
         validate_seal_storage_mirror(root, &round)?;
         Ok(SealOutcome {
             merge_sha_short: gitx::short(&authorization.merge_sha).to_string(),
             gates,
             replayed_complete,
+            nongate_receipt_warnings: Vec::new(),
         })
     })?;
+    outcome.nongate_receipt_warnings =
+        crate::verify::nongate_attempt_receipt_warnings(root, task_id, attempt_id, expected_head);
     trigger_site_gc(root, "TaskRecorded");
     Ok(outcome)
 }
@@ -1536,6 +1938,11 @@ fn validate_premerge_root_status(
             if late.paths.contains(path) {
                 continue;
             }
+            if path == "coordination/runtime/locks/seal-owner.intent"
+                && current_seal_owner_intent_matches(root)?
+            {
+                continue;
+            }
         }
         // Type-2 renames, unmerged entries, untracked files and every unknown
         // record are all forbidden.  In particular no staged bit may cross the
@@ -1602,6 +2009,1558 @@ fn account_merge_boundary_violation(
         .context("记录 merge boundary 真实结果/升级失败")
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FinalTreeGateSourceV1 {
+    source_event_id: String,
+    command_ref: String,
+    gate_run_id: String,
+    subject_tree_sha: String,
+    log_sha256: String,
+    log_bytes: u64,
+    duration_ms: u64,
+    toolchain_digest: String,
+    environment_digest: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FinalTreeGateAttestationV1 {
+    schema_version: u32,
+    round: String,
+    task_id: String,
+    attempt_id: String,
+    attempt_no: usize,
+    policy_base_sha: String,
+    ir_revision: u32,
+    validation_digest: String,
+    binding_sha256: String,
+    task_card_sha256: String,
+    resolved_command_digest: String,
+    ordered_command_refs: Vec<String>,
+    toolchain_digest: String,
+    environment_digest: String,
+    tested: TestedMergeTreeV1,
+    gates: Vec<FinalTreeGateSourceV1>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FinalTreeGatePointerV1 {
+    schema_version: u32,
+    cas_sha256: String,
+    cas_bytes: u64,
+}
+
+struct CapturedFinalTreeInputV1 {
+    tested: TestedMergeTreeV1,
+    policy_base_sha: String,
+    ir_revision: u32,
+    validation_digest: String,
+    binding_sha256: String,
+    task_card_sha256: String,
+    resolved_command_digest: String,
+    gate_refs: Vec<String>,
+    binding: binding::Binding,
+    fingerprint: gate::GateEnvironmentFingerprint,
+}
+
+fn canonical_final_tree_sha(value: &str, bytes: usize) -> bool {
+    value.len() == bytes
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn final_tree_input_identity_v1(
+    round: &str,
+    task_id: &str,
+    attempt_id: &str,
+    attempt_no: usize,
+    policy_base_sha: &str,
+    ir_revision: u32,
+    validation_digest: &str,
+    binding_sha256: &str,
+    task_card_sha256: &str,
+    tree_sha: &str,
+    main_sha: &str,
+    candidate_sha: &str,
+    resolved_command_digest: &str,
+    ordered_command_refs: &[String],
+    toolchain_digest: &str,
+    environment_digest: &str,
+) -> Result<String> {
+    let value = serde_json::json!({
+        "schemaVersion": FINAL_TREE_GATE_CONTRACT_V1,
+        "round": round,
+        "taskId": task_id,
+        "attemptId": attempt_id,
+        "attemptNo": attempt_no,
+        "policyBaseSha": policy_base_sha,
+        "irRevision": ir_revision,
+        "validationDigest": validation_digest,
+        "bindingSha256": binding_sha256,
+        "taskCardSha256": task_card_sha256,
+        "treeSha": tree_sha,
+        "mainSha": main_sha,
+        "candidateSha": candidate_sha,
+        "resolvedCommandDigest": resolved_command_digest,
+        "orderedCommandRefs": ordered_command_refs,
+        "toolchainDigest": toolchain_digest,
+        "environmentDigest": environment_digest,
+    });
+    let bytes = serde_json::to_vec(&value).context("final-tree input identity 编码失败")?;
+    let mut digest = Sha256::new();
+    let domain = b"orch-final-tree-gate-input-v1";
+    digest.update((domain.len() as u64).to_be_bytes());
+    digest.update(domain);
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn resolve_final_tree_policy(
+    root: &Path,
+    round: &str,
+    events: &[EventRecord],
+    task_id: &str,
+    attempt_id: &str,
+) -> Result<Option<plan::RuntimePolicyResolutionV1>> {
+    match plan::resolve_attempt_runtime_policy(
+        root,
+        round,
+        events,
+        task_id,
+        attempt_id,
+        "final-tree-v1",
+    ) {
+        Ok(resolution) if resolution.state == plan::RuntimePolicyStateV1::Active => {
+            Ok(Some(resolution))
+        }
+        Ok(_) => Ok(None),
+        Err(error)
+            if error
+                .to_string()
+                .contains("缺 runtime policy final-tree-v1")
+                || error.to_string().contains("缺 runtimePolicies envelope")
+                || {
+                    let detail = format!("{error:#}");
+                    (detail.contains("读取 policy-base committed PROJECT-BINDING 失败")
+                        || detail.contains("读取 policy-base committed ROUND-IR 失败"))
+                        && (detail.contains("does not exist in")
+                            || detail.contains("exists on disk, but not in"))
+                } =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error).context("resolve attempt final-tree-v1 policy failed"),
+    }
+}
+
+fn capture_final_tree_input_v1(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    events: &[EventRecord],
+    authorization: &crate::verify::RootMergeAuthorization,
+    policy_base_sha: &str,
+) -> Result<CapturedFinalTreeInputV1> {
+    let main_sha = gitx::rev_parse(root, "refs/heads/main")?;
+    let candidate_sha = gitx::rev_parse(root, &format!("refs/heads/task/{task_id}"))?;
+    if candidate_sha != authorization.head_sha {
+        bail!(
+            "final-tree candidate ref 漂移: authorized={} actual={candidate_sha}",
+            authorization.head_sha
+        );
+    }
+    let tree_sha = gitx::write_merge_tree(root, &main_sha, &candidate_sha)?;
+    let binding_bytes =
+        gitx::show_bytes(root, policy_base_sha, "coordination/PROJECT-BINDING.yaml")?;
+    let committed_binding = binding::parse_binding_bytes(&binding_bytes)
+        .map_err(anyhow::Error::msg)
+        .context("解析 final-tree policy-base binding 失败")?;
+    let active = plan::require_active_round_ir(root, round, events)?;
+    let committed_card = plan::load_bound_task_card(root, round, task_id, &active)?;
+    let card_rel = format!("coordination/rounds/{round}/tasks/{task_id}.md");
+    let task_card_sha256 = active
+        .candidate
+        .source_bindings
+        .task_cards
+        .get(&card_rel)
+        .with_context(|| format!("active ROUND-IR 未绑定 final-tree task card: {card_rel}"))?
+        .clone();
+    let ir_revision = active.persisted_revision;
+    let validation_digest = active.persisted_digest.clone();
+    let binding_sha256 = active.candidate.source_bindings.binding_sha256.clone();
+    let available = committed_binding
+        .commands
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    let gate_refs = crate::collect::resolved_merge_gate_refs_for_signed_fast(
+        &committed_binding,
+        &committed_card.meta.gates.fast,
+        &available,
+    )?;
+    if gate_refs.is_empty() {
+        bail!("final-tree merge/full lane 不能为空");
+    }
+    let resolved_command_digest =
+        buildcache::build_config_digest(&gate_refs, &committed_binding.commands)?;
+    let fingerprint = gate::capture_gate_environment_fingerprint(root)?;
+    let input_identity_sha256 = final_tree_input_identity_v1(
+        round,
+        task_id,
+        &authorization.attempt_id,
+        authorization.attempt_no,
+        policy_base_sha,
+        ir_revision,
+        &validation_digest,
+        &binding_sha256,
+        &task_card_sha256,
+        &tree_sha,
+        &main_sha,
+        &candidate_sha,
+        &resolved_command_digest,
+        &gate_refs,
+        &fingerprint.toolchain_digest,
+        &fingerprint.environment_digest,
+    )?;
+    Ok(CapturedFinalTreeInputV1 {
+        tested: TestedMergeTreeV1 {
+            tree_sha,
+            main_sha,
+            candidate_sha,
+            input_identity_sha256,
+        },
+        policy_base_sha: policy_base_sha.to_string(),
+        ir_revision,
+        validation_digest,
+        binding_sha256,
+        task_card_sha256,
+        resolved_command_digest,
+        gate_refs,
+        binding: committed_binding,
+        fingerprint,
+    })
+}
+
+fn final_tree_pointer_path(root: &Path, round: &str, task_id: &str, attempt_id: &str) -> PathBuf {
+    root.join("coordination/runtime/final-tree-v1")
+        .join(format!("{round}-{task_id}-{attempt_id}.json"))
+}
+
+fn final_tree_store(root: &Path) -> cas::Store {
+    cas::Store::new(&root.join("coordination/runtime/cas"))
+}
+
+fn persist_final_tree_gate_log_v1(root: &Path, result: &gate::GateResult) -> Result<()> {
+    let bytes = fs::read(&result.log_path)
+        .with_context(|| format!("读取 final-tree raw gate log 失败: {}", result.log_path))?;
+    let expected_sha256 = hex::encode(Sha256::digest(&bytes));
+    let store = final_tree_store(root);
+    let stored_sha256 = store
+        .put(&bytes)
+        .context("final-tree raw gate log 写 evidence CAS 失败")?;
+    if stored_sha256 != expected_sha256 {
+        bail!("final-tree raw gate log CAS identity 漂移");
+    }
+    let checked = store
+        .get(&stored_sha256)
+        .context("final-tree raw gate log CAS 写后回读失败")?
+        .context("final-tree raw gate log CAS 写后对象缺失")?;
+    if checked != bytes {
+        bail!("final-tree raw gate log CAS 写后字节损坏");
+    }
+    Ok(())
+}
+
+fn load_final_tree_attestation_v1(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    attempt_id: &str,
+) -> Result<Option<FinalTreeGateAttestationV1>> {
+    let path = final_tree_pointer_path(root, round, task_id, attempt_id);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("stat final-tree CAS pointer failed"),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("final-tree CAS pointer 不是 regular file");
+    }
+    let pointer: FinalTreeGatePointerV1 = serde_json::from_slice(&fs::read(&path)?)
+        .context("final-tree CAS pointer 非 canonical JSON")?;
+    if pointer.schema_version != FINAL_TREE_GATE_CONTRACT_V1
+        || !canonical_final_tree_sha(&pointer.cas_sha256, 64)
+        || pointer.cas_bytes == 0
+    {
+        bail!("final-tree CAS pointer identity 非 canonical");
+    }
+    let bytes = final_tree_store(root)
+        .get(&pointer.cas_sha256)
+        .context("final-tree attestation CAS 回读失败")?
+        .context("final-tree attestation CAS 对象缺失")?;
+    let actual_sha = hex::encode(Sha256::digest(&bytes));
+    if actual_sha != pointer.cas_sha256 || bytes.len() as u64 != pointer.cas_bytes {
+        bail!("final-tree attestation CAS 对象损坏");
+    }
+    let attestation = serde_json::from_slice(&bytes)
+        .context("final-tree attestation CAS payload 非 canonical")?;
+    Ok(Some(attestation))
+}
+
+fn store_final_tree_attestation_v1(
+    root: &Path,
+    attestation: &FinalTreeGateAttestationV1,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(attestation).context("final-tree attestation 编码失败")?;
+    let store = final_tree_store(root);
+    let cas_sha256 = store
+        .put(&bytes)
+        .context("final-tree attestation 写 CAS 失败")?;
+    let checked = store
+        .get(&cas_sha256)
+        .context("final-tree attestation CAS 写后回读失败")?
+        .context("final-tree attestation CAS 写后对象缺失")?;
+    if checked != bytes {
+        bail!("final-tree attestation CAS 写后字节损坏");
+    }
+    let pointer = FinalTreeGatePointerV1 {
+        schema_version: FINAL_TREE_GATE_CONTRACT_V1,
+        cas_sha256,
+        cas_bytes: bytes.len() as u64,
+    };
+    let pointer_bytes = serde_json::to_vec(&pointer)?;
+    let path = final_tree_pointer_path(
+        root,
+        &attestation.round,
+        &attestation.task_id,
+        &attestation.attempt_id,
+    );
+    let parent = path.parent().context("final-tree pointer 缺 parent")?;
+    fs::create_dir_all(parent)?;
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            bail!("拒绝覆盖非 regular final-tree CAS pointer");
+        }
+    }
+    let temp = parent.join(format!(".final-tree-pointer-{}", ulid::Ulid::new()));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temp)?;
+    file.write_all(&pointer_bytes)?;
+    file.sync_all()?;
+    fs::rename(&temp, &path)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn validate_final_tree_attestation_v1(
+    root: &Path,
+    events: &[EventRecord],
+    attestation: &FinalTreeGateAttestationV1,
+    captured: Option<&CapturedFinalTreeInputV1>,
+) -> Result<()> {
+    if attestation.schema_version != FINAL_TREE_GATE_CONTRACT_V1
+        || attestation.attempt_id
+            != format!("{}-A{:04}", attestation.task_id, attestation.attempt_no)
+        || !canonical_final_tree_sha(&attestation.policy_base_sha, 40)
+        || attestation.ir_revision == 0
+        || !canonical_final_tree_sha(&attestation.validation_digest, 64)
+        || !canonical_final_tree_sha(&attestation.binding_sha256, 64)
+        || !canonical_final_tree_sha(&attestation.task_card_sha256, 64)
+        || !canonical_final_tree_sha(&attestation.resolved_command_digest, 64)
+        || !canonical_final_tree_sha(&attestation.tested.tree_sha, 40)
+        || !canonical_final_tree_sha(&attestation.tested.main_sha, 40)
+        || !canonical_final_tree_sha(&attestation.tested.candidate_sha, 40)
+        || !canonical_final_tree_sha(&attestation.tested.input_identity_sha256, 64)
+        || !canonical_final_tree_sha(&attestation.toolchain_digest, 64)
+        || !canonical_final_tree_sha(&attestation.environment_digest, 64)
+        || attestation.ordered_command_refs.is_empty()
+        || attestation.gates.len() != attestation.ordered_command_refs.len()
+    {
+        bail!("final-tree attestation identity floor 未满足");
+    }
+    let recomputed = final_tree_input_identity_v1(
+        &attestation.round,
+        &attestation.task_id,
+        &attestation.attempt_id,
+        attestation.attempt_no,
+        &attestation.policy_base_sha,
+        attestation.ir_revision,
+        &attestation.validation_digest,
+        &attestation.binding_sha256,
+        &attestation.task_card_sha256,
+        &attestation.tested.tree_sha,
+        &attestation.tested.main_sha,
+        &attestation.tested.candidate_sha,
+        &attestation.resolved_command_digest,
+        &attestation.ordered_command_refs,
+        &attestation.toolchain_digest,
+        &attestation.environment_digest,
+    )?;
+    if recomputed != attestation.tested.input_identity_sha256 {
+        bail!("final-tree attestation input identity 漂移");
+    }
+    if let Some(captured) = captured {
+        if attestation.tested != captured.tested
+            || attestation.policy_base_sha != captured.policy_base_sha
+            || attestation.ir_revision != captured.ir_revision
+            || attestation.validation_digest != captured.validation_digest
+            || attestation.binding_sha256 != captured.binding_sha256
+            || attestation.task_card_sha256 != captured.task_card_sha256
+            || attestation.resolved_command_digest != captured.resolved_command_digest
+            || attestation.ordered_command_refs != captured.gate_refs
+            || attestation.toolchain_digest != captured.fingerprint.toolchain_digest
+            || attestation.environment_digest != captured.fingerprint.environment_digest
+        {
+            bail!("final-tree attestation 与 fresh captured input 不一致");
+        }
+    }
+
+    let root_positions = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event.kind == "VerdictIssued"
+                && event.actor == "verifier:root"
+                && event.task_id.as_deref() == Some(attestation.task_id.as_str())
+                && event.round.as_deref() == Some(attestation.round.as_str())
+                && event
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("attemptId"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(attestation.attempt_id.as_str())
+        })
+        .map(|(position, _)| position)
+        .collect::<Vec<_>>();
+    let [root_position] = root_positions.as_slice() else {
+        bail!("final-tree attestation 要求唯一 pending root PASS anchor");
+    };
+    let last_trial_miss = events
+        .iter()
+        .enumerate()
+        .filter_map(|(position, event)| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::GateReuseMiss(payload))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            (event.task_id.as_deref() == Some(attestation.task_id.as_str())
+                && event.round.as_deref() == Some(attestation.round.as_str())
+                && payload.attempt_id == attestation.attempt_id
+                && payload.phase == "trial")
+                .then_some(position)
+        })
+        .max()
+        .unwrap_or(*root_position);
+    let upper = events
+        .iter()
+        .enumerate()
+        .skip(last_trial_miss + 1)
+        .find(|(_, event)| {
+            event.kind == "MergeStarted"
+                && event.task_id.as_deref() == Some(attestation.task_id.as_str())
+                && event.round.as_deref() == Some(attestation.round.as_str())
+        })
+        .map(|(position, _)| position)
+        .unwrap_or(events.len());
+    let observed_trial_ids = events[last_trial_miss + 1..upper]
+        .iter()
+        .filter(|event| {
+            event.kind == GATE_EXECUTED_SCHEMA.0
+                && event.task_id.as_deref() == Some(attestation.task_id.as_str())
+                && event.round.as_deref() == Some(attestation.round.as_str())
+                && event
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("phase"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("trial")
+        })
+        .map(|event| event.event_id.as_str())
+        .collect::<Vec<_>>();
+    let attested_ids = attestation
+        .gates
+        .iter()
+        .map(|gate| gate.source_event_id.as_str())
+        .collect::<Vec<_>>();
+    if observed_trial_ids != attested_ids {
+        bail!("final-tree attestation 不绑定最后一组完整有序 Trial gates");
+    }
+
+    let store = final_tree_store(root);
+    let mut previous_position = last_trial_miss;
+    for (expected_ref, source) in attestation
+        .ordered_command_refs
+        .iter()
+        .zip(&attestation.gates)
+    {
+        let matches = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.event_id == source.source_event_id)
+            .collect::<Vec<_>>();
+        let [(position, event)] = matches.as_slice() else {
+            bail!("final-tree source GateExecuted eventId 不唯一");
+        };
+        let payload = crate::verify::canonical_gate_executed_payload(event, &attestation.round)
+            .context("final-tree source 不是 canonical GateExecuted")?;
+        if *position <= previous_position
+            || event.task_id.as_deref() != Some(attestation.task_id.as_str())
+            || payload.get("phase").and_then(serde_json::Value::as_str) != Some("trial")
+            || payload
+                .get("commandRef")
+                .and_then(serde_json::Value::as_str)
+                != Some(expected_ref.as_str())
+            || payload.get("gateRunId").and_then(serde_json::Value::as_str)
+                != Some(source.gate_run_id.as_str())
+            || payload.get("exitCode").and_then(serde_json::Value::as_i64) != Some(0)
+            || payload
+                .get("subjectTreeSha")
+                .and_then(serde_json::Value::as_str)
+                != Some(attestation.tested.tree_sha.as_str())
+            || payload.get("logSha256").and_then(serde_json::Value::as_str)
+                != Some(source.log_sha256.as_str())
+            || payload.get("logBytes").and_then(serde_json::Value::as_u64) != Some(source.log_bytes)
+            || payload
+                .get("durationMs")
+                .and_then(serde_json::Value::as_u64)
+                != Some(source.duration_ms)
+            || payload
+                .get("toolchainDigest")
+                .and_then(serde_json::Value::as_str)
+                != Some(attestation.toolchain_digest.as_str())
+            || payload
+                .get("environmentDigest")
+                .and_then(serde_json::Value::as_str)
+                != Some(attestation.environment_digest.as_str())
+            || source.command_ref != *expected_ref
+            || source.subject_tree_sha != attestation.tested.tree_sha
+            || source.toolchain_digest != attestation.toolchain_digest
+            || source.environment_digest != attestation.environment_digest
+            || source.log_bytes == 0
+        {
+            bail!("final-tree source GateExecuted tuple 漂移");
+        }
+        let log = store
+            .get(&source.log_sha256)
+            .context("final-tree source raw-log CAS 回读失败")?
+            .context("final-tree source raw-log CAS 对象缺失")?;
+        if log.len() as u64 != source.log_bytes
+            || hex::encode(Sha256::digest(&log)) != source.log_sha256
+        {
+            bail!("final-tree source raw-log CAS 对象损坏");
+        }
+        previous_position = *position;
+    }
+    Ok(())
+}
+
+fn recorded_final_tree_gate_source_v1(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    gate_run_id: &str,
+) -> Result<FinalTreeGateSourceV1> {
+    let read = read_ledger(&root.join(format!("coordination/rounds/{round}/events.jsonl")))?;
+    if !read.bad_lines.is_empty() {
+        bail!("final-tree GateExecuted lookup 遇到账本坏行");
+    }
+    let matches = read
+        .events
+        .iter()
+        .filter(|event| {
+            event.kind == GATE_EXECUTED_SCHEMA.0
+                && event.task_id.as_deref() == Some(task_id)
+                && event.round.as_deref() == Some(round)
+                && event
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("gateRunId"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(gate_run_id)
+        })
+        .collect::<Vec<_>>();
+    let [event] = matches.as_slice() else {
+        bail!("final-tree gateRunId 未绑定唯一 GateExecuted");
+    };
+    let payload = crate::verify::canonical_gate_executed_payload(event, round)
+        .context("final-tree recorded event 非 canonical GateExecuted")?;
+    let string = |key: &str| {
+        payload
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .with_context(|| format!("final-tree GateExecuted 缺 {key}"))
+    };
+    Ok(FinalTreeGateSourceV1 {
+        source_event_id: event.event_id.clone(),
+        command_ref: string("commandRef")?,
+        gate_run_id: string("gateRunId")?,
+        subject_tree_sha: string("subjectTreeSha")?,
+        log_sha256: string("logSha256")?,
+        log_bytes: payload
+            .get("logBytes")
+            .and_then(serde_json::Value::as_u64)
+            .context("final-tree GateExecuted 缺 logBytes")?,
+        duration_ms: payload
+            .get("durationMs")
+            .and_then(serde_json::Value::as_u64)
+            .context("final-tree GateExecuted 缺 durationMs")?,
+        toolchain_digest: string("toolchainDigest")?,
+        environment_digest: string("environmentDigest")?,
+    })
+}
+
+fn final_tree_approved_reattempt_event(
+    task_id: &str,
+    round: &str,
+    authorization: &crate::verify::RootMergeAuthorization,
+    reason: &str,
+) -> EventRecord {
+    ledger::event(
+        "AttemptBlocked",
+        "runtime:orch",
+        Some(task_id),
+        Some(round),
+        serde_json::json!({
+            "attemptId": authorization.attempt_id,
+            "attemptNo": authorization.attempt_no,
+            "agent": authorization.implementer_agent,
+            "stage": "approved-reattempt",
+            "verdictEventId": authorization.verdict_event_id,
+            "reason": reason,
+        }),
+    )
+}
+
+fn append_final_tree_approved_reattempt(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    authorization: &crate::verify::RootMergeAuthorization,
+    reason: &str,
+) -> Result<()> {
+    if reason.trim().is_empty() {
+        bail!("final-tree approved-reattempt reason 不能为空");
+    }
+    let event = final_tree_approved_reattempt_event(task_id, round, authorization, reason);
+    let appended = ledger::append_checked_merge_lifecycle(root, round, |events| {
+        let (root_event, payload) =
+            exact_root_pass_payload(events, round, task_id, &authorization.attempt_id)?;
+        if root_event.event_id != authorization.verdict_event_id
+            || payload.attempt_no != authorization.attempt_no
+            || payload.implementer_agent != authorization.implementer_agent
+            || payload.head_sha != authorization.head_sha
+            || events.iter().any(|candidate| {
+                candidate.kind == "MergeStarted"
+                    && candidate.task_id.as_deref() == Some(task_id)
+                    && candidate.round.as_deref() == Some(round)
+                    && candidate
+                        .payload
+                        .as_ref()
+                        .and_then(|value| value.get("attemptId"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(authorization.attempt_id.as_str())
+            })
+        {
+            bail!("final-tree approved-reattempt 不绑定唯一 pending root PASS");
+        }
+        Ok(vec![event])
+    })?;
+    if appended != 1 {
+        bail!("final-tree approved-reattempt append count 非 1");
+    }
+    Ok(())
+}
+
+fn final_tree_drift_reason(
+    attestation: &FinalTreeGateAttestationV1,
+    captured: &CapturedFinalTreeInputV1,
+) -> &'static str {
+    if attestation.tested.tree_sha != captured.tested.tree_sha
+        || attestation.tested.main_sha != captured.tested.main_sha
+        || attestation.tested.candidate_sha != captured.tested.candidate_sha
+    {
+        "input-tree"
+    } else if attestation.ir_revision != captured.ir_revision
+        || attestation.validation_digest != captured.validation_digest
+        || attestation.binding_sha256 != captured.binding_sha256
+        || attestation.task_card_sha256 != captured.task_card_sha256
+    {
+        "contract"
+    } else if attestation.resolved_command_digest != captured.resolved_command_digest
+        || attestation.ordered_command_refs != captured.gate_refs
+    {
+        "command"
+    } else if attestation.toolchain_digest != captured.fingerprint.toolchain_digest {
+        "toolchain"
+    } else {
+        "environment"
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_final_tree_input_miss(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    authorization: &crate::verify::RootMergeAuthorization,
+    policy_base_sha: &str,
+    command_ref: &str,
+    reason: &str,
+    expected_sha256: &str,
+    actual_sha256: &str,
+) -> Result<GateReuseMissDecisionV1> {
+    if !matches!(
+        reason,
+        "input-tree" | "contract" | "command" | "toolchain" | "environment"
+    ) || !canonical_final_tree_sha(expected_sha256, 64)
+        || !canonical_final_tree_sha(actual_sha256, 64)
+        || command_ref.trim().is_empty()
+    {
+        bail!("final-tree GateReuseMiss input 非 canonical");
+    }
+    let chosen = RefCell::new(None);
+    ledger::append_checked_merge_lifecycle(root, round, |events| {
+        let (root_event, payload) =
+            exact_root_pass_payload(events, round, task_id, &authorization.attempt_id)?;
+        if root_event.event_id != authorization.verdict_event_id
+            || payload.attempt_no != authorization.attempt_no
+            || payload.implementer_agent != authorization.implementer_agent
+            || events.iter().any(|event| {
+                event.kind == "MergeStarted"
+                    && event.task_id.as_deref() == Some(task_id)
+                    && event.round.as_deref() == Some(round)
+                    && event
+                        .payload
+                        .as_ref()
+                        .and_then(|value| value.get("attemptId"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(authorization.attempt_id.as_str())
+            })
+        {
+            bail!("final-tree GateReuseMiss 不绑定唯一 pending root PASS");
+        }
+        let prior = events
+            .iter()
+            .filter_map(|event| {
+                let Ok(Some(ledger::RuntimeEventPayloadV1::GateReuseMiss(payload))) =
+                    ledger::decode_runtime_event_v1(event)
+                else {
+                    return None;
+                };
+                (event.task_id.as_deref() == Some(task_id)
+                    && event.round.as_deref() == Some(round)
+                    && payload.attempt_id == authorization.attempt_id)
+                    .then_some(payload)
+            })
+            .collect::<Vec<_>>();
+        if let Some(existing) = prior.iter().find(|payload| {
+            payload.phase == "trial"
+                && payload.command_ref == command_ref
+                && payload.reason == reason
+                && payload.input_identity_sha256 == actual_sha256
+                && payload.expected_sha256 == expected_sha256
+                && payload.actual_sha256 == actual_sha256
+                && payload.policy_base_sha == policy_base_sha
+        }) {
+            let decision = if existing.miss_no < 2 {
+                GateReuseMissDecisionV1::RetryInput {
+                    miss_count: existing.miss_no,
+                }
+            } else {
+                let terminal = events.iter().any(|event| {
+                    event.kind == "AttemptBlocked"
+                        && event.actor == "runtime:orch"
+                        && event.task_id.as_deref() == Some(task_id)
+                        && event.round.as_deref() == Some(round)
+                        && event
+                            .payload
+                            .as_ref()
+                            .and_then(|value| value.get("stage"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("approved-reattempt")
+                        && event
+                            .payload
+                            .as_ref()
+                            .and_then(|value| value.get("verdictEventId"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(authorization.verdict_event_id.as_str())
+                });
+                if !terminal {
+                    bail!("final-tree missNo=2 缺同批 approved-reattempt terminal");
+                }
+                GateReuseMissDecisionV1::ApprovedReattempt { miss_count: 2 }
+            };
+            *chosen.borrow_mut() = Some(decision);
+            return Ok(Vec::new());
+        }
+        let prior_count = u32::try_from(prior.len()).context("final-tree miss count 溢出")?;
+        if prior_count >= 2 {
+            let decision = GateReuseMissDecisionV1::ApprovedReattempt { miss_count: 2 };
+            *chosen.borrow_mut() = Some(decision);
+            return Ok(vec![final_tree_approved_reattempt_event(
+                task_id,
+                round,
+                authorization,
+                "final-tree-v1 attempt already exhausted its two-miss budget",
+            )]);
+        }
+        let decision = decide_gate_reuse_miss_v1(prior_count, true, false);
+        let miss_no = match decision {
+            GateReuseMissDecisionV1::RetryInput { miss_count }
+            | GateReuseMissDecisionV1::ApprovedReattempt { miss_count } => miss_count,
+            _ => bail!("final-tree input drift produced non-input decision"),
+        };
+        let miss = ledger::runtime_event_v1(
+            round,
+            Some(task_id),
+            ledger::RuntimeEventPayloadV1::GateReuseMiss(ledger::GateReuseMissPayloadV1 {
+                schema_version: FINAL_TREE_GATE_CONTRACT_V1,
+                attempt_id: authorization.attempt_id.clone(),
+                attempt_no: authorization.attempt_no,
+                phase: "trial".to_string(),
+                command_ref: command_ref.to_string(),
+                miss_no,
+                reason: reason.to_string(),
+                input_identity_sha256: actual_sha256.to_string(),
+                expected_sha256: expected_sha256.to_string(),
+                actual_sha256: actual_sha256.to_string(),
+                policy_base_sha: policy_base_sha.to_string(),
+            }),
+        )?;
+        let mut batch = vec![miss];
+        if matches!(decision, GateReuseMissDecisionV1::ApprovedReattempt { .. }) {
+            batch.push(final_tree_approved_reattempt_event(
+                task_id,
+                round,
+                authorization,
+                "final-tree-v1 input drift budget exhausted at miss 2",
+            ));
+        }
+        *chosen.borrow_mut() = Some(decision);
+        Ok(batch)
+    })?;
+    chosen
+        .into_inner()
+        .context("final-tree GateReuseMiss decision 未产生")
+}
+
+fn run_final_tree_full_v1(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    authorization: &crate::verify::RootMergeAuthorization,
+    captured: &CapturedFinalTreeInputV1,
+) -> Result<FinalTreeGateAttestationV1> {
+    let synthetic_commit = gitx::commit_synthetic_merge_tree(
+        root,
+        &captured.tested.tree_sha,
+        &captured.tested.main_sha,
+        &authorization.head_sha,
+        &format!("orch final-tree-v1 {task_id} {}", authorization.attempt_id),
+    )?;
+    let worktree = root
+        .join(".cowork-temp")
+        .join(format!("final-tree-{task_id}-{}", ulid::Ulid::new()));
+    if fs::symlink_metadata(&worktree).is_ok() {
+        bail!("final-tree synthetic worktree 已存在，拒绝复用");
+    }
+    fs::create_dir_all(worktree.parent().context("final-tree worktree 缺 parent")?)?;
+    let log_dir = root.join("coordination/runtime/logs");
+    let final_tree_attempt_id = authorization.attempt_id.as_str();
+    let audit_identity = ledger::GateAuditIdentity::Attempt {
+        task_id,
+        attempt_id: final_tree_attempt_id,
+    };
+    let storage_permit = crate::storage::guard_gate_operation(
+        root,
+        round,
+        audit_identity,
+        &[
+            worktree.clone(),
+            log_dir.clone(),
+            root.join("orch/target"),
+            root.join("coordination/runtime/cas"),
+        ],
+    )?;
+    gitx::worktree_add_detached(root, &worktree, &synthetic_commit)?;
+    let run = (|| -> Result<(Vec<FinalTreeGateSourceV1>, Option<(String, i32)>)> {
+        if gitx::rev_parse(&worktree, "HEAD")? != synthetic_commit
+            || gitx::rev_parse(&worktree, "HEAD^{tree}")? != captured.tested.tree_sha
+            || !gitx::porcelain_v2(&worktree)?.trim().is_empty()
+        {
+            bail!("final-tree detached worktree initial identity/cleanliness 漂移");
+        }
+        let subject_tree_sha = gate::capture_gate_subject_tree(root, &worktree)?;
+        if subject_tree_sha != captured.tested.tree_sha {
+            bail!("final-tree gate subject 不是 synthetic merge tree");
+        }
+        let mut sources = Vec::new();
+        for gate_ref in &captured.gate_refs {
+            let spec = captured
+                .binding
+                .commands
+                .get(gate_ref)
+                .with_context(|| format!("final-tree binding 缺命令: {gate_ref}"))?;
+            let fresh_fingerprint = gate::capture_gate_environment_fingerprint(root)?;
+            if fresh_fingerprint != captured.fingerprint {
+                bail!("final-tree environment/toolchain 在 full spawn 前漂移");
+            }
+            let gate_run_id = ulid::Ulid::new().to_string();
+            let scoped_tag = gate::phase_scoped_log_tag(
+                round,
+                task_id,
+                &authorization.attempt_id,
+                gate::GatePhase::Trial,
+                &gate_run_id,
+            );
+            let result = with_close_orphan_watch(
+                root,
+                round,
+                task_id,
+                &log_dir,
+                &scoped_tag,
+                gate_ref,
+                || {
+                    crate::storage::refresh_gate_permit(
+                        root,
+                        round,
+                        audit_identity,
+                        &storage_permit,
+                        &[
+                            worktree.clone(),
+                            log_dir.clone(),
+                            root.join("orch/target"),
+                            root.join("coordination/runtime/cas"),
+                        ],
+                    )?;
+                    gate::run_gate_with_permit_and_identity(
+                        &storage_permit,
+                        audit_identity,
+                        gate_ref,
+                        spec,
+                        &worktree,
+                        &log_dir,
+                        &scoped_tag,
+                    )
+                },
+            )?;
+            if gitx::rev_parse(&worktree, "HEAD")? != synthetic_commit
+                || gate::capture_gate_subject_tree(root, &worktree)? != subject_tree_sha
+                || !gitx::porcelain_v2(&worktree)?.trim().is_empty()
+            {
+                bail!("final-tree gate {gate_ref} 改变 synthetic worktree");
+            }
+            persist_final_tree_gate_log_v1(root, &result)?;
+            gate::record_gate_execution(
+                root,
+                round,
+                audit_identity,
+                GATE_EXECUTED_SCHEMA,
+                gate::GatePhase::Trial,
+                &gate_run_id,
+                &subject_tree_sha,
+                &result,
+                &fresh_fingerprint,
+            )?;
+            let source = recorded_final_tree_gate_source_v1(root, round, task_id, &gate_run_id)?;
+            let exit_code = result.exit_code;
+            sources.push(source);
+            if exit_code != 0 {
+                return Ok((sources, Some((gate_ref.clone(), exit_code))));
+            }
+        }
+        Ok((sources, None))
+    })();
+    let cleanup =
+        gitx::worktree_remove(root, &worktree).context("清理 final-tree synthetic worktree 失败");
+    let (sources, red) = match (run, cleanup) {
+        (Ok(value), Ok(())) => value,
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(_), Err(error)) => return Err(error),
+        (Err(error), Err(cleanup_error)) => {
+            return Err(error).context(format!(
+                "final-tree full 失败且 worktree 清理失败: {cleanup_error:#}"
+            ))
+        }
+    };
+    if let Some((gate_ref, exit_code)) = red {
+        append_final_tree_approved_reattempt(
+            root,
+            round,
+            task_id,
+            authorization,
+            &format!("final-tree-v1 Trial full red: {gate_ref} exit {exit_code}"),
+        )?;
+        bail!(
+            "final-tree Trial full {gate_ref} 红（exit {exit_code}）；已用 exact approved-reattempt 闭合 pending PASS"
+        );
+    }
+    let attestation = FinalTreeGateAttestationV1 {
+        schema_version: FINAL_TREE_GATE_CONTRACT_V1,
+        round: round.to_string(),
+        task_id: task_id.to_string(),
+        attempt_id: authorization.attempt_id.clone(),
+        attempt_no: authorization.attempt_no,
+        policy_base_sha: captured.policy_base_sha.clone(),
+        ir_revision: captured.ir_revision,
+        validation_digest: captured.validation_digest.clone(),
+        binding_sha256: captured.binding_sha256.clone(),
+        task_card_sha256: captured.task_card_sha256.clone(),
+        resolved_command_digest: captured.resolved_command_digest.clone(),
+        ordered_command_refs: captured.gate_refs.clone(),
+        toolchain_digest: captured.fingerprint.toolchain_digest.clone(),
+        environment_digest: captured.fingerprint.environment_digest.clone(),
+        tested: captured.tested.clone(),
+        gates: sources,
+    };
+    let read = read_ledger(&root.join(format!("coordination/rounds/{round}/events.jsonl")))?;
+    if !read.bad_lines.is_empty() {
+        bail!("final-tree full 后账本含坏行");
+    }
+    validate_final_tree_attestation_v1(root, &read.events, &attestation, Some(captured))?;
+    store_final_tree_attestation_v1(root, &attestation)?;
+    Ok(attestation)
+}
+
+fn final_tree_error_identity_v1(detail: &str) -> String {
+    let mut digest = Sha256::new();
+    let domain = b"orch-final-tree-gate-error-v1";
+    digest.update((domain.len() as u64).to_be_bytes());
+    digest.update(domain);
+    digest.update((detail.len() as u64).to_be_bytes());
+    digest.update(detail.as_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn same_root_merge_authorization(
+    left: &crate::verify::RootMergeAuthorization,
+    right: &crate::verify::RootMergeAuthorization,
+) -> bool {
+    left.verdict_event_id == right.verdict_event_id
+        && left.attempt_id == right.attempt_id
+        && left.attempt_no == right.attempt_no
+        && left.implementer_agent == right.implementer_agent
+        && left.head_sha == right.head_sha
+        && left.main_head_sha == right.main_head_sha
+        && left.collect_completed_event_id == right.collect_completed_event_id
+        && left.bound_artifacts == right.bound_artifacts
+}
+
+fn final_tree_trial_observation_exists(
+    events: &[EventRecord],
+    round: &str,
+    task_id: &str,
+    attempt_id: &str,
+) -> bool {
+    let root_position = events.iter().position(|event| {
+        event.kind == "VerdictIssued"
+            && event.actor == "verifier:root"
+            && event.task_id.as_deref() == Some(task_id)
+            && event.round.as_deref() == Some(round)
+            && event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("attemptId"))
+                .and_then(serde_json::Value::as_str)
+                == Some(attempt_id)
+    });
+    let Some(root_position) = root_position else {
+        return false;
+    };
+    events[root_position + 1..].iter().any(|event| {
+        event.kind == GATE_EXECUTED_SCHEMA.0
+            && event.task_id.as_deref() == Some(task_id)
+            && event.round.as_deref() == Some(round)
+            && event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("phase"))
+                .and_then(serde_json::Value::as_str)
+                == Some("trial")
+    })
+}
+
+fn prepare_final_tree_proof_v1(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    authorization: &crate::verify::RootMergeAuthorization,
+    events: &[EventRecord],
+) -> Result<Option<FinalTreeGateAttestationV1>> {
+    let Some(policy) =
+        resolve_final_tree_policy(root, round, events, task_id, &authorization.attempt_id)?
+    else {
+        return Ok(None);
+    };
+    let durable_miss_count = events
+        .iter()
+        .filter_map(|event| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::GateReuseMiss(payload))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            (event.task_id.as_deref() == Some(task_id)
+                && event.round.as_deref() == Some(round)
+                && payload.attempt_id == authorization.attempt_id)
+                .then_some(payload)
+        })
+        .count();
+    if durable_miss_count >= 2 {
+        append_final_tree_approved_reattempt(
+            root,
+            round,
+            task_id,
+            authorization,
+            "final-tree-v1 refuses a pending PASS whose attempt already exhausted two reuse misses",
+        )?;
+        bail!("final-tree-v1 attempt miss budget was already exhausted")
+    }
+    let captured = capture_final_tree_input_v1(
+        root,
+        round,
+        task_id,
+        events,
+        authorization,
+        &policy.policy_base_sha,
+    )?;
+    let prior = load_final_tree_attestation_v1(root, round, task_id, &authorization.attempt_id)?;
+    let attestation = match prior {
+        Some(prior) => {
+            // Validate source events and every raw-log object before deciding
+            // whether the live identity moved. Corruption is never a miss.
+            validate_final_tree_attestation_v1(root, events, &prior, None)?;
+            if prior.tested == captured.tested
+                && prior.ir_revision == captured.ir_revision
+                && prior.validation_digest == captured.validation_digest
+                && prior.binding_sha256 == captured.binding_sha256
+                && prior.task_card_sha256 == captured.task_card_sha256
+                && prior.resolved_command_digest == captured.resolved_command_digest
+                && prior.ordered_command_refs == captured.gate_refs
+                && prior.toolchain_digest == captured.fingerprint.toolchain_digest
+                && prior.environment_digest == captured.fingerprint.environment_digest
+            {
+                validate_final_tree_attestation_v1(root, events, &prior, Some(&captured))?;
+                prior
+            } else {
+                let reason = final_tree_drift_reason(&prior, &captured);
+                let decision = append_final_tree_input_miss(
+                    root,
+                    round,
+                    task_id,
+                    authorization,
+                    &policy.policy_base_sha,
+                    captured
+                        .gate_refs
+                        .first()
+                        .context("final-tree merge refs unexpectedly empty")?,
+                    reason,
+                    &prior.tested.input_identity_sha256,
+                    &captured.tested.input_identity_sha256,
+                )?;
+                if matches!(decision, GateReuseMissDecisionV1::ApprovedReattempt { .. }) {
+                    bail!(
+                        "final-tree input drift reached miss 2；已用 exact approved-reattempt 闭合 pending PASS"
+                    );
+                }
+                run_final_tree_full_v1(root, round, task_id, authorization, &captured)?
+            }
+        }
+        None => {
+            if final_tree_trial_observation_exists(
+                events,
+                round,
+                task_id,
+                &authorization.attempt_id,
+            ) {
+                bail!(
+                    "final-tree Trial observations exist without a readable CAS attestation pointer"
+                );
+            }
+            run_final_tree_full_v1(root, round, task_id, authorization, &captured)?
+        }
+    };
+
+    let after = read_ledger(&root.join(format!("coordination/rounds/{round}/events.jsonl")))?;
+    if !after.bad_lines.is_empty() {
+        bail!("final-tree full 后 fresh ledger 含坏行");
+    }
+    let fresh_authorization =
+        crate::verify::validate_root_merge_authorization(root, round, task_id, &after.events);
+    let fresh_authorization = match fresh_authorization {
+        Ok(fresh) if same_root_merge_authorization(&fresh, authorization) => fresh,
+        Ok(_) => {
+            let actual = final_tree_error_identity_v1("root authorization tuple changed");
+            let decision = append_final_tree_input_miss(
+                root,
+                round,
+                task_id,
+                authorization,
+                &policy.policy_base_sha,
+                attestation
+                    .ordered_command_refs
+                    .first()
+                    .context("final-tree attestation refs empty")?,
+                "contract",
+                &attestation.tested.input_identity_sha256,
+                &actual,
+            )?;
+            if matches!(decision, GateReuseMissDecisionV1::ApprovedReattempt { .. }) {
+                bail!("final-tree root authorization drift exhausted miss budget");
+            }
+            bail!("final-tree root authorization changed after full; retry seal")
+        }
+        Err(error) => {
+            let detail = format!("root authorization recheck failed: {error:#}");
+            let actual = final_tree_error_identity_v1(&detail);
+            let decision = append_final_tree_input_miss(
+                root,
+                round,
+                task_id,
+                authorization,
+                &policy.policy_base_sha,
+                attestation
+                    .ordered_command_refs
+                    .first()
+                    .context("final-tree attestation refs empty")?,
+                "contract",
+                &attestation.tested.input_identity_sha256,
+                &actual,
+            )?;
+            if matches!(decision, GateReuseMissDecisionV1::ApprovedReattempt { .. }) {
+                bail!("final-tree root authorization failure exhausted miss budget");
+            }
+            bail!("{detail}; recorded one attempt-scoped GateReuseMiss")
+        }
+    };
+    let fresh_policy = resolve_final_tree_policy(
+        root,
+        round,
+        &after.events,
+        task_id,
+        &authorization.attempt_id,
+    )?
+    .context("final-tree-v1 policy disappeared after full")?;
+    if fresh_policy.policy_base_sha != policy.policy_base_sha
+        || fresh_policy.policy_sha256 != policy.policy_sha256
+        || fresh_policy.binding_sha256 != policy.binding_sha256
+    {
+        bail!("final-tree-v1 policy identity changed after full");
+    }
+    let fresh = capture_final_tree_input_v1(
+        root,
+        round,
+        task_id,
+        &after.events,
+        &fresh_authorization,
+        &fresh_policy.policy_base_sha,
+    );
+    let fresh = match fresh {
+        Ok(value) => value,
+        Err(error) => {
+            let detail = format!("final-tree input recapture failed: {error:#}");
+            let actual = final_tree_error_identity_v1(&detail);
+            let decision = append_final_tree_input_miss(
+                root,
+                round,
+                task_id,
+                authorization,
+                &policy.policy_base_sha,
+                attestation
+                    .ordered_command_refs
+                    .first()
+                    .context("final-tree attestation refs empty")?,
+                "input-tree",
+                &attestation.tested.input_identity_sha256,
+                &actual,
+            )?;
+            if matches!(decision, GateReuseMissDecisionV1::ApprovedReattempt { .. }) {
+                bail!("final-tree input recapture exhausted miss budget");
+            }
+            bail!("{detail}; recorded one attempt-scoped GateReuseMiss")
+        }
+    };
+    if fresh.tested.input_identity_sha256 != attestation.tested.input_identity_sha256 {
+        let reason = final_tree_drift_reason(&attestation, &fresh);
+        let decision = append_final_tree_input_miss(
+            root,
+            round,
+            task_id,
+            authorization,
+            &policy.policy_base_sha,
+            fresh
+                .gate_refs
+                .first()
+                .context("final-tree fresh refs empty")?,
+            reason,
+            &attestation.tested.input_identity_sha256,
+            &fresh.tested.input_identity_sha256,
+        )?;
+        if matches!(decision, GateReuseMissDecisionV1::ApprovedReattempt { .. }) {
+            bail!("final-tree input drift reached miss 2 after full");
+        }
+        bail!("final-tree input drifted after full; retry seal with miss budget preserved")
+    }
+    validate_final_tree_attestation_v1(root, &after.events, &attestation, Some(&fresh))?;
+    Ok(Some(attestation))
+}
+
+fn final_tree_reused_events_v1(
+    round: &str,
+    task_id: &str,
+    attestation: &FinalTreeGateAttestationV1,
+) -> Result<Vec<EventRecord>> {
+    attestation
+        .gates
+        .iter()
+        .map(|source| {
+            ledger::runtime_event_v1(
+                round,
+                Some(task_id),
+                ledger::RuntimeEventPayloadV1::GateReused(ledger::GateReusedPayloadV1 {
+                    schema_version: FINAL_TREE_GATE_CONTRACT_V1,
+                    attempt_id: attestation.attempt_id.clone(),
+                    attempt_no: attestation.attempt_no,
+                    source_gate_event_id: source.source_event_id.clone(),
+                    source_phase: "trial".to_string(),
+                    target_phase: "postmerge".to_string(),
+                    input_identity_sha256: attestation.tested.input_identity_sha256.clone(),
+                    command_ref: source.command_ref.clone(),
+                    subject_tree_sha: source.subject_tree_sha.clone(),
+                    log_sha256: source.log_sha256.clone(),
+                    log_bytes: source.log_bytes,
+                    saved_ms: source.duration_ms,
+                }),
+            )
+        })
+        .collect()
+}
+
+fn validate_final_tree_recorded_reuse_v1(
+    root: &Path,
+    events: &[EventRecord],
+    round: &str,
+    task_id: &str,
+    merge_sha: &str,
+    attestation: &FinalTreeGateAttestationV1,
+) -> Result<()> {
+    validate_final_tree_attestation_v1(root, events, attestation, None)?;
+    let actual_tree = gitx::rev_parse(root, &format!("{merge_sha}^{{tree}}"))?;
+    if compare_actual_merge_tree_v1(&attestation.tested, &actual_tree) != FinalTreeDecisionV1::Reuse
+    {
+        bail!("recorded final-tree reuse 不绑定 actual merge tree");
+    }
+    let recorded = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event.kind == "TaskRecorded"
+                && event.task_id.as_deref() == Some(task_id)
+                && event.round.as_deref() == Some(round)
+        })
+        .collect::<Vec<_>>();
+    let [(recorded_position, _)] = recorded.as_slice() else {
+        bail!("final-tree reuse 要求唯一 TaskRecorded");
+    };
+    let reused = events
+        .iter()
+        .enumerate()
+        .filter_map(|(position, event)| {
+            let Ok(Some(ledger::RuntimeEventPayloadV1::GateReused(payload))) =
+                ledger::decode_runtime_event_v1(event)
+            else {
+                return None;
+            };
+            (event.task_id.as_deref() == Some(task_id)
+                && event.round.as_deref() == Some(round)
+                && payload.attempt_id == attestation.attempt_id
+                && payload.target_phase == "postmerge")
+                .then_some((position, payload))
+        })
+        .collect::<Vec<_>>();
+    if reused.len() != attestation.gates.len()
+        || reused
+            .first()
+            .is_none_or(|(position, _)| *position <= *recorded_position)
+        || reused
+            .windows(2)
+            .any(|window| window[0].0 + 1 != window[1].0)
+    {
+        bail!("GateReused 未形成 TaskRecorded 同批后的连续 lifecycle suffix");
+    }
+    for ((_, reused), source) in reused.iter().zip(&attestation.gates) {
+        if reused.source_gate_event_id != source.source_event_id
+            || reused.source_phase != "trial"
+            || reused.target_phase != "postmerge"
+            || reused.input_identity_sha256 != attestation.tested.input_identity_sha256
+            || reused.command_ref != source.command_ref
+            || reused.subject_tree_sha != attestation.tested.tree_sha
+            || reused.log_sha256 != source.log_sha256
+            || reused.log_bytes != source.log_bytes
+            || reused.saved_ms != source.duration_ms
+        {
+            bail!("postmerge GateReused payload 与 Trial source proof 漂移");
+        }
+    }
+    Ok(())
+}
+
+fn append_final_tree_reused_record_v1(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    merge_sha: &str,
+    attestation: &FinalTreeGateAttestationV1,
+) -> Result<()> {
+    let actual_tree = gitx::rev_parse(root, &format!("{merge_sha}^{{tree}}"))?;
+    if compare_actual_merge_tree_v1(&attestation.tested, &actual_tree) != FinalTreeDecisionV1::Reuse
+    {
+        bail!("actual merge tree 不等于 tested tree，拒绝复用 postmerge");
+    }
+    let ledger_path = root.join(format!("coordination/rounds/{round}/events.jsonl"));
+    let before = read_ledger(&ledger_path)?;
+    if !before.bad_lines.is_empty() {
+        bail!("final-tree reuse record 前账本含坏行");
+    }
+    validate_final_tree_attestation_v1(root, &before.events, attestation, None)?;
+    let authorization =
+        crate::verify::validate_root_record_authorization(root, round, task_id, &before.events)?;
+    if authorization.merge_sha != merge_sha || authorization.already_recorded {
+        bail!("final-tree reuse record authorization 与 exact merge 不匹配");
+    }
+    let attestation = attestation.clone();
+    let expected_authorization = authorization.clone();
+    ledger::append_checked_merge_lifecycle(root, round, |events| {
+        let fresh =
+            crate::verify::validate_root_record_authorization(root, round, task_id, events)?;
+        if fresh != expected_authorization {
+            bail!("final-tree GateReused append 前 record authorization 漂移");
+        }
+        validate_final_tree_attestation_v1(root, events, &attestation, None)?;
+        let mut batch = canonical_task_recorded_batch(
+            root,
+            events,
+            task_id,
+            round,
+            &fresh,
+            &fresh.merge_sha,
+            None,
+        )?;
+        // FrozenContractSuperseded's pre-B310 validator permits no prefix
+        // before TaskRecorded. Appending the inert reuse observations after
+        // the canonical close facts in this same atomic lifecycle batch keeps
+        // all readers all-or-nothing without weakening that frozen grammar.
+        batch.extend(final_tree_reused_events_v1(round, task_id, &attestation)?);
+        Ok(batch)
+    })?;
+    let after = read_ledger(&ledger_path)?;
+    if !after.bad_lines.is_empty() {
+        bail!("final-tree reuse record 后账本含坏行");
+    }
+    validate_final_tree_recorded_reuse_v1(
+        root,
+        &after.events,
+        round,
+        task_id,
+        merge_sha,
+        &attestation,
+    )
+}
+
+fn validate_completed_final_tree_reuse_if_present(
+    root: &Path,
+    events: &[EventRecord],
+    round: &str,
+    task_id: &str,
+    authorization: &crate::verify::RootRecordAuthorization,
+) -> Result<()> {
+    let reused = events.iter().any(|event| {
+        matches!(
+            ledger::decode_runtime_event_v1(event),
+            Ok(Some(ledger::RuntimeEventPayloadV1::GateReused(ref payload)))
+                if event.task_id.as_deref() == Some(task_id)
+                    && event.round.as_deref() == Some(round)
+                    && payload.attempt_id == authorization.attempt_id
+                    && payload.target_phase == "postmerge"
+        )
+    });
+    if !reused {
+        return Ok(());
+    }
+    resolve_final_tree_policy(root, round, events, task_id, &authorization.attempt_id)?
+        .context("postmerge GateReused 的 attempt-base final-tree-v1 未激活")?;
+    let attestation =
+        load_final_tree_attestation_v1(root, round, task_id, &authorization.attempt_id)?
+            .context("completed final-tree reuse 缺 CAS attestation pointer")?;
+    validate_final_tree_recorded_reuse_v1(
+        root,
+        events,
+        round,
+        task_id,
+        &authorization.merge_sha,
+        &attestation,
+    )
+}
+
+fn finish_successful_merge(
+    root: &Path,
+    task_id: &str,
+    branch: &str,
+    authorization: &crate::verify::RootMergeAuthorization,
+    short: String,
+    gates: Vec<gate::GateResult>,
+) -> Result<MergeOutcome> {
+    let board_line = format!(
+        "- [orch] **{task_id} merged**（`{short}`，no-ff，合后门全绿）· verifier:root fixed-HEAD PASS · 运行时自动收口。"
+    );
+    let board_result = fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("coordination/BOARD.md"))
+        .and_then(|mut file| writeln!(file, "{board_line}"));
+    if let Err(error) = board_result {
+        eprintln!(
+            "[orch] 警告：BOARD.md 追加失败（{error}）——merge 与记账已完成，仅人读账本缺一行"
+        );
+    }
+    let disposition = match wake::load_registry(root) {
+        Ok(registry) => {
+            cleanup_disposition(registry.contains_key(&authorization.implementer_agent))
+        }
+        Err(error) => {
+            eprintln!("[orch] 警告：AgentRegistry 读取失败（{error}）——保守按 Tier F 延后清理");
+            CleanupDisposition::DeferredTierF
+        }
+    };
+    match disposition {
+        CleanupDisposition::DeferredTierF => println!(
+            "[orch] Tier F 现场延迟清理：保留 worktree .worktrees/{task_id} 与分支 {branch}，待确认会话退出后由 Tier F 流程回收"
+        ),
+        CleanupDisposition::AttemptBestEffort => {
+            let worktree = root.join(".worktrees").join(task_id);
+            if let Err(error) = gitx::worktree_remove(root, &worktree) {
+                eprintln!("[orch] 警告：worktree remove 失败（{error}）——best-effort，继续尝试删分支");
+            }
+            if let Err(error) = gitx::branch_delete(root, branch) {
+                eprintln!("[orch] 警告：branch delete 失败（{error}）——best-effort，merge 事实不受影响");
+            }
+        }
+    }
+    Ok(MergeOutcome {
+        merge_sha_short: short,
+        gates,
+    })
+}
+
 pub fn run_merge(root: &Path, task_id: &str) -> Result<MergeOutcome> {
     let outcome =
         with_merge_lifecycle_transition(root, "orch merge", || run_merge_locked(root, task_id))?;
@@ -1625,6 +3584,12 @@ fn run_merge_locked(root: &Path, task_id: &str) -> Result<MergeOutcome> {
     let branch = format!("task/{task_id}");
     let authorization =
         crate::verify::validate_root_merge_authorization(root, &round, task_id, &lr.events)?;
+    // `final-tree-v1` is attempt-base policy: active attempts must complete
+    // their synthetic merge/full proof while no MergeStarted barrier exists.
+    // Dormant and historical attempts return `None` and retain the legacy
+    // postmerge path byte-for-byte below.
+    let final_tree_proof =
+        prepare_final_tree_proof_v1(root, &round, task_id, &authorization, &lr.events)?;
     let started_payload = serde_json::json!({
         "attemptId": authorization.attempt_id,
         "attemptNo": authorization.attempt_no,
@@ -1830,6 +3795,35 @@ fn run_merge_locked(root: &Path, task_id: &str) -> Result<MergeOutcome> {
     )
     .context("落 MergeExecuted 失败——main 已推进，停止后续门/记账，需人工介入")?;
 
+    if let Some(attestation) = final_tree_proof.as_ref() {
+        let actual_tree_sha = gitx::rev_parse(root, &format!("{merge_sha}^{{tree}}"))?;
+        match compare_actual_merge_tree_v1(&attestation.tested, &actual_tree_sha) {
+            FinalTreeDecisionV1::Reuse => {
+                append_final_tree_reused_record_v1(root, &round, task_id, &merge_sha, attestation)?;
+                println!(
+                    "[orch] final-tree-v1 exact tree reuse: Trial full 已满足 postmerge，saved gates={}",
+                    attestation.gates.len()
+                );
+                return finish_successful_merge(
+                    root,
+                    task_id,
+                    &branch,
+                    &authorization,
+                    short,
+                    Vec::new(),
+                );
+            }
+            FinalTreeDecisionV1::RunPostMerge {
+                tested_tree_sha,
+                actual_tree_sha,
+            } => {
+                eprintln!(
+                    "[orch] final-tree-v1 actual tree drift: tested={tested_tree_sha} actual={actual_tree_sha}; running real PostMerge"
+                );
+            }
+        }
+    }
+
     // ── 步骤 3：在 exact merge SHA 的 clean detached worktree 复跑快门。
     // 主工作区可能含不相关的本地修改；它们绝不能弱化或污染 post-merge gate。
     let log_dir = root.join("coordination/runtime/logs");
@@ -1844,33 +3838,75 @@ fn run_merge_locked(root: &Path, task_id: &str) -> Result<MergeOutcome> {
         {
             bail!("postmerge detached worktree 初始 HEAD/clean 不匹配");
         }
-        // Parse the gate contract only inside the immutable merge commit
-        // worktree.  Never reopen mutable root card/binding bytes after the
-        // fixed-HEAD authorization check (ABA-safe).
-        let c = card::load(&gate_wt, &round, task_id)?;
-        let b = binding::load(&gate_wt)?;
+        // Active final-tree attempts keep their attempt-base merge commands;
+        // dormant/history preserves the legacy immutable merge-worktree card.
+        let (gate_refs, b) = if let Some(attestation) = final_tree_proof.as_ref() {
+            let bytes = gitx::show_bytes(
+                root,
+                &attestation.policy_base_sha,
+                "coordination/PROJECT-BINDING.yaml",
+            )?;
+            let binding = binding::parse_binding_bytes(&bytes)
+                .map_err(anyhow::Error::msg)
+                .context("解析 final-tree PostMerge policy-base binding 失败")?;
+            (attestation.ordered_command_refs.clone(), binding)
+        } else {
+            let card = card::load(&gate_wt, &round, task_id)?;
+            (card.meta.gates.fast, binding::load(&gate_wt)?)
+        };
+        let subject_tree_sha = gate::capture_gate_subject_tree(root, &gate_wt)?;
         let mut gates = Vec::new();
-        for gref in &c.meta.gates.fast {
+        for gref in &gate_refs {
             let spec = b
                 .commands
                 .get(gref)
                 .with_context(|| format!("绑定缺命令: {gref}"))?;
-            let tag = format!("{task_id}-postmerge");
-            let g = with_close_orphan_watch(root, &round, task_id, &log_dir, &tag, gref, || {
-                gate::run_gate_with_audit_identity(
-                    root,
-                    &round,
-                    ledger::GateAuditIdentity::Attempt {
-                        task_id,
-                        attempt_id: &authorization.attempt_id,
-                    },
-                    gref,
-                    spec,
-                    &gate_wt,
-                    &log_dir,
-                    &tag,
-                )
-            })?;
+            let gate_run_id = ulid::Ulid::new().to_string();
+            let scoped_tag = gate::phase_scoped_log_tag(
+                &round,
+                task_id,
+                &authorization.attempt_id,
+                gate::GatePhase::PostMerge,
+                &gate_run_id,
+            );
+            let fingerprint = gate::capture_gate_environment_fingerprint(root)?;
+            let g = with_close_orphan_watch(
+                root,
+                &round,
+                task_id,
+                &log_dir,
+                &scoped_tag,
+                gref,
+                || {
+                    gate::run_gate_with_audit_identity(
+                        root,
+                        &round,
+                        ledger::GateAuditIdentity::Attempt {
+                            task_id,
+                            attempt_id: &authorization.attempt_id,
+                        },
+                        gref,
+                        spec,
+                        &gate_wt,
+                        &log_dir,
+                        &scoped_tag,
+                    )
+                },
+            )?;
+            gate::record_gate_execution(
+                root,
+                &round,
+                ledger::GateAuditIdentity::Attempt {
+                    task_id,
+                    attempt_id: &authorization.attempt_id,
+                },
+                GATE_EXECUTED_SCHEMA,
+                gate::GatePhase::PostMerge,
+                &gate_run_id,
+                &subject_tree_sha,
+                &g,
+                &fingerprint,
+            )?;
             if gitx::rev_parse(&gate_wt, "HEAD")? != merge_sha
                 || !gitx::porcelain_v2(&gate_wt)?.trim().is_empty()
             {
@@ -1920,7 +3956,15 @@ fn run_merge_locked(root: &Path, task_id: &str) -> Result<MergeOutcome> {
         if fresh != record_authorization {
             bail!("TaskRecorded append 前 post-merge authorization 漂移");
         }
-        Ok(task_recorded_batch(events, task_id, &round))
+        canonical_task_recorded_batch(
+            root,
+            events,
+            task_id,
+            &round,
+            &fresh,
+            &fresh.merge_sha,
+            None,
+        )
     })?;
 
     // ── 步骤 5：人读尾务——BOARD 追加失败只警告，不推翻已完成的 merge+gate+记账 ──
@@ -2252,6 +4296,7 @@ fn run_record_locked(
     // Keep the retirement producer visibly bound to the record path; the
     // checked append below invokes this exact pure function with fresh events.
     let retire_task_sites = crate::sites::retire_task_sites;
+    let _ = retire_task_sites;
     let round = fs::read_to_string(root.join("coordination/runtime/CURRENT-ROUND"))
         .context("CURRENT-ROUND 缺失")?
         .trim()
@@ -2267,6 +4312,13 @@ fn run_record_locked(
     let authorization =
         crate::verify::validate_root_record_authorization(root, &round, task_id, &lr.events)?;
     if authorization.already_recorded {
+        validate_completed_final_tree_reuse_if_present(
+            root,
+            &lr.events,
+            &round,
+            task_id,
+            &authorization,
+        )?;
         println!("[orch] {task_id} 已记账（canonical TaskRecorded 在账）——幂等返回");
         return Ok(RecordOutcome {
             gates: Vec::new(),
@@ -2274,6 +4326,41 @@ fn run_record_locked(
             relaxation: None,
         });
     }
+    let mut final_tree_recovery_attestation = None;
+    if matches!(gate_point, RecordGatePoint::MergeCommit)
+        && resolve_final_tree_policy(root, &round, &lr.events, task_id, &authorization.attempt_id)?
+            .is_some()
+    {
+        if let Some(attestation) =
+            load_final_tree_attestation_v1(root, &round, task_id, &authorization.attempt_id)?
+        {
+            validate_final_tree_attestation_v1(root, &lr.events, &attestation, None)?;
+            let actual_tree =
+                gitx::rev_parse(root, &format!("{}^{{tree}}", authorization.merge_sha))?;
+            if compare_actual_merge_tree_v1(&attestation.tested, &actual_tree)
+                == FinalTreeDecisionV1::Reuse
+            {
+                append_final_tree_reused_record_v1(
+                    root,
+                    &round,
+                    task_id,
+                    &authorization.merge_sha,
+                    &attestation,
+                )?;
+                return Ok(RecordOutcome {
+                    gates: Vec::new(),
+                    already_recorded: false,
+                    relaxation: None,
+                });
+            }
+            final_tree_recovery_attestation = Some(attestation);
+        }
+    }
+    // GateExecuted is now the first durable write made by record recovery. Reuse the checked
+    // lifecycle entry before spawning so pending atomic recovery (and the exact legacy B88 fixture
+    // repair hosted there) has reconciled ledger/WAL; an ordinary observation append must never be
+    // asked to guess across divergent storage arms.
+    ledger::append_checked_merge_lifecycle(root, &round, |_| Ok(Vec::new()))?;
     let short = gitx::short(&authorization.merge_sha).to_string();
     let (gate_sha, widened_files) = match gate_point {
         RecordGatePoint::MergeCommit => (authorization.merge_sha.clone(), None),
@@ -2305,20 +4392,44 @@ fn run_record_locked(
         {
             bail!("record detached worktree 初始 HEAD/clean 不匹配");
         }
-        let c = card::load(&gate_wt, &round, task_id)?;
-        let b = binding::load(&gate_wt)?;
+        let (gate_refs, b) = if let Some(attestation) = final_tree_recovery_attestation.as_ref() {
+            let bytes = gitx::show_bytes(
+                root,
+                &attestation.policy_base_sha,
+                "coordination/PROJECT-BINDING.yaml",
+            )?;
+            let binding = binding::parse_binding_bytes(&bytes)
+                .map_err(anyhow::Error::msg)
+                .context("解析 final-tree Recovery policy-base binding 失败")?;
+            (attestation.ordered_command_refs.clone(), binding)
+        } else {
+            let card = card::load(&gate_wt, &round, task_id)?;
+            (card.meta.gates.fast, binding::load(&gate_wt)?)
+        };
+        let subject_tree_sha = gate::capture_gate_subject_tree(root, &gate_wt)?;
         let mut gates = Vec::new();
-        for gref in &c.meta.gates.fast {
+        for gref in &gate_refs {
             let spec = b
                 .commands
                 .get(gref)
                 .with_context(|| format!("绑定缺命令: {gref}"))?;
-            let tag = match gate_point {
-                RecordGatePoint::MergeCommit => format!("{task_id}-record"),
-                RecordGatePoint::MainTip => format!("{task_id}-record-at-tip"),
-            };
-            let result =
-                with_close_orphan_watch(root, &round, task_id, &log_dir, &tag, gref, || {
+            let gate_run_id = ulid::Ulid::new().to_string();
+            let scoped_tag = gate::phase_scoped_log_tag(
+                &round,
+                task_id,
+                &authorization.attempt_id,
+                gate::GatePhase::Recovery,
+                &gate_run_id,
+            );
+            let fingerprint = gate::capture_gate_environment_fingerprint(root)?;
+            let result = with_close_orphan_watch(
+                root,
+                &round,
+                task_id,
+                &log_dir,
+                &scoped_tag,
+                gref,
+                || {
                     gate::run_gate_with_audit_identity(
                         root,
                         &round,
@@ -2330,9 +4441,24 @@ fn run_record_locked(
                         spec,
                         &gate_wt,
                         &log_dir,
-                        &tag,
+                        &scoped_tag,
                     )
-                })?;
+                },
+            )?;
+            gate::record_gate_execution(
+                root,
+                &round,
+                ledger::GateAuditIdentity::Attempt {
+                    task_id,
+                    attempt_id: &authorization.attempt_id,
+                },
+                GATE_EXECUTED_SCHEMA,
+                gate::GatePhase::Recovery,
+                &gate_run_id,
+                &subject_tree_sha,
+                &result,
+                &fingerprint,
+            )?;
             if gitx::rev_parse(&gate_wt, "HEAD")? != gate_sha
                 || !gitx::porcelain_v2(&gate_wt)?.trim().is_empty()
             {
@@ -2395,19 +4521,9 @@ fn run_record_locked(
 
     // The gate result authorizes no stale state: append_checked reacquires the
     // ledger lease and recomputes the complete chain/refs/source bindings.
-    let mut recorded = record_events(task_id, &round, &gates)?;
-    if let Some(proof) = &relaxation {
-        // TaskRecorded first closes the existing merge barrier; the audit fact
-        // follows in the same checked append and cannot exist on a red path.
-        recorded.push(record_gate_relaxed_event(
-            task_id,
-            &round,
-            &proof.merge_sha,
-            &proof.tip_sha,
-            &proof.reason,
-            &proof.files,
-        ));
-    }
+    // Preserve the public pure guard, but mint every durable event only inside
+    // the one fresh, checked canonical batch below.
+    record_events(task_id, &round, &gates)?;
     let expected_relaxation = relaxation.clone();
     let appended = ledger::append_checked_merge_lifecycle(root, &round, |events| {
         let fresh =
@@ -2433,10 +4549,15 @@ fn run_record_locked(
                 bail!("TaskRecorded append 前 merge_sha..tipSha 文件清单漂移");
             }
         }
-        let mut batch = recorded.clone();
-        let retirements = retire_task_sites(events, task_id, &batch[0].event_id);
-        batch.splice(1..1, retirements);
-        Ok(batch)
+        canonical_task_recorded_batch(
+            root,
+            events,
+            task_id,
+            &round,
+            &fresh,
+            &gate_sha,
+            expected_relaxation.as_ref(),
+        )
     })?;
 
     Ok(RecordOutcome {
@@ -2496,6 +4617,22 @@ pub fn release_preconditions(
     Ok(())
 }
 
+/// Reject the H29 release arm whenever the historical signed card declares a
+/// frozen-contract supersession.  Release would close the barrier without the
+/// adjacent TaskRecorded/FrozenContractSuperseded facts and make that record
+/// edge permanently unreachable.
+pub fn release_frozen_supersession_precondition(
+    pending_declarations: usize,
+) -> std::result::Result<(), String> {
+    if pending_declarations > 0 {
+        return Err(
+            "pending frozen supersession requires atomic `orch record <TASK> --at-tip`; post-merge-gate-released is forbidden"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// H29 合后门红支：把「屏障永不可闭合 ⇒ 全轮冻结」变成一条留证的释放出口。
 /// 三条件 fail-closed，任一不满足即拒：
 /// 1. 账本确有本 (task, round) 的 `post-merge-gate` 升级——证明门确实红过，
@@ -2514,6 +4651,19 @@ fn release_post_merge_barrier(
 ) -> Result<RecoveryOutcome> {
     if authorization.already_recorded {
         bail!("merge --recover {task_id} 释放臂拒绝已 TaskRecorded authorization");
+    }
+    let historical_card = crate::verify::frozen_contract_card_from_record_authorization(
+        root,
+        round,
+        task_id,
+        authorization,
+    )?;
+    if let Err(reason) = release_frozen_supersession_precondition(
+        historical_card.meta.frozen_contract_supersessions.len(),
+    ) {
+        bail!(
+            "merge --recover {task_id} 拒绝：{reason}；唯一合法出口是 `orch record {task_id} --at-tip`，由同一 record batch 原子生成 TaskRecorded/FrozenContractSuperseded"
+        );
     }
     let gate_red = events.iter().rev().find(|event| {
         event.kind == "EscalationRaised"
@@ -2589,15 +4739,30 @@ fn release_post_merge_barrier(
         }
         let card = card::load(&gate_wt, round, task_id)?;
         let binding = binding::load(&gate_wt)?;
+        let subject_tree_sha = gate::capture_gate_subject_tree(root, &gate_wt)?;
         let mut gates = Vec::new();
         for gate_ref in &card.meta.gates.fast {
             let spec = binding
                 .commands
                 .get(gate_ref)
                 .with_context(|| format!("绑定缺命令: {gate_ref}"))?;
-            let tag = format!("{task_id}-release");
-            let result =
-                with_close_orphan_watch(root, round, task_id, &log_dir, &tag, gate_ref, || {
+            let gate_run_id = ulid::Ulid::new().to_string();
+            let scoped_tag = gate::phase_scoped_log_tag(
+                round,
+                task_id,
+                &authorization.attempt_id,
+                gate::GatePhase::Recovery,
+                &gate_run_id,
+            );
+            let fingerprint = gate::capture_gate_environment_fingerprint(root)?;
+            let result = with_close_orphan_watch(
+                root,
+                round,
+                task_id,
+                &log_dir,
+                &scoped_tag,
+                gate_ref,
+                || {
                     gate::run_gate_with_audit_identity(
                         root,
                         round,
@@ -2609,9 +4774,24 @@ fn release_post_merge_barrier(
                         spec,
                         &gate_wt,
                         &log_dir,
-                        &tag,
+                        &scoped_tag,
                     )
-                })?;
+                },
+            )?;
+            gate::record_gate_execution(
+                root,
+                round,
+                ledger::GateAuditIdentity::Attempt {
+                    task_id,
+                    attempt_id: &authorization.attempt_id,
+                },
+                GATE_EXECUTED_SCHEMA,
+                gate::GatePhase::Recovery,
+                &gate_run_id,
+                &subject_tree_sha,
+                &result,
+                &fingerprint,
+            )?;
             if gitx::rev_parse(&gate_wt, "HEAD")? != tip_sha
                 || !gitx::porcelain_v2(&gate_wt)?.trim().is_empty()
             {
@@ -2621,6 +4801,7 @@ fn release_post_merge_barrier(
         }
         Ok(gates)
     })();
+    // Observation recording leaves the recovery gate outcome unchanged.
     gitx::worktree_remove(root, &gate_wt).context("清理 release detached worktree 失败")?;
     let gates = gate_run?;
     let tip_green = !gates.is_empty() && gates.iter().all(|gate| gate.exit_code == 0);
@@ -2720,15 +4901,24 @@ fn recover_boundary_merge(
         if c.meta.gates.fast.is_empty() {
             bail!("boundary recovery fast gate 集为空，拒绝补记");
         }
+        let subject_tree_sha = gate::capture_gate_subject_tree(root, &gate_wt)?;
         let mut gates = Vec::new();
         for gref in &c.meta.gates.fast {
             let spec = b
                 .commands
                 .get(gref)
                 .with_context(|| format!("绑定缺命令: {gref}"))?;
-            let tag = format!("{task_id}-boundary-recovery");
+            let gate_run_id = ulid::Ulid::new().to_string();
+            let scoped_tag = gate::phase_scoped_log_tag(
+                round,
+                task_id,
+                &authorization.attempt_id,
+                gate::GatePhase::Recovery,
+                &gate_run_id,
+            );
+            let fingerprint = gate::capture_gate_environment_fingerprint(root)?;
             let result =
-                with_close_orphan_watch(root, round, task_id, &log_dir, &tag, gref, || {
+                with_close_orphan_watch(root, round, task_id, &log_dir, &scoped_tag, gref, || {
                     gate::run_gate_with_audit_identity(
                         root,
                         round,
@@ -2740,9 +4930,23 @@ fn recover_boundary_merge(
                         spec,
                         &gate_wt,
                         &log_dir,
-                        &tag,
+                        &scoped_tag,
                     )
                 })?;
+            gate::record_gate_execution(
+                root,
+                round,
+                ledger::GateAuditIdentity::Attempt {
+                    task_id,
+                    attempt_id: &authorization.attempt_id,
+                },
+                GATE_EXECUTED_SCHEMA,
+                gate::GatePhase::Recovery,
+                &gate_run_id,
+                &subject_tree_sha,
+                &result,
+                &fingerprint,
+            )?;
             if gitx::rev_parse(&gate_wt, "HEAD")? != tip_sha
                 || !gitx::porcelain_v2(&gate_wt)?.trim().is_empty()
             {
@@ -2760,6 +4964,12 @@ fn recover_boundary_merge(
     let expected_authorization = authorization.clone();
     let expected_tip = tip_sha.clone();
     let expected_files = widened_files.clone();
+    let recovery_relaxation = RecordRelaxationProof {
+        merge_sha: authorization.merge_sha.clone(),
+        tip_sha: tip_sha.clone(),
+        reason: H48_BOUNDARY_RECOVERY_REASON.to_string(),
+        files: widened_files.clone(),
+    };
     let proposed = if let Some(red) = red_gate {
         vec![
             merge_executed_event(task_id, round, &authorization.merge_sha),
@@ -2772,18 +4982,13 @@ fn recover_boundary_merge(
             ),
         ]
     } else {
-        vec![
-            merge_executed_event(task_id, round, &authorization.merge_sha),
-            task_recorded_event(task_id, round),
-            record_gate_relaxed_event(
-                task_id,
-                round,
-                &authorization.merge_sha,
-                &tip_sha,
-                H48_BOUNDARY_RECOVERY_REASON,
-                &widened_files,
-            ),
-        ]
+        // The post-green suffix is minted below by the same fallible helper as
+        // normal seal and record --at-tip.  Only MergeExecuted precedes it.
+        vec![merge_executed_event(
+            task_id,
+            round,
+            &authorization.merge_sha,
+        )]
     };
     let proposed_count = proposed.len();
     let green_recovery = red_gate.is_none();
@@ -2808,16 +5013,17 @@ fn recover_boundary_merge(
         }
         let mut batch = proposed.clone();
         if green_recovery {
-            let recorded_at = batch
-                .iter()
-                .position(|event| event.kind == "TaskRecorded")
-                .context("H48 green recovery missing TaskRecorded candidate")?;
-            let retirements = crate::sites::retire_task_sites(
-                fresh_events,
+            let mut history = fresh_events.to_vec();
+            history.extend(batch.iter().cloned());
+            batch.extend(canonical_task_recorded_batch(
+                root,
+                &history,
                 task_id,
-                &batch[recorded_at].event_id,
-            );
-            batch.splice(recorded_at + 1..recorded_at + 1, retirements);
+                round,
+                &fresh,
+                &fresh_tip,
+                Some(&recovery_relaxation),
+            )?);
         }
         expected_appended = batch.len();
         Ok(batch)
@@ -2929,10 +5135,7 @@ fn run_merge_recovery_locked(root: &Path, task_id: &str) -> Result<RecoveryOutco
                 );
             }
             let authorization = crate::verify::validate_root_record_authorization(
-                root,
-                &round,
-                task_id,
-                &lr.events,
+                root, &round, task_id, &lr.events,
             )?;
             let released = release_post_merge_barrier(
                 root,
@@ -3012,7 +5215,87 @@ fn run_merge_recovery_locked(root: &Path, task_id: &str) -> Result<RecoveryOutco
 mod tests {
     use super::*;
 
+    fn matching_gate_logs(log_dir: &Path, prefix: &str, suffix: &str) -> Vec<PathBuf> {
+        let mut matches = fs::read_dir(log_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                (name.starts_with(prefix) && name.ends_with(suffix)).then_some(entry.path())
+            })
+            .collect::<Vec<_>>();
+        matches.sort();
+        matches
+    }
+
     // ─── 纯判据内核（seed 契约表）───
+
+    #[test]
+    fn frozen_supersession_release_is_rejected_before_any_recovery_gate() {
+        let events = vec![
+            ledger::event(
+                "MergeStarted",
+                "runtime:orch",
+                Some("B310"),
+                Some("r81"),
+                serde_json::json!({
+                    "attemptId": "B310-A0001",
+                    "attemptNo": 1,
+                    "headSha": "a".repeat(40),
+                    "mainHeadSha": "b".repeat(40),
+                    "collectCompletedEventId": "collect-one",
+                    "verdictEventId": "verdict-one",
+                }),
+            ),
+            ledger::event(
+                "MergeExecuted",
+                "reviewer:orch-runtime",
+                Some("B310"),
+                Some("r81"),
+                serde_json::json!({"mergeSha": "c".repeat(40), "policy": "no-ff"}),
+            ),
+            ledger::event(
+                "EscalationRaised",
+                "reviewer:orch-runtime",
+                Some("B310"),
+                Some("r81"),
+                serde_json::json!({
+                    "stage": "post-merge-gate",
+                    "gate": "testFast",
+                    "exit": 1,
+                    "mergeSha": "c".repeat(40),
+                    "reason": "red",
+                    "hint": "repair",
+                }),
+            ),
+        ];
+        let barrier = ledger::active_merge_barrier(&events).expect("barrier remains active");
+        assert!(barrier.merge_executed);
+        let error = release_frozen_supersession_precondition(1).unwrap_err();
+        assert!(error.contains("record") && error.contains("forbidden"));
+        assert!(!events.iter().any(|event| matches!(
+            event.kind.as_str(),
+            "TaskRecorded" | "FrozenContractSuperseded"
+        ) || event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("stage"))
+            .and_then(serde_json::Value::as_str)
+            == Some("post-merge-gate-released")));
+        assert!(ledger::active_merge_barrier(&events).is_some());
+
+        let source = include_str!("close.rs");
+        let function = &source[source.find("fn release_post_merge_barrier(").unwrap()..];
+        let recovery_gate_call = ["gate::run_gate_with_", "audit_identity"].concat();
+        assert!(
+            function
+                .find("release_frozen_supersession_precondition")
+                .unwrap()
+                < function.find(&recovery_gate_call).unwrap(),
+            "supersession refusal must precede every recovery gate spawn"
+        );
+    }
 
     #[test]
     fn merge_failure_disposition_table() {
@@ -3288,8 +5571,7 @@ mod tests {
             .iter()
             .any(|line| line.contains("removed=1 refused=1 freedBytes=")));
         assert!(lines.iter().any(|line| {
-            line.contains(&format!("REFUSED {}", dirty.site_id))
-                && line.contains("tracked/staged")
+            line.contains(&format!("REFUSED {}", dirty.site_id)) && line.contains("tracked/staged")
         }));
         assert!(!root.join(&clean.worktree).exists());
         assert!(!root.join(&clean.target).exists());
@@ -3336,6 +5618,178 @@ mod tests {
             };
             assert_eq!(merge_was_blocked_by_main_guard(&failure), expected);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seal_owner_intent_blocks_nonowner_main_advance_and_cleans_up() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = crate::util::test_scratch_dir("b310-seal-owner-intent");
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(
+            &root,
+            &["config", "user.email", "orch-test@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "orch test"]);
+        fs::write(root.join("README.md"), "base\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-q", "-m", "base"]);
+        let hook_dir = root.join(".git/b310-hooks");
+        fs::create_dir_all(&hook_dir).unwrap();
+        let hook = hook_dir.join("reference-transaction");
+        fs::write(
+            &hook,
+            include_str!("../../../../.githooks/reference-transaction"),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        git(
+            &root,
+            &["config", "core.hooksPath", hook_dir.to_str().unwrap()],
+        );
+
+        with_merge_lifecycle_transition(&root, "fixture seal owner", || {
+            let intent = root.join("coordination/runtime/locks/seal-owner.intent");
+            assert!(intent.is_file());
+            let blocked = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["commit", "--allow-empty", "-q", "-m", "external advance"])
+                .output()?;
+            assert!(!blocked.status.success());
+            assert!(String::from_utf8_lossy(&blocked.stderr).contains("seal owner"));
+            Ok(())
+        })
+        .unwrap();
+        assert!(!root
+            .join("coordination/runtime/locks/seal-owner.intent")
+            .exists());
+        git(
+            &root,
+            &["commit", "--allow-empty", "-q", "-m", "after owner release"],
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn main_guard_parses_transaction_new_ledger_not_canonical_worktree_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = crate::util::test_scratch_dir("b310-main-blob-guard");
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(
+            &root,
+            &["config", "user.email", "orch-test@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "orch test"]);
+        fs::create_dir_all(root.join("coordination/runtime")).unwrap();
+        fs::create_dir_all(root.join("coordination/rounds/r81")).unwrap();
+        fs::write(root.join("coordination/runtime/CURRENT-ROUND"), "r81\n").unwrap();
+        let base_event = ledger::event(
+            "TaskValidated",
+            "runtime:orch",
+            None,
+            Some("r81"),
+            serde_json::json!({"irRevision": 1, "validationDigest": "a".repeat(64)}),
+        );
+        let mut base_ledger = serde_json::to_vec(&base_event).unwrap();
+        base_ledger.push(b'\n');
+        let ledger_path = root.join("coordination/rounds/r81/events.jsonl");
+        fs::write(&ledger_path, &base_ledger).unwrap();
+        git(&root, &["add", "coordination"]);
+        git(&root, &["commit", "-q", "-m", "base"]);
+
+        let hook_dir = root.join(".git/b310-hooks");
+        fs::create_dir_all(&hook_dir).unwrap();
+        let hook = hook_dir.join("reference-transaction");
+        fs::write(
+            &hook,
+            include_str!("../../../../.githooks/reference-transaction"),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        git(
+            &root,
+            &["config", "core.hooksPath", hook_dir.to_str().unwrap()],
+        );
+
+        let forged = ledger::event(
+            "ReviewSpoolPromoted",
+            "runtime:orch",
+            Some("B900"),
+            Some("r81"),
+            serde_json::json!({
+                "schemaVersion": 1,
+                "panelId": "panel-one",
+                "seatId": "seat-one",
+                "generation": 1,
+                "wakeId": "wake-one",
+                "attemptId": "B900-A0001",
+                "attemptNo": 1,
+                "role": "primary",
+                "agent": "executor-one",
+                "reviewedHead": "b".repeat(40),
+                "policyBaseSha": "c".repeat(40),
+                "stagingPath": ".worktrees/review/.cowork-temp/review-spool/B900-A0001-seat-one-g1-wake-one.md",
+                "canonicalPath": "coordination/rounds/r81/reviews/B900-A0001-seat-one-g1-wake-one.md",
+                "sha256": "d".repeat(64),
+                "bytes": 100,
+                "bodyLen": 10,
+                "verdict": "MAYBE",
+                "terminalEventId": "terminal-one",
+                "deliveryEventId": "delivery-one",
+            }),
+        );
+        let mut forged_ledger = base_ledger.clone();
+        forged_ledger.extend(serde_json::to_vec(&forged).unwrap());
+        forged_ledger.push(b'\n');
+        fs::write(&ledger_path, &forged_ledger).unwrap();
+        git(&root, &["add", "coordination/rounds/r81/events.jsonl"]);
+        let tree = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["write-tree"])
+            .output()
+            .unwrap();
+        assert!(tree.status.success());
+        let tree = String::from_utf8(tree.stdout).unwrap().trim().to_string();
+        let base = crate::gitx::rev_parse(&root, "HEAD").unwrap();
+        let commit = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["commit-tree", &tree, "-p", &base, "-m", "forged ledger"])
+            .output()
+            .unwrap();
+        assert!(commit.status.success());
+        let forged_commit = String::from_utf8(commit.stdout).unwrap().trim().to_string();
+        fs::write(&ledger_path, &base_ledger).unwrap();
+        git(&root, &["read-tree", "HEAD"]);
+
+        let update = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["update-ref", "refs/heads/main", &forged_commit, &base])
+            .output()
+            .unwrap();
+        assert!(!update.status.success());
+        assert_eq!(
+            crate::gitx::rev_parse(&root, "refs/heads/main").unwrap(),
+            base
+        );
+        let stderr = String::from_utf8_lossy(&update.stderr);
+        assert!(
+            stderr.contains("append-only")
+                || stderr.contains("ReviewSpoolPromoted")
+                || stderr.contains("verdict"),
+            "unexpected guard diagnostic: {stderr}"
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     // ─── 生产路径实弹（r51/B147 事故原样重放 + 恢复出口）───
@@ -3681,11 +6135,9 @@ git: {pushPolicy: forbidden, mergePolicy: ff-only-else-no-ff}
 
         let unpaired_recovery = fixture.storage_event(TASK, true);
         let unpaired_id = unpaired_recovery.event_id.clone();
-        with_merge_lifecycle_transition(
-            &fixture.root,
-            "fixture unpaired storage recovery",
-            || ledger::append_storage_audit(&fixture.root, ROUND, unpaired_recovery),
-        )
+        with_merge_lifecycle_transition(&fixture.root, "fixture unpaired storage recovery", || {
+            ledger::append_storage_audit(&fixture.root, ROUND, unpaired_recovery)
+        })
         .unwrap();
         assert!(fixture
             .events()
@@ -3695,33 +6147,40 @@ git: {pushPolicy: forbidden, mergePolicy: ff-only-else-no-ff}
         let ordinary = fixture.storage_event(TASK, false);
         assert!(ledger::append(&fixture.root, ROUND, &[ordinary.clone()]).is_err());
         assert!(ledger::append_storage_audit(&fixture.root, ROUND, ordinary.clone()).is_err());
-        assert!(fixture.events().iter().all(|event| event.event_id != ordinary.event_id));
+        assert!(fixture
+            .events()
+            .iter()
+            .all(|event| event.event_id != ordinary.event_id));
 
         let wrong_task = fixture.storage_event("BOTHER", false);
-        let wrong = with_merge_lifecycle_transition(&fixture.root, "fixture wrong storage task", || {
-            ledger::append_storage_audit(&fixture.root, ROUND, wrong_task)
-        });
+        let wrong =
+            with_merge_lifecycle_transition(&fixture.root, "fixture wrong storage task", || {
+                ledger::append_storage_audit(&fixture.root, ROUND, wrong_task)
+            });
         assert!(wrong.is_err());
 
         let mut wrong_round = fixture.storage_event(TASK, false);
         wrong_round.round = Some("r-other".to_string());
-        let wrong = with_merge_lifecycle_transition(&fixture.root, "fixture wrong storage round", || {
-            ledger::append_storage_audit(&fixture.root, ROUND, wrong_round)
-        });
+        let wrong =
+            with_merge_lifecycle_transition(&fixture.root, "fixture wrong storage round", || {
+                ledger::append_storage_audit(&fixture.root, ROUND, wrong_round)
+            });
         assert!(wrong.is_err());
 
         let mut wrong_actor = fixture.storage_event(TASK, false);
         wrong_actor.actor = "planner".to_string();
-        let wrong = with_merge_lifecycle_transition(&fixture.root, "fixture wrong storage actor", || {
-            ledger::append_storage_audit(&fixture.root, ROUND, wrong_actor)
-        });
+        let wrong =
+            with_merge_lifecycle_transition(&fixture.root, "fixture wrong storage actor", || {
+                ledger::append_storage_audit(&fixture.root, ROUND, wrong_actor)
+            });
         assert!(wrong.is_err());
 
         let mut smuggled = fixture.storage_event(TASK, false);
         smuggled.payload.as_mut().unwrap()["mergeSha"] = serde_json::json!(fixture.main_head);
-        let wrong = with_merge_lifecycle_transition(&fixture.root, "fixture smuggled storage key", || {
-            ledger::append_storage_audit(&fixture.root, ROUND, smuggled)
-        });
+        let wrong =
+            with_merge_lifecycle_transition(&fixture.root, "fixture smuggled storage key", || {
+                ledger::append_storage_audit(&fixture.root, ROUND, smuggled)
+            });
         assert!(wrong.is_err());
 
         with_merge_lifecycle_transition(&fixture.root, "fixture storage refusal", || {
@@ -3736,16 +6195,19 @@ git: {pushPolicy: forbidden, mergePolicy: ff-only-else-no-ff}
         .unwrap();
         let events = fixture.events();
         assert_eq!(
-            events.iter().filter(|event| {
-                ledger::canonical_gate_storage_audit_event(event).is_some_and(|audit| {
-                    audit.identity
-                        == ledger::GateAuditIdentity::Attempt {
-                            task_id: TASK,
-                            attempt_id: "BT-A0001",
-                        }
-                        && !audit.recovered
+            events
+                .iter()
+                .filter(|event| {
+                    ledger::canonical_gate_storage_audit_event(event).is_some_and(|audit| {
+                        audit.identity
+                            == ledger::GateAuditIdentity::Attempt {
+                                task_id: TASK,
+                                attempt_id: "BT-A0001",
+                            }
+                            && !audit.recovered
+                    })
                 })
-            }).count(),
+                .count(),
             1
         );
         let after_refusal = ledger::active_merge_barrier(&events).unwrap();
@@ -3760,22 +6222,27 @@ git: {pushPolicy: forbidden, mergePolicy: ff-only-else-no-ff}
         })
         .unwrap();
         let duplicate_recovery = fixture.storage_event(TASK, true);
-        with_merge_lifecycle_transition(&fixture.root, "fixture duplicate storage recovery", || {
-            ledger::append_storage_audit(&fixture.root, ROUND, duplicate_recovery)
-        })
+        with_merge_lifecycle_transition(
+            &fixture.root,
+            "fixture duplicate storage recovery",
+            || ledger::append_storage_audit(&fixture.root, ROUND, duplicate_recovery),
+        )
         .unwrap();
         let events = fixture.events();
         assert_eq!(
-            events.iter().filter(|event| {
-                ledger::canonical_gate_storage_audit_event(event).is_some_and(|audit| {
-                    audit.identity
-                        == ledger::GateAuditIdentity::Attempt {
-                            task_id: TASK,
-                            attempt_id: "BT-A0001",
-                        }
-                        && audit.recovered
+            events
+                .iter()
+                .filter(|event| {
+                    ledger::canonical_gate_storage_audit_event(event).is_some_and(|audit| {
+                        audit.identity
+                            == ledger::GateAuditIdentity::Attempt {
+                                task_id: TASK,
+                                attempt_id: "BT-A0001",
+                            }
+                            && audit.recovered
+                    })
                 })
-            }).count(),
+                .count(),
             1
         );
         let after_recovery = ledger::active_merge_barrier(&events).unwrap();
@@ -3789,20 +6256,30 @@ git: {pushPolicy: forbidden, mergePolicy: ff-only-else-no-ff}
         let before_post_merge = ledger::active_merge_barrier(&fixture.events()).unwrap();
         assert!(before_post_merge.merge_executed);
         let post_merge_refusal = fixture.storage_event(TASK, false);
-        with_merge_lifecycle_transition(&fixture.root, "fixture post-merge storage refusal", || {
-            ledger::append_storage_audit(&fixture.root, ROUND, post_merge_refusal)
-        })
+        with_merge_lifecycle_transition(
+            &fixture.root,
+            "fixture post-merge storage refusal",
+            || ledger::append_storage_audit(&fixture.root, ROUND, post_merge_refusal),
+        )
         .unwrap();
         let post_merge_recovery = fixture.storage_event(TASK, true);
-        with_merge_lifecycle_transition(&fixture.root, "fixture post-merge storage recovery", || {
-            ledger::append_storage_audit(&fixture.root, ROUND, post_merge_recovery)
-        })
+        with_merge_lifecycle_transition(
+            &fixture.root,
+            "fixture post-merge storage recovery",
+            || ledger::append_storage_audit(&fixture.root, ROUND, post_merge_recovery),
+        )
         .unwrap();
         let after_post_merge = ledger::active_merge_barrier(&fixture.events()).unwrap();
         assert_eq!(before_post_merge.task_id, after_post_merge.task_id);
         assert_eq!(before_post_merge.round, after_post_merge.round);
-        assert_eq!(before_post_merge.merge_executed, after_post_merge.merge_executed);
-        assert_eq!(before_post_merge.main_head_sha, after_post_merge.main_head_sha);
+        assert_eq!(
+            before_post_merge.merge_executed,
+            after_post_merge.merge_executed
+        );
+        assert_eq!(
+            before_post_merge.main_head_sha,
+            after_post_merge.main_head_sha
+        );
     }
 
     #[test]
@@ -3811,9 +6288,9 @@ git: {pushPolicy: forbidden, mergePolicy: ff-only-else-no-ff}
         fixture.arm_dangling_barrier();
         let merge_sha = fixture.merge_task_without_accounting();
         fixture.append_merge_executed_only(&merge_sha);
-        let log_path = fixture
-            .root
-            .join("coordination/runtime/logs/BT-record-gate-postGate.log");
+        let log_dir = fixture.root.join("coordination/runtime/logs");
+        let log_prefix = "BT-round-rT-BT-A0001-recovery-";
+        let log_suffix = "-gate-postGate.log";
         fs::create_dir_all(fixture.root.join(".orch")).unwrap();
         fs::write(
             fixture.root.join(".orch/machine.yaml"),
@@ -3822,9 +6299,16 @@ git: {pushPolicy: forbidden, mergePolicy: ff-only-else-no-ff}
         .unwrap();
 
         assert!(run_record(&fixture.root, TASK).is_err());
-        assert!(!log_path.exists(), "record refusal must precede gate log/spawn");
+        assert!(
+            matching_gate_logs(&log_dir, log_prefix, log_suffix).is_empty(),
+            "record refusal must precede every phase-scoped gate log/spawn"
+        );
         let events = fixture.events();
-        assert!(ledger::active_merge_barrier(&events).unwrap().merge_executed);
+        assert!(
+            ledger::active_merge_barrier(&events)
+                .unwrap()
+                .merge_executed
+        );
         assert!(!events.iter().any(|event| {
             event.kind == "TaskRecorded" && event.task_id.as_deref() == Some(TASK)
         }));
@@ -3841,8 +6325,22 @@ git: {pushPolicy: forbidden, mergePolicy: ff-only-else-no-ff}
 
         fs::remove_file(fixture.root.join(".orch/machine.yaml")).unwrap();
         let retried = run_record(&fixture.root, TASK).unwrap();
-        assert!(retried.gates.iter().any(|gate| gate.name == "postGate"));
-        assert!(log_path.is_file(), "record retry must reach the real gate spawn marker");
+        let gate = retried
+            .gates
+            .iter()
+            .find(|gate| gate.name == "postGate")
+            .expect("record retry must return the real gate result");
+        let logs = matching_gate_logs(&log_dir, log_prefix, log_suffix);
+        let [log_path] = logs.as_slice() else {
+            panic!("record retry must create exactly one phase-scoped gate log: {logs:?}");
+        };
+        assert_eq!(Path::new(&gate.log_path), log_path);
+        let file_name = log_path.file_name().unwrap().to_str().unwrap();
+        let gate_run_id = file_name
+            .strip_prefix(log_prefix)
+            .and_then(|name| name.strip_suffix(log_suffix))
+            .expect("record retry log must retain the typed prefix/suffix");
+        assert!(gate_run_id.parse::<ulid::Ulid>().is_ok());
         let events = fixture.events();
         assert!(ledger::active_merge_barrier(&events).is_none());
         assert!(events.iter().any(|event| {
@@ -4185,12 +6683,19 @@ git: {pushPolicy: forbidden, mergePolicy: ff-only-else-no-ff}
     fn release_refuses_executed_barrier_without_gate_failure_record() {
         let fixture = merge_fixture("b159-release-no-red-record", false);
         fixture.arm_dangling_barrier();
-        merge_no_ff_without_hooks(
+        with_merge_lifecycle_transition(
             &fixture.root,
-            &fixture.task_head,
             "fixture exact merge without post-gate",
+            || {
+                merge_no_ff_without_hooks(
+                    &fixture.root,
+                    &fixture.task_head,
+                    "fixture exact merge without post-gate",
+                )
+                .map_err(|failure| anyhow::anyhow!(failure.to_string()))
+            },
         )
-        .unwrap_or_else(|failure| panic!("{failure}"));
+        .unwrap();
         let merge_sha = git_output(&fixture.root, &["rev-parse", "main"]);
         with_merge_lifecycle_transition(&fixture.root, "fixture account merge", || {
             append_merge_lifecycle_events(
@@ -5048,5 +7553,61 @@ git: {pushPolicy: forbidden, mergePolicy: ff-only-else-no-ff}
         fixture.arm_dangling_barrier();
         let error = run_merge_recovery(root, "BOTHER").unwrap_err().to_string();
         assert!(error.contains("张冠李戴"), "{error}");
+    }
+
+    #[test]
+    fn close_boundary_scopes_watcher_and_runner_artifacts_once() {
+        let root = crate::util::test_scratch_dir("b272-close-scoped-gate");
+        let log_dir = root.join("coordination/runtime/logs");
+        fs::create_dir_all(&log_dir).unwrap();
+        let spec = binding::CommandSpec {
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                ": > \"$ORCH_GATE_FIXTURE_REGISTRY\"; echo close-green".into(),
+            ],
+            timeout_seconds: 30,
+            trial_timeout_seconds: None,
+            approval: None,
+        };
+        let result = with_round_scoped_close_gate(
+            &root,
+            "r71",
+            "B272",
+            &log_dir,
+            "B272-postmerge",
+            "testFast",
+            |scoped_tag| gate::run_gate("testFast", &spec, &root, &log_dir, scoped_tag),
+        )
+        .unwrap();
+        assert_eq!(result.exit_code, 0);
+
+        let stem = "B272-postmerge-round-r71-gate-testFast";
+        for extension in ["log", "hb", "orphans", "fixtures"] {
+            assert!(
+                log_dir.join(format!("{stem}.{extension}")).is_file(),
+                "close watcher/runner sibling missing: {extension}"
+            );
+        }
+        assert!(!log_dir.join("B272-postmerge-gate-testFast.log").exists());
+    }
+
+    #[test]
+    fn round_close_sweep_reports_each_slot_usage() {
+        let root = crate::util::test_scratch_dir("b272-close-cache-summary");
+        let target = root
+            .join(".cowork-temp/trial-cache/slots/slot-00/generations/generation-000000/target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("artifact"), b"warm-cache\n").unwrap();
+
+        let report = sweep_trial_cache_before_round_close(&root).unwrap();
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.slot_usage.len(), 1);
+        assert_eq!(report.slot_usage[0].slot, "slot-00");
+        assert!(report.slot_usage[0].logical_bytes_before > 0);
+        assert_eq!(
+            report.slot_usage[0].logical_bytes_before,
+            report.slot_usage[0].logical_bytes_after
+        );
     }
 }

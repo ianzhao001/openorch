@@ -3,10 +3,397 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use fd_lock::RwLock;
 use orch_core::EventRecord;
+use serde::{Deserialize, Serialize};
+
+/// Schema version shared by the ten runtime-policy, review-panel, spool, and
+/// gate-reuse facts introduced by B310.
+pub const RUNTIME_EVENT_SCHEMA_V1: u32 = 1;
+
+/// Durable activation of one signed runtime policy at a captured main commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimePolicyActivatedPayloadV1 {
+    /// Payload schema discriminator; must equal [`RUNTIME_EVENT_SCHEMA_V1`].
+    pub schema_version: u32,
+    /// Exact key under `PROJECT-BINDING.runtimePolicies.policies`.
+    pub policy: String,
+    /// Task whose recorded implementation owns the policy.
+    pub owner_task: String,
+    /// Canonical TaskRecorded event authorizing activation.
+    pub owner_recorded_event_id: String,
+    /// Owner merge commit proven to be an ancestor of the activation base.
+    pub owner_merge_sha: String,
+    /// SHA-256 of the complete committed binding bytes.
+    pub binding_sha256: String,
+    /// SHA-256 of the canonical selected policy subtree.
+    pub policy_sha256: String,
+    /// Main commit captured before the accounting commit containing this fact.
+    pub activated_at_main_sha: String,
+}
+
+/// Durable deactivation of one previously activated runtime policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimePolicyDeactivatedPayloadV1 {
+    /// Payload schema discriminator; must equal [`RUNTIME_EVENT_SCHEMA_V1`].
+    pub schema_version: u32,
+    /// Exact signed runtime-policy key.
+    pub policy: String,
+    /// Activation event whose state is being closed.
+    pub activation_event_id: String,
+    /// SHA-256 of the complete committed binding bytes.
+    pub binding_sha256: String,
+    /// SHA-256 of the canonical selected policy subtree.
+    pub policy_sha256: String,
+    /// Main commit captured before the deactivation accounting commit.
+    pub deactivated_at_main_sha: String,
+    /// Non-blank operator/runtime reason retained for audit.
+    pub reason: String,
+}
+
+/// Atomic selection of one three-seat review panel for an immutable attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewPanelSelectedPayloadV1 {
+    /// Payload schema discriminator.
+    pub schema_version: u32,
+    /// Stable panel identity shared by every route and terminal fact.
+    pub panel_id: String,
+    /// Canonical task attempt selected for review.
+    pub attempt_id: String,
+    /// Positive attempt ordinal matching `attemptId`.
+    pub attempt_no: usize,
+    /// Immutable candidate commit reviewed by every seat.
+    pub reviewed_head: String,
+    /// First DispatchIssued base commit that fixes policy semantics.
+    pub policy_base_sha: String,
+    /// Exact runtime-policy key that authorized dynamic review.
+    pub policy: String,
+    /// SHA-256 of that policy's canonical committed subtree.
+    pub policy_sha256: String,
+    /// V1 initial panel width; it must be exactly three.
+    pub seat_count: usize,
+    /// Exact three logical seat identities committed by the adjacent routes.
+    pub seat_ids: [String; 3],
+}
+
+/// One precommitted route for a panel seat generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewSeatRoutedPayloadV1 {
+    /// Payload schema discriminator.
+    pub schema_version: u32,
+    /// Panel identity selected before any provider wake.
+    pub panel_id: String,
+    /// Stable logical seat identity retained across retry generations.
+    pub seat_id: String,
+    /// Positive, monotonic logical seat generation.
+    pub generation: u32,
+    /// Preallocated managed wake identity consumed by the spawn path.
+    pub wake_id: String,
+    /// Canonical task attempt receiving this route.
+    pub attempt_id: String,
+    /// Positive ordinal matching `attemptId`.
+    pub attempt_no: usize,
+    /// Routed role (`primary`, `secondary`, or `nongate`).
+    pub role: String,
+    /// Exact registered agent selected for this route.
+    pub agent: String,
+    /// Candidate lineage (`primary`, `secondary`, or `nongate`).
+    pub lineage: String,
+    /// Immutable candidate commit.
+    pub reviewed_head: String,
+    /// Attempt base commit fixing policy semantics.
+    pub policy_base_sha: String,
+    /// Deadline derived from role and signed workload.
+    pub deadline_secs: u64,
+    /// Whether a business-invalid result may receive generation two.
+    pub retry_eligible: bool,
+    /// Route source: `initial`, `retry`, or `backfill`.
+    pub route_kind: String,
+    /// ReviewPanelSelected event authorizing this route.
+    pub selected_event_id: String,
+    /// Source logical seat for retry/backfill; null only for initial routes.
+    pub source_seat_id: Option<String>,
+    /// Source logical generation for retry/backfill; null only for initial routes.
+    pub source_generation: Option<u32>,
+    /// Source terminal fact for retry/backfill; null only for initial routes.
+    pub source_terminal_event_id: Option<String>,
+}
+
+/// Terminal classification of one exact panel seat generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewSeatTerminatedPayloadV1 {
+    /// Payload schema discriminator.
+    pub schema_version: u32,
+    /// Panel identity.
+    pub panel_id: String,
+    /// Stable logical seat identity.
+    pub seat_id: String,
+    /// Exact terminal generation.
+    pub generation: u32,
+    /// Exact managed wake identity.
+    pub wake_id: String,
+    /// Canonical task attempt.
+    pub attempt_id: String,
+    /// Positive ordinal matching `attemptId`.
+    pub attempt_no: usize,
+    /// Routed review role.
+    pub role: String,
+    /// Routed agent identity.
+    pub agent: String,
+    /// Candidate lineage copied from the route.
+    pub lineage: String,
+    /// Immutable reviewed candidate.
+    pub reviewed_head: String,
+    /// Attempt base commit fixing policy semantics.
+    pub policy_base_sha: String,
+    /// Closed state: pass/fail/blocked/business-invalid/system-terminal-invalid.
+    pub state: String,
+    /// Managed terminal or ActionRejected event proving the state.
+    pub terminal_event_id: String,
+    /// Delivery event for a substantive artifact; null for invalid terminals.
+    pub delivery_event_id: Option<String>,
+    /// Non-blank exact or derived terminal explanation.
+    pub reason: String,
+}
+
+/// No-clobber promotion of one seat-scoped staging artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewSpoolPromotedPayloadV1 {
+    /// Payload schema discriminator.
+    pub schema_version: u32,
+    /// Panel identity owning the artifact.
+    pub panel_id: String,
+    /// Stable logical seat identity.
+    pub seat_id: String,
+    /// Exact seat generation.
+    pub generation: u32,
+    /// Exact managed wake identity.
+    pub wake_id: String,
+    /// Canonical task attempt.
+    pub attempt_id: String,
+    /// Positive ordinal matching `attemptId`.
+    pub attempt_no: usize,
+    /// Review role carried by the artifact.
+    pub role: String,
+    /// Reviewer identity carried by the artifact.
+    pub agent: String,
+    /// Immutable reviewed candidate.
+    pub reviewed_head: String,
+    /// Attempt base commit fixing policy semantics.
+    pub policy_base_sha: String,
+    /// Repository-relative lease-scoped staging path.
+    pub staging_path: String,
+    /// Repository-relative committed canonical path.
+    pub canonical_path: String,
+    /// SHA-256 of the promoted bytes.
+    pub sha256: String,
+    /// Complete artifact byte length.
+    pub bytes: u64,
+    /// Substantive body byte length.
+    pub body_len: u64,
+    /// Parsed artifact verdict.
+    pub verdict: String,
+    /// Managed terminal event that stabilized the staging bytes.
+    pub terminal_event_id: String,
+    /// Adjacent ReviewDelivered/NongateReviewDelivered event identity.
+    pub delivery_event_id: String,
+}
+
+/// Durable close of one panel after pass, veto, or unreachable quorum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewPanelClosedPayloadV1 {
+    /// Payload schema discriminator.
+    pub schema_version: u32,
+    /// Panel identity being closed.
+    pub panel_id: String,
+    /// Canonical task attempt.
+    pub attempt_id: String,
+    /// Positive ordinal matching `attemptId`.
+    pub attempt_no: usize,
+    /// Immutable reviewed candidate.
+    pub reviewed_head: String,
+    /// Attempt base commit fixing policy semantics.
+    pub policy_base_sha: String,
+    /// Close outcome: `pass`, `veto`, or `pool-exhausted`.
+    pub outcome: String,
+    /// Non-blank deterministic explanation.
+    pub reason: String,
+    /// Number of terminal seat generations observed at close.
+    pub terminal_seat_count: usize,
+    /// Number of unique PASS voices counted by policy.
+    pub pass_count: usize,
+    /// Whether at least one counted PASS has primary lineage.
+    pub primary_pass: bool,
+}
+
+/// Durable escalation from a narrow candidate lane to a stronger signed lane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GateLaneEscalatedPayloadV1 {
+    /// Payload schema discriminator.
+    pub schema_version: u32,
+    /// Canonical task attempt.
+    pub attempt_id: String,
+    /// Positive ordinal matching `attemptId`.
+    pub attempt_no: usize,
+    /// Originally resolved lane.
+    pub from_lane: String,
+    /// Stronger lane selected after fail-closed resolution.
+    pub to_lane: String,
+    /// Non-blank escalation reason.
+    pub reason: String,
+    /// Attempt base commit fixing runtime policy.
+    pub policy_base_sha: String,
+    /// SHA-256 of the ordered resolved command set.
+    pub resolved_command_digest: String,
+}
+
+/// Durable reuse of one prior GateExecuted observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GateReusedPayloadV1 {
+    /// Payload schema discriminator.
+    pub schema_version: u32,
+    /// Canonical task attempt receiving the reuse.
+    pub attempt_id: String,
+    /// Positive ordinal matching `attemptId`.
+    pub attempt_no: usize,
+    /// Source GateExecuted event identity.
+    pub source_gate_event_id: String,
+    /// Source phase that actually ran the gate.
+    pub source_phase: String,
+    /// Target phase whose proof is being satisfied.
+    pub target_phase: String,
+    /// SHA-256 of every reusable input dimension.
+    pub input_identity_sha256: String,
+    /// Signed binding command reference.
+    pub command_ref: String,
+    /// Exact tested subject tree.
+    pub subject_tree_sha: String,
+    /// SHA-256 of the reused full gate log.
+    pub log_sha256: String,
+    /// Reused full gate-log byte length.
+    pub log_bytes: u64,
+    /// Measured milliseconds avoided by reuse.
+    pub saved_ms: u64,
+}
+
+/// Durable, attempt-scoped reason a gate proof could not be reused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GateReuseMissPayloadV1 {
+    /// Payload schema discriminator.
+    pub schema_version: u32,
+    /// Canonical task attempt.
+    pub attempt_id: String,
+    /// Positive ordinal matching `attemptId`.
+    pub attempt_no: usize,
+    /// Phase that requested reuse.
+    pub phase: String,
+    /// Signed command reference being compared.
+    pub command_ref: String,
+    /// Durable one-based miss count for this attempt.
+    pub miss_no: u32,
+    /// Closed reason class: input-tree/contract/command/toolchain/environment.
+    pub reason: String,
+    /// SHA-256 of the complete current reuse identity.
+    pub input_identity_sha256: String,
+    /// Expected source identity digest.
+    pub expected_sha256: String,
+    /// Actual current identity digest; missing/corrupt evidence is a hard error
+    /// and therefore never produces a GateReuseMiss fact.
+    pub actual_sha256: String,
+    /// Attempt base commit fixing runtime policy.
+    pub policy_base_sha: String,
+}
+
+/// Typed constructor input for every B310 runtime event kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeEventPayloadV1 {
+    /// Activate a signed dormant policy.
+    RuntimePolicyActivated(RuntimePolicyActivatedPayloadV1),
+    /// Deactivate a previously active policy.
+    RuntimePolicyDeactivated(RuntimePolicyDeactivatedPayloadV1),
+    /// Promote one validated lease-scoped review artifact.
+    ReviewSpoolPromoted(ReviewSpoolPromotedPayloadV1),
+    /// Select one immutable three-seat panel.
+    ReviewPanelSelected(ReviewPanelSelectedPayloadV1),
+    /// Route one exact seat generation.
+    ReviewSeatRouted(ReviewSeatRoutedPayloadV1),
+    /// Record one exact seat terminal.
+    ReviewSeatTerminated(ReviewSeatTerminatedPayloadV1),
+    /// Close one panel with a deterministic outcome.
+    ReviewPanelClosed(ReviewPanelClosedPayloadV1),
+    /// Escalate a gate lane without weakening the signed floor.
+    GateLaneEscalated(GateLaneEscalatedPayloadV1),
+    /// Reuse one exact prior gate proof.
+    GateReused(GateReusedPayloadV1),
+    /// Record one durable gate-reuse miss.
+    GateReuseMiss(GateReuseMissPayloadV1),
+}
+
+impl RuntimeEventPayloadV1 {
+    /// Return the stable event-kind spelling paired with this typed payload.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::RuntimePolicyActivated(_) => "RuntimePolicyActivated",
+            Self::RuntimePolicyDeactivated(_) => "RuntimePolicyDeactivated",
+            Self::ReviewSpoolPromoted(_) => "ReviewSpoolPromoted",
+            Self::ReviewPanelSelected(_) => "ReviewPanelSelected",
+            Self::ReviewSeatRouted(_) => "ReviewSeatRouted",
+            Self::ReviewSeatTerminated(_) => "ReviewSeatTerminated",
+            Self::ReviewPanelClosed(_) => "ReviewPanelClosed",
+            Self::GateLaneEscalated(_) => "GateLaneEscalated",
+            Self::GateReused(_) => "GateReused",
+            Self::GateReuseMiss(_) => "GateReuseMiss",
+        }
+    }
+
+    fn value(&self) -> Result<serde_json::Value> {
+        Ok(match self {
+            Self::RuntimePolicyActivated(value) => serde_json::to_value(value)?,
+            Self::RuntimePolicyDeactivated(value) => serde_json::to_value(value)?,
+            Self::ReviewSpoolPromoted(value) => serde_json::to_value(value)?,
+            Self::ReviewPanelSelected(value) => serde_json::to_value(value)?,
+            Self::ReviewSeatRouted(value) => serde_json::to_value(value)?,
+            Self::ReviewSeatTerminated(value) => serde_json::to_value(value)?,
+            Self::ReviewPanelClosed(value) => serde_json::to_value(value)?,
+            Self::GateLaneEscalated(value) => serde_json::to_value(value)?,
+            Self::GateReused(value) => serde_json::to_value(value)?,
+            Self::GateReuseMiss(value) => serde_json::to_value(value)?,
+        })
+    }
+}
+
+/// Construct one canonical B310 event with its actor, envelope, and exact
+/// payload shape checked before the caller can append it.
+pub fn runtime_event_v1(
+    round: &str,
+    task_id: Option<&str>,
+    payload: RuntimeEventPayloadV1,
+) -> Result<EventRecord> {
+    let event = event(
+        payload.kind(),
+        "runtime:orch",
+        task_id,
+        Some(round),
+        payload.value()?,
+    );
+    if !canonical_runtime_event_v1(&event, round)? {
+        bail!("runtime V1 constructor produced a non-canonical event");
+    }
+    Ok(event)
+}
 
 /// Pure ledger/WAL reconciliation result.
 ///
@@ -473,7 +860,9 @@ fn exact_payload<'a>(
 /// every other production gate must carry its durable attempt identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateAuditIdentity<'a> {
-    PreAttempt { task_id: &'a str },
+    PreAttempt {
+        task_id: &'a str,
+    },
     Attempt {
         task_id: &'a str,
         attempt_id: &'a str,
@@ -525,6 +914,1797 @@ fn canonical_attempt_id(task_id: &str, attempt_id: &str) -> bool {
         .ok()
         .filter(|ordinal| *ordinal > 0)
         .is_some_and(|ordinal| attempt_id == format!("{task_id}-A{ordinal:04}"))
+}
+
+fn safe_runtime_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn canonical_task_text(value: &str) -> bool {
+    let Some(digits) = value.strip_prefix('B') else {
+        return false;
+    };
+    !digits.is_empty()
+        && !digits.starts_with('0')
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn canonical_attempt_ordinal(task_id: &str, attempt_id: &str, attempt_no: usize) -> bool {
+    attempt_no > 0
+        && canonical_attempt_id(task_id, attempt_id)
+        && attempt_id == format!("{task_id}-A{attempt_no:04}")
+}
+
+fn canonical_relative_path(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn nonblank(value: &str) -> bool {
+    !value.trim().is_empty() && value.trim() == value
+}
+
+/// Decode one of the ten V1 event kinds into its deny-unknown-fields payload.
+/// Non-V1 kinds return `Ok(None)` so legacy callers can share the validator
+/// without maintaining another event-name allowlist.
+pub fn decode_runtime_event_v1(event: &EventRecord) -> Result<Option<RuntimeEventPayloadV1>> {
+    let Some(value) = event.payload.clone() else {
+        if matches!(
+            event.kind.as_str(),
+            "RuntimePolicyActivated"
+                | "RuntimePolicyDeactivated"
+                | "ReviewSpoolPromoted"
+                | "ReviewPanelSelected"
+                | "ReviewSeatRouted"
+                | "ReviewSeatTerminated"
+                | "ReviewPanelClosed"
+                | "GateLaneEscalated"
+                | "GateReused"
+                | "GateReuseMiss"
+        ) {
+            bail!("{} 缺 typed V1 payload", event.kind);
+        }
+        return Ok(None);
+    };
+    let decoded = match event.kind.as_str() {
+        "RuntimePolicyActivated" => RuntimeEventPayloadV1::RuntimePolicyActivated(
+            serde_json::from_value(value).context("RuntimePolicyActivated payload 非 canonical")?,
+        ),
+        "RuntimePolicyDeactivated" => RuntimeEventPayloadV1::RuntimePolicyDeactivated(
+            serde_json::from_value(value)
+                .context("RuntimePolicyDeactivated payload 非 canonical")?,
+        ),
+        "ReviewSpoolPromoted" => RuntimeEventPayloadV1::ReviewSpoolPromoted(
+            serde_json::from_value(value).context("ReviewSpoolPromoted payload 非 canonical")?,
+        ),
+        "ReviewPanelSelected" => RuntimeEventPayloadV1::ReviewPanelSelected(
+            serde_json::from_value(value).context("ReviewPanelSelected payload 非 canonical")?,
+        ),
+        "ReviewSeatRouted" => RuntimeEventPayloadV1::ReviewSeatRouted(
+            serde_json::from_value(value).context("ReviewSeatRouted payload 非 canonical")?,
+        ),
+        "ReviewSeatTerminated" => RuntimeEventPayloadV1::ReviewSeatTerminated(
+            serde_json::from_value(value).context("ReviewSeatTerminated payload 非 canonical")?,
+        ),
+        "ReviewPanelClosed" => RuntimeEventPayloadV1::ReviewPanelClosed(
+            serde_json::from_value(value).context("ReviewPanelClosed payload 非 canonical")?,
+        ),
+        "GateLaneEscalated" => RuntimeEventPayloadV1::GateLaneEscalated(
+            serde_json::from_value(value).context("GateLaneEscalated payload 非 canonical")?,
+        ),
+        "GateReused" => RuntimeEventPayloadV1::GateReused(
+            serde_json::from_value(value).context("GateReused payload 非 canonical")?,
+        ),
+        "GateReuseMiss" => RuntimeEventPayloadV1::GateReuseMiss(
+            serde_json::from_value(value).context("GateReuseMiss payload 非 canonical")?,
+        ),
+        _ => return Ok(None),
+    };
+    Ok(Some(decoded))
+}
+
+/// Validate the exact actor/round/task envelope and semantic field floor of
+/// one V1 event.  Cross-event ordering is enforced separately by append and
+/// archive-history validation; this predicate is their shared shape decoder.
+pub fn canonical_runtime_event_v1(event: &EventRecord, round: &str) -> Result<bool> {
+    let Some(decoded) = decode_runtime_event_v1(event)? else {
+        return Ok(false);
+    };
+    let exact_keys: &[&str] = match event.kind.as_str() {
+        "RuntimePolicyActivated" => &[
+            "schemaVersion",
+            "policy",
+            "ownerTask",
+            "ownerRecordedEventId",
+            "ownerMergeSha",
+            "bindingSha256",
+            "policySha256",
+            "activatedAtMainSha",
+        ],
+        "RuntimePolicyDeactivated" => &[
+            "schemaVersion",
+            "policy",
+            "activationEventId",
+            "bindingSha256",
+            "policySha256",
+            "deactivatedAtMainSha",
+            "reason",
+        ],
+        "ReviewPanelSelected" => &[
+            "schemaVersion",
+            "panelId",
+            "attemptId",
+            "attemptNo",
+            "reviewedHead",
+            "policyBaseSha",
+            "policy",
+            "policySha256",
+            "seatCount",
+            "seatIds",
+        ],
+        "ReviewSeatRouted" => &[
+            "schemaVersion",
+            "panelId",
+            "seatId",
+            "generation",
+            "wakeId",
+            "attemptId",
+            "attemptNo",
+            "role",
+            "agent",
+            "lineage",
+            "reviewedHead",
+            "policyBaseSha",
+            "deadlineSecs",
+            "retryEligible",
+            "routeKind",
+            "selectedEventId",
+            "sourceSeatId",
+            "sourceGeneration",
+            "sourceTerminalEventId",
+        ],
+        "ReviewSeatTerminated" => &[
+            "schemaVersion",
+            "panelId",
+            "seatId",
+            "generation",
+            "wakeId",
+            "attemptId",
+            "attemptNo",
+            "role",
+            "agent",
+            "lineage",
+            "reviewedHead",
+            "policyBaseSha",
+            "state",
+            "terminalEventId",
+            "deliveryEventId",
+            "reason",
+        ],
+        "ReviewSpoolPromoted" => &[
+            "schemaVersion",
+            "panelId",
+            "seatId",
+            "generation",
+            "wakeId",
+            "attemptId",
+            "attemptNo",
+            "role",
+            "agent",
+            "reviewedHead",
+            "policyBaseSha",
+            "stagingPath",
+            "canonicalPath",
+            "sha256",
+            "bytes",
+            "bodyLen",
+            "verdict",
+            "terminalEventId",
+            "deliveryEventId",
+        ],
+        "ReviewPanelClosed" => &[
+            "schemaVersion",
+            "panelId",
+            "attemptId",
+            "attemptNo",
+            "reviewedHead",
+            "policyBaseSha",
+            "outcome",
+            "reason",
+            "terminalSeatCount",
+            "passCount",
+            "primaryPass",
+        ],
+        "GateLaneEscalated" => &[
+            "schemaVersion",
+            "attemptId",
+            "attemptNo",
+            "fromLane",
+            "toLane",
+            "reason",
+            "policyBaseSha",
+            "resolvedCommandDigest",
+        ],
+        "GateReused" => &[
+            "schemaVersion",
+            "attemptId",
+            "attemptNo",
+            "sourceGateEventId",
+            "sourcePhase",
+            "targetPhase",
+            "inputIdentitySha256",
+            "commandRef",
+            "subjectTreeSha",
+            "logSha256",
+            "logBytes",
+            "savedMs",
+        ],
+        "GateReuseMiss" => &[
+            "schemaVersion",
+            "attemptId",
+            "attemptNo",
+            "phase",
+            "commandRef",
+            "missNo",
+            "reason",
+            "inputIdentitySha256",
+            "expectedSha256",
+            "actualSha256",
+            "policyBaseSha",
+        ],
+        _ => unreachable!("decoder admitted only V1 kinds"),
+    };
+    if exact_payload(event, exact_keys).is_none() {
+        bail!("{} V1 payload key set/type 非 exact", event.kind);
+    }
+    if event.actor != "runtime:orch"
+        || event.round.as_deref() != Some(round)
+        || !extra_is_canonical(event)
+    {
+        bail!("{} V1 envelope actor/round/extra 非 canonical", event.kind);
+    }
+    let task = event.task_id.as_deref();
+    let task_required = !matches!(
+        decoded,
+        RuntimeEventPayloadV1::RuntimePolicyActivated(_)
+            | RuntimeEventPayloadV1::RuntimePolicyDeactivated(_)
+    );
+    if task_required != task.is_some() || task.is_some_and(|value| !canonical_task_text(value)) {
+        bail!("{} V1 task envelope 非 canonical", event.kind);
+    }
+    let task = task.unwrap_or_default();
+    let schema = match &decoded {
+        RuntimeEventPayloadV1::RuntimePolicyActivated(value) => value.schema_version,
+        RuntimeEventPayloadV1::RuntimePolicyDeactivated(value) => value.schema_version,
+        RuntimeEventPayloadV1::ReviewSpoolPromoted(value) => value.schema_version,
+        RuntimeEventPayloadV1::ReviewPanelSelected(value) => value.schema_version,
+        RuntimeEventPayloadV1::ReviewSeatRouted(value) => value.schema_version,
+        RuntimeEventPayloadV1::ReviewSeatTerminated(value) => value.schema_version,
+        RuntimeEventPayloadV1::ReviewPanelClosed(value) => value.schema_version,
+        RuntimeEventPayloadV1::GateLaneEscalated(value) => value.schema_version,
+        RuntimeEventPayloadV1::GateReused(value) => value.schema_version,
+        RuntimeEventPayloadV1::GateReuseMiss(value) => value.schema_version,
+    };
+    if schema != RUNTIME_EVENT_SCHEMA_V1 {
+        bail!("{} schemaVersion 必须为 1", event.kind);
+    }
+    let valid = match &decoded {
+        RuntimeEventPayloadV1::RuntimePolicyActivated(value) => {
+            safe_runtime_identity(&value.policy)
+                && canonical_task_text(&value.owner_task)
+                && safe_runtime_identity(&value.owner_recorded_event_id)
+                && valid_full_sha_text(&value.owner_merge_sha)
+                && valid_full_sha_text(&value.activated_at_main_sha)
+                && valid_sha256_text(&value.binding_sha256)
+                && valid_sha256_text(&value.policy_sha256)
+        }
+        RuntimeEventPayloadV1::RuntimePolicyDeactivated(value) => {
+            safe_runtime_identity(&value.policy)
+                && safe_runtime_identity(&value.activation_event_id)
+                && valid_sha256_text(&value.binding_sha256)
+                && valid_sha256_text(&value.policy_sha256)
+                && valid_full_sha_text(&value.deactivated_at_main_sha)
+                && nonblank(&value.reason)
+        }
+        RuntimeEventPayloadV1::ReviewPanelSelected(value) => {
+            let seat_ids = value
+                .seat_ids
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            safe_runtime_identity(&value.panel_id)
+                && canonical_attempt_ordinal(task, &value.attempt_id, value.attempt_no)
+                && valid_full_sha_text(&value.reviewed_head)
+                && valid_full_sha_text(&value.policy_base_sha)
+                && safe_runtime_identity(&value.policy)
+                && valid_sha256_text(&value.policy_sha256)
+                && value.seat_count == 3
+                && seat_ids.len() == 3
+                && value
+                    .seat_ids
+                    .iter()
+                    .all(|seat| safe_runtime_identity(seat))
+        }
+        RuntimeEventPayloadV1::ReviewSeatRouted(value) => {
+            let provenance = (
+                value.source_seat_id.as_deref(),
+                value.source_generation,
+                value.source_terminal_event_id.as_deref(),
+            );
+            let provenance_valid = match (value.route_kind.as_str(), provenance) {
+                ("initial", (None, None, None)) => true,
+                ("retry" | "backfill", (Some(seat), Some(generation), Some(terminal))) => {
+                    safe_runtime_identity(seat) && generation > 0 && safe_runtime_identity(terminal)
+                }
+                _ => false,
+            };
+            safe_runtime_identity(&value.panel_id)
+                && safe_runtime_identity(&value.seat_id)
+                && value.generation > 0
+                && safe_runtime_identity(&value.wake_id)
+                && canonical_attempt_ordinal(task, &value.attempt_id, value.attempt_no)
+                && matches!(value.role.as_str(), "primary" | "secondary" | "nongate")
+                && safe_runtime_identity(&value.agent)
+                && matches!(value.lineage.as_str(), "primary" | "secondary" | "nongate")
+                && value.role == value.lineage
+                && valid_full_sha_text(&value.reviewed_head)
+                && valid_full_sha_text(&value.policy_base_sha)
+                && value.deadline_secs > 0
+                && matches!(value.route_kind.as_str(), "initial" | "retry" | "backfill")
+                && safe_runtime_identity(&value.selected_event_id)
+                && provenance_valid
+        }
+        RuntimeEventPayloadV1::ReviewSeatTerminated(value) => {
+            let substantive = matches!(value.state.as_str(), "pass" | "fail" | "blocked");
+            safe_runtime_identity(&value.panel_id)
+                && safe_runtime_identity(&value.seat_id)
+                && value.generation > 0
+                && safe_runtime_identity(&value.wake_id)
+                && canonical_attempt_ordinal(task, &value.attempt_id, value.attempt_no)
+                && matches!(value.role.as_str(), "primary" | "secondary" | "nongate")
+                && safe_runtime_identity(&value.agent)
+                && matches!(value.lineage.as_str(), "primary" | "secondary" | "nongate")
+                && valid_full_sha_text(&value.reviewed_head)
+                && valid_full_sha_text(&value.policy_base_sha)
+                && matches!(
+                    value.state.as_str(),
+                    "pass" | "fail" | "blocked" | "business-invalid" | "system-terminal-invalid"
+                )
+                && safe_runtime_identity(&value.terminal_event_id)
+                && (substantive == value.delivery_event_id.is_some())
+                && value
+                    .delivery_event_id
+                    .as_deref()
+                    .is_none_or(safe_runtime_identity)
+                && nonblank(&value.reason)
+        }
+        RuntimeEventPayloadV1::ReviewSpoolPromoted(value) => {
+            let artifact_name = format!(
+                "{}-{}-g{}-{}.md",
+                value.attempt_id, value.seat_id, value.generation, value.wake_id
+            );
+            let canonical = format!("coordination/rounds/{round}/reviews/{artifact_name}");
+            let staging_suffix = format!("/.cowork-temp/review-spool/{artifact_name}");
+            safe_runtime_identity(&value.panel_id)
+                && safe_runtime_identity(&value.seat_id)
+                && value.generation > 0
+                && safe_runtime_identity(&value.wake_id)
+                && canonical_attempt_ordinal(task, &value.attempt_id, value.attempt_no)
+                && matches!(value.role.as_str(), "primary" | "secondary" | "nongate")
+                && safe_runtime_identity(&value.agent)
+                && valid_full_sha_text(&value.reviewed_head)
+                && valid_full_sha_text(&value.policy_base_sha)
+                && canonical_relative_path(&value.staging_path)
+                && canonical_relative_path(&value.canonical_path)
+                && value.staging_path != value.canonical_path
+                && value.staging_path.starts_with(".worktrees/")
+                && value.staging_path.ends_with(&staging_suffix)
+                && value.canonical_path == canonical
+                && valid_sha256_text(&value.sha256)
+                && value.bytes > 0
+                && value.body_len > 0
+                && value.body_len <= value.bytes
+                && matches!(value.verdict.as_str(), "PASS" | "FAIL" | "BLOCKED")
+                && safe_runtime_identity(&value.terminal_event_id)
+                && safe_runtime_identity(&value.delivery_event_id)
+        }
+        RuntimeEventPayloadV1::ReviewPanelClosed(value) => {
+            safe_runtime_identity(&value.panel_id)
+                && canonical_attempt_ordinal(task, &value.attempt_id, value.attempt_no)
+                && valid_full_sha_text(&value.reviewed_head)
+                && valid_full_sha_text(&value.policy_base_sha)
+                && matches!(value.outcome.as_str(), "pass" | "veto" | "pool-exhausted")
+                && nonblank(&value.reason)
+                && value.terminal_seat_count > 0
+                && value.pass_count <= value.terminal_seat_count
+        }
+        RuntimeEventPayloadV1::GateLaneEscalated(value) => {
+            canonical_attempt_ordinal(task, &value.attempt_id, value.attempt_no)
+                && value.from_lane == "candidate"
+                && value.to_lane == "fast"
+                && nonblank(&value.reason)
+                && valid_full_sha_text(&value.policy_base_sha)
+                && valid_sha256_text(&value.resolved_command_digest)
+        }
+        RuntimeEventPayloadV1::GateReused(value) => {
+            let source_phase = value.source_phase.as_str();
+            let target_phase = value.target_phase.as_str();
+            canonical_attempt_ordinal(task, &value.attempt_id, value.attempt_no)
+                && safe_runtime_identity(&value.source_gate_event_id)
+                && matches!(
+                    source_phase,
+                    "red-replay" | "collect" | "trial" | "root" | "postmerge" | "recovery"
+                )
+                && matches!(target_phase, "root" | "postmerge")
+                && matches!(
+                    (source_phase, target_phase),
+                    ("collect", "root") | ("trial", "postmerge")
+                )
+                && valid_sha256_text(&value.input_identity_sha256)
+                && safe_runtime_identity(&value.command_ref)
+                && valid_full_sha_text(&value.subject_tree_sha)
+                && valid_sha256_text(&value.log_sha256)
+                && value.log_bytes > 0
+        }
+        RuntimeEventPayloadV1::GateReuseMiss(value) => {
+            canonical_attempt_ordinal(task, &value.attempt_id, value.attempt_no)
+                && matches!(value.phase.as_str(), "root" | "trial" | "postmerge")
+                && safe_runtime_identity(&value.command_ref)
+                && (1..=2).contains(&value.miss_no)
+                && matches!(
+                    value.reason.as_str(),
+                    "input-tree" | "contract" | "command" | "toolchain" | "environment"
+                )
+                && valid_sha256_text(&value.input_identity_sha256)
+                && valid_sha256_text(&value.expected_sha256)
+                && valid_sha256_text(&value.actual_sha256)
+                && valid_full_sha_text(&value.policy_base_sha)
+        }
+    };
+    if !valid {
+        bail!("{} V1 typed payload semantic floor 未满足", event.kind);
+    }
+    Ok(true)
+}
+
+fn valid_full_sha_text(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_sha256_text(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn event_payload_text<'a>(event: &'a EventRecord, key: &str) -> Option<&'a str> {
+    event.payload.as_ref()?.get(key)?.as_str()
+}
+
+fn runtime_attempt_has_dispatch(
+    events: &[EventRecord],
+    before: usize,
+    round: &str,
+    task: &str,
+    attempt_id: &str,
+    attempt_no: usize,
+    policy_base_sha: Option<&str>,
+) -> bool {
+    events[..before]
+        .iter()
+        .filter(|event| {
+            event.kind == "DispatchIssued"
+                && event.actor == "runtime:orch"
+                && event.round.as_deref() == Some(round)
+                && event.task_id.as_deref() == Some(task)
+                && event_payload_text(event, "attemptId") == Some(attempt_id)
+                && event
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("attemptNo"))
+                    .and_then(serde_json::Value::as_u64)
+                    == u64::try_from(attempt_no).ok()
+                && policy_base_sha
+                    .is_none_or(|sha| event_payload_text(event, "baseSha") == Some(sha))
+        })
+        .count()
+        == 1
+}
+
+fn runtime_route_tuple_matches(
+    route: &ReviewSeatRoutedPayloadV1,
+    panel: &ReviewPanelSelectedPayloadV1,
+) -> bool {
+    route.panel_id == panel.panel_id
+        && route.attempt_id == panel.attempt_id
+        && route.attempt_no == panel.attempt_no
+        && route.reviewed_head == panel.reviewed_head
+        && route.policy_base_sha == panel.policy_base_sha
+}
+
+/// Revalidate every V1 event and its referenced predecessor tuple.  This is
+/// consumed by append authority, expected-main replay, archived record replay,
+/// and doctor so no surface can silently apply a weaker event interpretation.
+pub fn validate_runtime_event_history_v1(events: &[EventRecord], round: &str) -> Result<()> {
+    let mut panel_attempts = std::collections::BTreeSet::new();
+    let mut route_keys = std::collections::BTreeSet::new();
+    let mut route_wakes = std::collections::BTreeSet::new();
+    let mut panel_wake_ids = std::collections::BTreeSet::new();
+    let mut panel_wake_routes = std::collections::BTreeSet::new();
+    let mut backfill_sources = std::collections::BTreeSet::new();
+    let mut terminal_keys = std::collections::BTreeSet::new();
+    let mut promoted_keys = std::collections::BTreeSet::new();
+    let mut promotion_delivery_ids = std::collections::BTreeSet::new();
+    let mut closed_panels = std::collections::BTreeSet::new();
+    let mut active_policies =
+        std::collections::BTreeMap::<String, (String, RuntimePolicyActivatedPayloadV1)>::new();
+    let mut round_closed = false;
+
+    for (position, event) in events.iter().enumerate() {
+        if event.kind == "RoundClosed"
+            && event.actor == "runtime:orch"
+            && event.round.as_deref() == Some(round)
+        {
+            round_closed = true;
+            continue;
+        }
+        if event.kind == "WakeIssued"
+            && event.payload.as_ref().is_some_and(|payload| {
+                ["routeEventId", "panelId", "seatId", "policyBaseSha"]
+                    .iter()
+                    .any(|key| payload.get(*key).is_some())
+            })
+        {
+            let route_event_id = event_payload_text(event, "routeEventId")
+                .context("panel WakeIssued 缺 routeEventId")?;
+            let routes = events[..position]
+                .iter()
+                .filter(|candidate| candidate.event_id == route_event_id)
+                .filter_map(|candidate| {
+                    let Ok(Some(RuntimeEventPayloadV1::ReviewSeatRouted(route))) =
+                        decode_runtime_event_v1(candidate)
+                    else {
+                        return None;
+                    };
+                    Some((candidate, route))
+                })
+                .collect::<Vec<_>>();
+            let [(route_event, route)] = routes.as_slice() else {
+                bail!("panel WakeIssued.routeEventId 未绑定唯一先行 route");
+            };
+            let wake_id = event_payload_text(event, "wakeId").unwrap_or_default();
+            if event.actor != "runtime:orch"
+                || event.round.as_deref() != Some(round)
+                || event.task_id != route_event.task_id
+                || event_payload_text(event, "attemptId") != Some(route.attempt_id.as_str())
+                || event_payload_text(event, "agent") != Some(route.agent.as_str())
+                || event_payload_text(event, "panelId") != Some(route.panel_id.as_str())
+                || event_payload_text(event, "seatId") != Some(route.seat_id.as_str())
+                || event
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("generation"))
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(u64::from(route.generation))
+                || wake_id != route.wake_id
+                || event_payload_text(event, "policyBaseSha")
+                    != Some(route.policy_base_sha.as_str())
+                || event_payload_text(event, "reviewedHead")
+                    != Some(route.reviewed_head.as_str())
+                || !panel_wake_ids.insert(wake_id.to_string())
+                || !panel_wake_routes.insert(route_event_id.to_string())
+            {
+                bail!("panel WakeIssued 未精确绑定先行 route immutable tuple");
+            }
+        }
+        let Some(decoded) = decode_runtime_event_v1(event)? else {
+            continue;
+        };
+        if round_closed {
+            bail!("runtime V1 event 不得出现在 RoundClosed 之后");
+        }
+        canonical_runtime_event_v1(event, round)?;
+        let task = event.task_id.as_deref().unwrap_or_default();
+        match decoded {
+            RuntimeEventPayloadV1::RuntimePolicyActivated(payload) => {
+                crate::plan::ensure_runtime_policy_transition_idle(round, &events[..position])
+                    .context("RuntimePolicyActivated historical idle authority failed")?;
+                if active_policies.contains_key(&payload.policy) {
+                    bail!("runtime policy 重复激活而未先停用: {}", payload.policy);
+                }
+                let recorded = events[..position]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| {
+                        candidate.kind == "TaskRecorded"
+                            && candidate.actor == "runtime:orch"
+                            && candidate.round.as_deref() == Some(round)
+                            && candidate.task_id.as_deref() == Some(payload.owner_task.as_str())
+                            && candidate.event_id == payload.owner_recorded_event_id
+                            && candidate.payload.as_ref()
+                                == Some(&serde_json::json!({"postMergeGates": "all-green"}))
+                    })
+                    .collect::<Vec<_>>();
+                let [(recorded_position, _)] = recorded.as_slice() else {
+                    bail!("RuntimePolicyActivated ownerRecordedEventId 未绑定唯一 TaskRecorded");
+                };
+                let merges = events[..*recorded_position].iter().filter(|candidate| {
+                    candidate.kind == "MergeExecuted"
+                        && candidate.actor == "reviewer:orch-runtime"
+                        && candidate.round.as_deref() == Some(round)
+                        && candidate.task_id.as_deref() == Some(payload.owner_task.as_str())
+                        && event_payload_text(candidate, "mergeSha")
+                            == Some(payload.owner_merge_sha.as_str())
+                });
+                if merges.count() != 1 {
+                    bail!("RuntimePolicyActivated ownerMergeSha 未绑定唯一 MergeExecuted");
+                }
+                active_policies.insert(payload.policy.clone(), (event.event_id.clone(), payload));
+            }
+            RuntimeEventPayloadV1::RuntimePolicyDeactivated(payload) => {
+                crate::plan::ensure_runtime_policy_transition_idle(round, &events[..position])
+                    .context("RuntimePolicyDeactivated historical idle authority failed")?;
+                if let Some((activation_id, activation)) = active_policies.get(&payload.policy) {
+                    if activation_id != &payload.activation_event_id
+                        || activation.binding_sha256 != payload.binding_sha256
+                        || activation.policy_sha256 != payload.policy_sha256
+                    {
+                        bail!("RuntimePolicyDeactivated 未绑定当前 activationEventId");
+                    }
+                }
+                active_policies.remove(&payload.policy);
+            }
+            RuntimeEventPayloadV1::ReviewPanelSelected(payload) => {
+                if !panel_attempts.insert((task.to_string(), payload.attempt_id.clone())) {
+                    bail!("同 attempt 重复 ReviewPanelSelected");
+                }
+                if !runtime_attempt_has_dispatch(
+                    events,
+                    position,
+                    round,
+                    task,
+                    &payload.attempt_id,
+                    payload.attempt_no,
+                    Some(&payload.policy_base_sha),
+                ) {
+                    bail!("ReviewPanelSelected 未绑定先行 DispatchIssued/baseSha");
+                }
+                let current_matches = events[..position]
+                    .iter()
+                    .rev()
+                    .find(|candidate| {
+                        candidate.kind == "DispatchIssued"
+                            && candidate.actor == "runtime:orch"
+                            && candidate.round.as_deref() == Some(round)
+                            && candidate.task_id.as_deref() == Some(task)
+                    })
+                    .is_some_and(|current| {
+                        event_payload_text(current, "attemptId")
+                            == Some(payload.attempt_id.as_str())
+                            && current
+                                .payload
+                                .as_ref()
+                                .and_then(|value| value.get("attemptNo"))
+                                .and_then(serde_json::Value::as_u64)
+                                == u64::try_from(payload.attempt_no).ok()
+                            && event_payload_text(current, "baseSha")
+                                == Some(payload.policy_base_sha.as_str())
+                    });
+                if !current_matches
+                    || events[..position].iter().any(|candidate| {
+                        (candidate.kind == "VerdictIssued"
+                            && candidate.task_id.as_deref() == Some(task)
+                            && event_payload_text(candidate, "attemptId")
+                                == Some(payload.attempt_id.as_str()))
+                            || crate::attempt::event_terminates_attempt(
+                                candidate,
+                                &payload.attempt_id,
+                            )
+                    })
+                {
+                    bail!("ReviewPanelSelected 未绑定当时 current non-terminal attempt");
+                }
+                let collected_head = crate::wake::immutable_collect_head_before(
+                    events,
+                    position,
+                    round,
+                    task,
+                    &payload.attempt_id,
+                )?;
+                if collected_head != payload.reviewed_head {
+                    bail!("ReviewPanelSelected.reviewedHead 未绑定 immutable collect head");
+                }
+                let initial = events
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(route_position, candidate)| {
+                        let Ok(Some(RuntimeEventPayloadV1::ReviewSeatRouted(route))) =
+                            decode_runtime_event_v1(candidate)
+                        else {
+                            return None;
+                        };
+                        (route.panel_id == payload.panel_id && route.route_kind == "initial")
+                            .then_some((route_position, route))
+                    })
+                    .collect::<Vec<_>>();
+                if initial.len() != 3
+                    || initial
+                        .iter()
+                        .enumerate()
+                        .any(|(offset, (route_position, route))| {
+                            *route_position != position + offset + 1
+                                || route.generation != 1
+                                || !runtime_route_tuple_matches(route, &payload)
+                        })
+                    || initial
+                        .iter()
+                        .filter(|(_, route)| route.role != "nongate")
+                        .count()
+                        < 2
+                    || initial
+                        .iter()
+                        .map(|(_, route)| route.agent.as_str())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        != 3
+                    || !initial.iter().any(|(_, route)| route.lineage == "primary")
+                    || initial
+                        .iter()
+                        .map(|(_, route)| route.seat_id.as_str())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        != payload
+                            .seat_ids
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<std::collections::BTreeSet<_>>()
+                {
+                    bail!("ReviewPanelSelected 必须紧邻恰三条合法 initial routes");
+                }
+            }
+            RuntimeEventPayloadV1::ReviewSeatRouted(payload) => {
+                if closed_panels.contains(&payload.panel_id) {
+                    bail!("closed review panel 不得追加 route");
+                }
+                if events[..position].iter().any(|candidate| {
+                    (matches!(candidate.kind.as_str(), "WakeIssued" | "ManagedWakeTerminated")
+                        && event_payload_text(candidate, "wakeId")
+                            == Some(payload.wake_id.as_str()))
+                        || (candidate.kind == "ActionRejected"
+                            && event_payload_text(candidate, "actionId")
+                                == Some(payload.wake_id.as_str()))
+                }) {
+                    bail!("ReviewSeatRouted 必须先于同 wakeId 的 wake/terminal/rejection");
+                }
+                let panels = events[..position]
+                    .iter()
+                    .filter_map(|candidate| {
+                        let Ok(Some(RuntimeEventPayloadV1::ReviewPanelSelected(panel))) =
+                            decode_runtime_event_v1(candidate)
+                        else {
+                            return None;
+                        };
+                        (panel.panel_id == payload.panel_id)
+                            .then_some((candidate.event_id.as_str(), panel))
+                    })
+                    .collect::<Vec<_>>();
+                let [(selected_event_id, panel)] = panels.as_slice() else {
+                    bail!("ReviewSeatRouted 缺唯一先行 panel");
+                };
+                if !runtime_route_tuple_matches(&payload, panel)
+                    || payload.selected_event_id != *selected_event_id
+                    || !panel.seat_ids.iter().any(|seat| seat == &payload.seat_id)
+                        && payload.route_kind == "initial"
+                {
+                    bail!("ReviewSeatRouted 与 panel immutable tuple 漂移");
+                }
+                if !route_keys.insert((
+                    payload.panel_id.clone(),
+                    payload.seat_id.clone(),
+                    payload.generation,
+                )) || !route_wakes.insert(payload.wake_id.clone())
+                {
+                    bail!("ReviewSeatRouted seat generation/wakeId 重复");
+                }
+                if payload.route_kind == "retry" {
+                    if payload.generation != 2
+                        || events[..position]
+                            .iter()
+                            .filter(|candidate| {
+                                matches!(
+                                    decode_runtime_event_v1(candidate),
+                                    Ok(Some(RuntimeEventPayloadV1::ReviewSeatRouted(ref route)))
+                                        if route.panel_id == payload.panel_id
+                                            && route.route_kind == "retry"
+                                )
+                            })
+                            .count()
+                            != 0
+                        || !events[..position].iter().any(|candidate| {
+                            matches!(
+                                decode_runtime_event_v1(candidate),
+                                Ok(Some(RuntimeEventPayloadV1::ReviewSeatRouted(ref route)))
+                                    if route.panel_id == payload.panel_id
+                                        && route.seat_id == payload.seat_id
+                                        && route.generation == 1
+                                        && route.retry_eligible
+                            )
+                        })
+                        || !events[..position].iter().any(|candidate| {
+                            matches!(
+                                decode_runtime_event_v1(candidate),
+                                Ok(Some(RuntimeEventPayloadV1::ReviewSeatTerminated(ref terminal)))
+                                    if terminal.panel_id == payload.panel_id
+                                        && terminal.seat_id == payload.seat_id
+                                        && terminal.generation == 1
+                                        && terminal.state == "business-invalid"
+                                        && payload.source_seat_id.as_deref()
+                                            == Some(terminal.seat_id.as_str())
+                                        && payload.source_generation == Some(terminal.generation)
+                                        && payload.source_terminal_event_id.as_deref()
+                                            == Some(candidate.event_id.as_str())
+                            )
+                        })
+                    {
+                        bail!("retry route 只允许 business-invalid seat 的 generation 2");
+                    }
+                } else if payload.route_kind == "backfill" {
+                    if payload.generation != 1
+                        || !payload
+                            .source_terminal_event_id
+                            .as_ref()
+                            .is_some_and(|source| backfill_sources.insert(source.clone()))
+                        || !events[..position].iter().any(|candidate| {
+                            matches!(
+                                decode_runtime_event_v1(candidate),
+                                Ok(Some(RuntimeEventPayloadV1::ReviewSeatTerminated(ref terminal)))
+                                    if terminal.panel_id == payload.panel_id
+                                        && terminal.state == "system-terminal-invalid"
+                                        && payload.source_seat_id.as_deref()
+                                            == Some(terminal.seat_id.as_str())
+                                        && payload.source_generation == Some(terminal.generation)
+                                        && payload.source_terminal_event_id.as_deref()
+                                            == Some(candidate.event_id.as_str())
+                            )
+                        })
+                    {
+                        bail!("backfill route 缺 exact source terminal 或 generation 非 1");
+                    }
+                }
+            }
+            RuntimeEventPayloadV1::ReviewSeatTerminated(payload) => {
+                if closed_panels.contains(&payload.panel_id) {
+                    bail!("closed review panel 不得追加 terminal");
+                }
+                let key = (
+                    payload.panel_id.clone(),
+                    payload.seat_id.clone(),
+                    payload.generation,
+                );
+                if !terminal_keys.insert(key) {
+                    bail!("ReviewSeatTerminated 重复 seat generation");
+                }
+                let routes = events[..position]
+                    .iter()
+                    .filter_map(|candidate| {
+                        let Ok(Some(RuntimeEventPayloadV1::ReviewSeatRouted(route))) =
+                            decode_runtime_event_v1(candidate)
+                        else {
+                            return None;
+                        };
+                        (route.panel_id == payload.panel_id
+                            && route.seat_id == payload.seat_id
+                            && route.generation == payload.generation)
+                            .then_some(route)
+                    })
+                    .collect::<Vec<_>>();
+                let [route] = routes.as_slice() else {
+                    bail!("ReviewSeatTerminated 缺唯一先行 route");
+                };
+                if route.wake_id != payload.wake_id
+                    || route.attempt_id != payload.attempt_id
+                    || route.attempt_no != payload.attempt_no
+                    || route.role != payload.role
+                    || route.agent != payload.agent
+                    || route.lineage != payload.lineage
+                    || route.reviewed_head != payload.reviewed_head
+                    || route.policy_base_sha != payload.policy_base_sha
+                {
+                    bail!("ReviewSeatTerminated 未精确反向绑定 route");
+                }
+                let terminals = events[..position]
+                    .iter()
+                    .filter(|candidate| candidate.event_id == payload.terminal_event_id)
+                    .collect::<Vec<_>>();
+                let [terminal] = terminals.as_slice() else {
+                    bail!("ReviewSeatTerminated terminal/delivery 引用不唯一");
+                };
+                let terminal_matches = match terminal.kind.as_str() {
+                    "ManagedWakeTerminated" => {
+                        let terminal_state =
+                            event_payload_text(terminal, "state").unwrap_or("failed");
+                        let exact_reason = event_payload_text(terminal, "exactReason")
+                            .or_else(|| event_payload_text(terminal, "outcomeClass"))
+                            .unwrap_or("managed terminal without exact review artifact");
+                        let classified = crate::wake::classify_review_panel_invalid_v1(
+                            &payload.agent,
+                            terminal_state,
+                            exact_reason,
+                        );
+                        terminal.actor == "runtime:orch"
+                            && terminal.round.as_deref() == Some(round)
+                            && terminal.task_id.as_deref() == Some(task)
+                            && event_payload_text(terminal, "wakeId")
+                                == Some(payload.wake_id.as_str())
+                            && event_payload_text(terminal, "agent") == Some(payload.agent.as_str())
+                            && terminal
+                                .payload
+                                .as_ref()
+                                .and_then(|value| value.get("managedScopeTerminated"))
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(true)
+                            && match payload.state.as_str() {
+                                "pass" | "fail" | "blocked" => {
+                                    terminal_state == "answered"
+                                }
+                                "business-invalid" => {
+                                    classified
+                                        == crate::wake::ReviewPanelSeatStateV1::BusinessInvalid
+                                }
+                                "system-terminal-invalid" => {
+                                    classified
+                                        == crate::wake::ReviewPanelSeatStateV1::SystemInvalid
+                                }
+                                _ => false,
+                            }
+                    }
+                    "ActionRejected" => {
+                        payload.state == "system-terminal-invalid"
+                            && terminal.actor == "runtime:orch"
+                            && terminal.round.as_deref() == Some(round)
+                            && terminal.task_id.as_deref() == Some(task)
+                            && event_payload_text(terminal, "actionId")
+                                == Some(payload.wake_id.as_str())
+                            && event_payload_text(terminal, "attemptId")
+                                == Some(payload.attempt_id.as_str())
+                    }
+                    _ => false,
+                };
+                if !terminal_matches {
+                    bail!(
+                        "ReviewSeatTerminated terminalEventId 未绑定 exact managed/action terminal"
+                    );
+                }
+                if let Some(delivery_id) = payload.delivery_event_id.as_deref() {
+                    let deliveries = events[..position]
+                        .iter()
+                        .filter(|candidate| candidate.event_id == delivery_id)
+                        .collect::<Vec<_>>();
+                    let [delivery] = deliveries.as_slice() else {
+                        bail!("ReviewSeatTerminated deliveryEventId 不唯一");
+                    };
+                    if !matches!(
+                        delivery.kind.as_str(),
+                        "ReviewDelivered" | "NongateReviewDelivered"
+                    ) || delivery.actor != "runtime:orch"
+                        || delivery.round.as_deref() != Some(round)
+                        || delivery.task_id.as_deref() != Some(task)
+                        || event_payload_text(delivery, "attemptId")
+                            != Some(payload.attempt_id.as_str())
+                        || event_payload_text(delivery, "role") != Some(payload.role.as_str())
+                        || event_payload_text(delivery, "agent") != Some(payload.agent.as_str())
+                        || event_payload_text(delivery, "panelId")
+                            != Some(payload.panel_id.as_str())
+                        || event_payload_text(delivery, "seatId")
+                            != Some(payload.seat_id.as_str())
+                        || delivery
+                            .payload
+                            .as_ref()
+                            .and_then(|value| value.get("generation"))
+                            .and_then(serde_json::Value::as_u64)
+                            != Some(u64::from(payload.generation))
+                        || event_payload_text(delivery, "wakeId")
+                            != Some(payload.wake_id.as_str())
+                        || event_payload_text(delivery, "policyBaseSha")
+                            != Some(payload.policy_base_sha.as_str())
+                        || event_payload_text(delivery, "reviewedHead")
+                            != Some(payload.reviewed_head.as_str())
+                    {
+                        bail!("ReviewSeatTerminated delivery 未绑定 exact review tuple");
+                    }
+                    let promotions = events[..position]
+                        .iter()
+                        .filter_map(|candidate| {
+                            let Ok(Some(RuntimeEventPayloadV1::ReviewSpoolPromoted(promotion))) =
+                                decode_runtime_event_v1(candidate)
+                            else {
+                                return None;
+                            };
+                            (promotion.panel_id == payload.panel_id
+                                && promotion.seat_id == payload.seat_id
+                                && promotion.generation == payload.generation
+                                && promotion.wake_id == payload.wake_id
+                                && promotion.attempt_id == payload.attempt_id
+                                && promotion.attempt_no == payload.attempt_no
+                                && promotion.role == payload.role
+                                && promotion.agent == payload.agent
+                                && promotion.reviewed_head == payload.reviewed_head
+                                && promotion.policy_base_sha == payload.policy_base_sha
+                                && promotion.terminal_event_id == payload.terminal_event_id
+                                && promotion.delivery_event_id == delivery_id)
+                                .then_some(promotion)
+                        })
+                        .collect::<Vec<_>>();
+                    let [promotion] = promotions.as_slice() else {
+                        bail!("ReviewSeatTerminated 缺唯一 matching ReviewSpoolPromoted");
+                    };
+                    let expected_state = match promotion.verdict.as_str() {
+                        "PASS" => "pass",
+                        "FAIL" => "fail",
+                        "BLOCKED" => "blocked",
+                        _ => unreachable!("V1 promotion verdict was decoded as closed vocabulary"),
+                    };
+                    let delivery_body_len = delivery
+                        .payload
+                        .as_ref()
+                        .and_then(|value| value.get("bodyLen"))
+                        .and_then(serde_json::Value::as_u64);
+                    let nongate_exact = payload.role != "nongate"
+                        || (delivery.kind == "NongateReviewDelivered"
+                            && event_payload_text(delivery, "path")
+                                == Some(promotion.canonical_path.as_str())
+                            && event_payload_text(delivery, "sha256")
+                                == Some(promotion.sha256.as_str())
+                            && delivery
+                                .payload
+                                .as_ref()
+                                .and_then(|value| value.get("bytes"))
+                                .and_then(serde_json::Value::as_u64)
+                                == Some(promotion.bytes)
+                            && event_payload_text(delivery, "verdict")
+                                == Some(promotion.verdict.as_str()));
+                    if payload.state != expected_state
+                        || delivery_body_len != Some(promotion.body_len)
+                        || (payload.role == "nongate"
+                            && delivery.kind != "NongateReviewDelivered")
+                        || (payload.role != "nongate" && delivery.kind != "ReviewDelivered")
+                        || !nongate_exact
+                    {
+                        bail!("ReviewSeatTerminated state/delivery 与 promoted artifact 漂移");
+                    }
+                }
+            }
+            RuntimeEventPayloadV1::ReviewSpoolPromoted(payload) => {
+                let seat_key = (
+                    payload.panel_id.clone(),
+                    payload.seat_id.clone(),
+                    payload.generation,
+                );
+                let promotion_key = (
+                    payload.panel_id.clone(),
+                    payload.seat_id.clone(),
+                    payload.generation,
+                    payload.wake_id.clone(),
+                );
+                if closed_panels.contains(&payload.panel_id)
+                    || terminal_keys.contains(&seat_key)
+                    || !promoted_keys.insert(promotion_key)
+                    || !promotion_delivery_ids.insert(payload.delivery_event_id.clone())
+                {
+                    bail!("ReviewSpoolPromoted 重复、迟到或位于 closed panel");
+                }
+                let route_matches = events[..position].iter().filter(|candidate| {
+                    matches!(
+                        decode_runtime_event_v1(candidate),
+                        Ok(Some(RuntimeEventPayloadV1::ReviewSeatRouted(ref route)))
+                            if route.panel_id == payload.panel_id
+                                && route.seat_id == payload.seat_id
+                                && route.generation == payload.generation
+                                && route.wake_id == payload.wake_id
+                                && route.attempt_id == payload.attempt_id
+                                && route.attempt_no == payload.attempt_no
+                                && route.role == payload.role
+                                && route.agent == payload.agent
+                                && route.reviewed_head == payload.reviewed_head
+                                && route.policy_base_sha == payload.policy_base_sha
+                    )
+                });
+                let terminals = events[..position]
+                    .iter()
+                    .filter(|candidate| candidate.event_id == payload.terminal_event_id)
+                    .collect::<Vec<_>>();
+                let terminal_exact = matches!(terminals.as_slice(), [terminal]
+                    if terminal.kind == "ManagedWakeTerminated"
+                        && terminal.actor == "runtime:orch"
+                        && terminal.round.as_deref() == Some(round)
+                        && terminal.task_id.as_deref() == Some(task)
+                        && event_payload_text(terminal, "wakeId") == Some(payload.wake_id.as_str())
+                        && event_payload_text(terminal, "agent") == Some(payload.agent.as_str())
+                        && event_payload_text(terminal, "state") == Some("answered")
+                        && terminal
+                            .payload
+                            .as_ref()
+                            .and_then(|value| value.get("managedScopeTerminated"))
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                        && event_payload_text(terminal, "outputPath")
+                            .is_some_and(|path| path.ends_with(payload.staging_path.as_str()))
+                        && event_payload_text(terminal, "outputSha256")
+                            == Some(payload.sha256.as_str()));
+                if route_matches.count() != 1 || !terminal_exact {
+                    bail!("ReviewSpoolPromoted route/terminal 引用不闭合");
+                }
+                let Some(delivery) = events.get(position + 1) else {
+                    bail!("ReviewSpoolPromoted 缺相邻 delivery");
+                };
+                if delivery.event_id != payload.delivery_event_id
+                    || !matches!(
+                        delivery.kind.as_str(),
+                        "ReviewDelivered" | "NongateReviewDelivered"
+                    )
+                    || delivery.actor != "runtime:orch"
+                    || delivery.round.as_deref() != Some(round)
+                    || delivery.task_id.as_deref() != Some(task)
+                    || event_payload_text(delivery, "attemptId")
+                        != Some(payload.attempt_id.as_str())
+                    || event_payload_text(delivery, "role") != Some(payload.role.as_str())
+                    || event_payload_text(delivery, "agent") != Some(payload.agent.as_str())
+                    || event_payload_text(delivery, "panelId") != Some(payload.panel_id.as_str())
+                    || event_payload_text(delivery, "seatId") != Some(payload.seat_id.as_str())
+                    || delivery
+                        .payload
+                        .as_ref()
+                        .and_then(|value| value.get("generation"))
+                        .and_then(serde_json::Value::as_u64)
+                        != Some(u64::from(payload.generation))
+                    || event_payload_text(delivery, "wakeId") != Some(payload.wake_id.as_str())
+                    || event_payload_text(delivery, "policyBaseSha")
+                        != Some(payload.policy_base_sha.as_str())
+                    || event_payload_text(delivery, "reviewedHead")
+                        != Some(payload.reviewed_head.as_str())
+                    || delivery
+                        .payload
+                        .as_ref()
+                        .and_then(|value| value.get("bodyLen"))
+                        .and_then(serde_json::Value::as_u64)
+                        != Some(payload.body_len)
+                    || (payload.role == "nongate" && delivery.kind != "NongateReviewDelivered")
+                    || (payload.role != "nongate" && delivery.kind != "ReviewDelivered")
+                {
+                    bail!("ReviewSpoolPromoted 未与 exact delivery 同批相邻");
+                }
+                let Some(seat_terminal) = events.get(position + 2) else {
+                    bail!("ReviewSpoolPromoted 缺相邻 ReviewSeatTerminated");
+                };
+                let expected_state = match payload.verdict.as_str() {
+                    "PASS" => "pass",
+                    "FAIL" => "fail",
+                    "BLOCKED" => "blocked",
+                    _ => unreachable!("V1 promotion verdict was decoded as closed vocabulary"),
+                };
+                if !matches!(
+                    decode_runtime_event_v1(seat_terminal),
+                    Ok(Some(RuntimeEventPayloadV1::ReviewSeatTerminated(ref terminal)))
+                        if seat_terminal.task_id.as_deref() == Some(task)
+                            && terminal.panel_id == payload.panel_id
+                            && terminal.seat_id == payload.seat_id
+                            && terminal.generation == payload.generation
+                            && terminal.wake_id == payload.wake_id
+                            && terminal.attempt_id == payload.attempt_id
+                            && terminal.attempt_no == payload.attempt_no
+                            && terminal.role == payload.role
+                            && terminal.agent == payload.agent
+                            && terminal.reviewed_head == payload.reviewed_head
+                            && terminal.policy_base_sha == payload.policy_base_sha
+                            && terminal.state == expected_state
+                            && terminal.terminal_event_id == payload.terminal_event_id
+                            && terminal.delivery_event_id.as_deref()
+                                == Some(payload.delivery_event_id.as_str())
+                ) {
+                    bail!("ReviewSpoolPromoted/delivery 未与 exact seat terminal 同批相邻");
+                }
+            }
+            RuntimeEventPayloadV1::ReviewPanelClosed(payload) => {
+                if !closed_panels.insert(payload.panel_id.clone()) {
+                    bail!("ReviewPanelClosed 重复 panel");
+                }
+                let selected = events[..position].iter().filter(|candidate| {
+                    matches!(
+                        decode_runtime_event_v1(candidate),
+                        Ok(Some(RuntimeEventPayloadV1::ReviewPanelSelected(ref panel)))
+                            if panel.panel_id == payload.panel_id
+                                && panel.attempt_id == payload.attempt_id
+                                && panel.attempt_no == payload.attempt_no
+                                && panel.reviewed_head == payload.reviewed_head
+                                && panel.policy_base_sha == payload.policy_base_sha
+                    )
+                });
+                if selected.count() != 1 {
+                    bail!("ReviewPanelClosed 未绑定唯一 selected panel");
+                }
+                let mut current_routes =
+                    std::collections::BTreeMap::<String, ReviewSeatRoutedPayloadV1>::new();
+                for candidate in &events[..position] {
+                    let Ok(Some(RuntimeEventPayloadV1::ReviewSeatRouted(route))) =
+                        decode_runtime_event_v1(candidate)
+                    else {
+                        continue;
+                    };
+                    if route.panel_id != payload.panel_id {
+                        continue;
+                    }
+                    let replace = current_routes
+                        .get(&route.seat_id)
+                        .is_none_or(|prior| prior.generation < route.generation);
+                    if replace {
+                        current_routes.insert(route.seat_id.clone(), route);
+                    }
+                }
+                let mut panel_seats = Vec::new();
+                let mut terminal_count = 0usize;
+                for route in current_routes.values() {
+                    let matching = events[..position]
+                        .iter()
+                        .filter_map(|candidate| {
+                            let Ok(Some(RuntimeEventPayloadV1::ReviewSeatTerminated(terminal))) =
+                                decode_runtime_event_v1(candidate)
+                            else {
+                                return None;
+                            };
+                            (terminal.panel_id == route.panel_id
+                                && terminal.seat_id == route.seat_id
+                                && terminal.generation == route.generation)
+                                .then_some(terminal)
+                        })
+                        .collect::<Vec<_>>();
+                    if matching.len() > 1 {
+                        bail!("panel close sees duplicate current-generation terminal");
+                    }
+                    let state = match matching.first().map(|terminal| terminal.state.as_str()) {
+                        Some("pass") => {
+                            terminal_count += 1;
+                            crate::wake::ReviewPanelSeatStateV1::Pass
+                        }
+                        Some("fail") => {
+                            terminal_count += 1;
+                            crate::wake::ReviewPanelSeatStateV1::Fail
+                        }
+                        Some("blocked") => {
+                            terminal_count += 1;
+                            crate::wake::ReviewPanelSeatStateV1::Blocked
+                        }
+                        Some("business-invalid") => {
+                            terminal_count += 1;
+                            crate::wake::ReviewPanelSeatStateV1::BusinessInvalid
+                        }
+                        Some("system-terminal-invalid") => {
+                            terminal_count += 1;
+                            crate::wake::ReviewPanelSeatStateV1::SystemInvalid
+                        }
+                        None => crate::wake::ReviewPanelSeatStateV1::Pending,
+                        Some(other) => bail!("unknown panel terminal state at close: {other}"),
+                    };
+                    panel_seats.push(crate::wake::ReviewPanelSeatV1 {
+                        seat_id: route.seat_id.clone(),
+                        generation: route.generation,
+                        role: route.role.clone(),
+                        agent: route.agent.clone(),
+                        primary_lineage: route.lineage == "primary",
+                        retry_eligible: route.retry_eligible,
+                        state,
+                    });
+                }
+                let primary_pass = panel_seats.iter().any(|seat| {
+                    seat.primary_lineage && seat.state == crate::wake::ReviewPanelSeatStateV1::Pass
+                });
+                let formal_passes = panel_seats
+                    .iter()
+                    .filter(|seat| {
+                        seat.role != "nongate"
+                            && seat.state == crate::wake::ReviewPanelSeatStateV1::Pass
+                    })
+                    .count();
+                let unavailable_secondary = panel_seats.iter().any(|seat| {
+                    seat.role == "secondary"
+                        && matches!(
+                            seat.state,
+                            crate::wake::ReviewPanelSeatStateV1::BusinessInvalid
+                                | crate::wake::ReviewPanelSeatStateV1::SystemInvalid
+                        )
+                });
+                let nongate_substitution = panel_seats.iter().any(|seat| {
+                    seat.role == "nongate"
+                        && seat.state == crate::wake::ReviewPanelSeatStateV1::Pass
+                }) && unavailable_secondary;
+                let pass_count = formal_passes + usize::from(nongate_substitution);
+                let retries_used = events[..position]
+                    .iter()
+                    .filter(|candidate| {
+                        matches!(
+                            decode_runtime_event_v1(candidate),
+                            Ok(Some(RuntimeEventPayloadV1::ReviewSeatRouted(ref route)))
+                                if route.panel_id == payload.panel_id
+                                    && route.route_kind == "retry"
+                        )
+                    })
+                    .count();
+                let decision = crate::wake::evaluate_review_panel_v1(
+                    &crate::wake::ReviewPanelPolicyV1 {
+                        minimum_passes: 2,
+                        require_primary_pass: true,
+                        maximum_business_retries: 1,
+                        nongate_substitutes_secondary_only: true,
+                    },
+                    &panel_seats,
+                    retries_used,
+                    0,
+                );
+                let expected_outcome = match decision {
+                    crate::wake::ReviewPanelDecisionV1::Pass => "pass",
+                    crate::wake::ReviewPanelDecisionV1::Veto => "veto",
+                    crate::wake::ReviewPanelDecisionV1::PoolExhausted => "pool-exhausted",
+                    other => bail!("ReviewPanelClosed outcome 尚不可达: {other:?}"),
+                };
+                if payload.outcome != expected_outcome
+                    || payload.terminal_seat_count != terminal_count
+                    || payload.pass_count != pass_count
+                    || payload.primary_pass != primary_pass
+                {
+                    bail!("ReviewPanelClosed outcome/count 未从 current generations 重算");
+                }
+                if payload.outcome == "pool-exhausted" {
+                    let Some(blocked) = events.get(position + 1) else {
+                        bail!("pool-exhausted ReviewPanelClosed 缺相邻 AttemptBlocked");
+                    };
+                    if blocked.kind != "AttemptBlocked"
+                        || blocked.actor != "runtime:orch"
+                        || blocked.task_id.as_deref() != Some(task)
+                        || blocked.round.as_deref() != Some(round)
+                        || event_payload_text(blocked, "attemptId")
+                            != Some(payload.attempt_id.as_str())
+                        || event_payload_text(blocked, "stage") != Some("review-panel-exhausted")
+                    {
+                        bail!("pool-exhausted close 未与 exact AttemptBlocked 同批相邻");
+                    }
+                }
+            }
+            RuntimeEventPayloadV1::GateLaneEscalated(payload) => {
+                if !runtime_attempt_has_dispatch(
+                    events,
+                    position,
+                    round,
+                    task,
+                    &payload.attempt_id,
+                    payload.attempt_no,
+                    Some(&payload.policy_base_sha),
+                ) {
+                    bail!("GateLaneEscalated 未绑定 DispatchIssued/policyBaseSha");
+                }
+            }
+            RuntimeEventPayloadV1::GateReused(payload) => {
+                let sources = events[..position]
+                    .iter()
+                    .filter(|candidate| candidate.event_id == payload.source_gate_event_id)
+                    .collect::<Vec<_>>();
+                let [source] = sources.as_slice() else {
+                    bail!("GateReused sourceGateEventId 不唯一");
+                };
+                let source_payload = crate::verify::canonical_gate_executed_payload(source, round)
+                    .context("GateReused source 不是 canonical GateExecuted")?;
+                let source_exact = source.task_id.as_deref() == Some(task)
+                    && source_payload
+                        .get("phase")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(payload.source_phase.as_str())
+                    && source_payload
+                        .get("commandRef")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(payload.command_ref.as_str())
+                    && source_payload
+                        .get("subjectTreeSha")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(payload.subject_tree_sha.as_str())
+                    && source_payload
+                        .get("logSha256")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(payload.log_sha256.as_str())
+                    && source_payload
+                        .get("logBytes")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(payload.log_bytes);
+                if !runtime_attempt_has_dispatch(
+                    events,
+                    position,
+                    round,
+                    task,
+                    &payload.attempt_id,
+                    payload.attempt_no,
+                    None,
+                ) || !source_exact
+                {
+                    bail!("GateReused 未绑定 DispatchIssued/唯一 source GateExecuted");
+                }
+            }
+            RuntimeEventPayloadV1::GateReuseMiss(payload) => {
+                if !runtime_attempt_has_dispatch(
+                    events,
+                    position,
+                    round,
+                    task,
+                    &payload.attempt_id,
+                    payload.attempt_no,
+                    Some(&payload.policy_base_sha),
+                ) {
+                    bail!("GateReuseMiss 未绑定 DispatchIssued/policyBaseSha");
+                }
+                let prior_misses = events[..position]
+                    .iter()
+                    .filter(|candidate| {
+                        matches!(
+                            decode_runtime_event_v1(candidate),
+                            Ok(Some(RuntimeEventPayloadV1::GateReuseMiss(ref prior)))
+                                if candidate.task_id.as_deref() == Some(task)
+                                    && prior.attempt_id == payload.attempt_id
+                        )
+                    })
+                    .count();
+                if usize::try_from(payload.miss_no).ok() != Some(prior_misses + 1) {
+                    bail!("GateReuseMiss missNo 不是 attempt-scoped durable 次序");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_review_panel_repository_authority_v1(
+    root: &Path,
+    events: &[EventRecord],
+    round: &str,
+    selected_position: usize,
+    selected_event: &EventRecord,
+    selected: &ReviewPanelSelectedPayloadV1,
+    policy: &crate::plan::ReviewPoolPolicyV1,
+) -> Result<()> {
+    let task = selected_event
+        .task_id
+        .as_deref()
+        .context("ReviewPanelSelected repository authority 缺 taskId")?;
+    let dispatches = events[..selected_position]
+        .iter()
+        .filter(|event| {
+            event.kind == "DispatchIssued"
+                && event.actor == "runtime:orch"
+                && event.round.as_deref() == Some(round)
+                && event.task_id.as_deref() == Some(task)
+                && event_payload_text(event, "attemptId") == Some(selected.attempt_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let [dispatch] = dispatches.as_slice() else {
+        bail!("ReviewPanelSelected repository authority 缺唯一 DispatchIssued");
+    };
+    let implementer = event_payload_text(dispatch, "agent")
+        .context("ReviewPanelSelected DispatchIssued 缺 implementer agent")?;
+
+    let ir_rel = format!("coordination/rounds/{round}/ROUND-IR.yaml");
+    let ir_bytes = crate::gitx::show_bytes(root, &selected.policy_base_sha, &ir_rel)
+        .with_context(|| format!("读取 panel policy-base ROUND-IR 失败: {ir_rel}"))?;
+    let ir_text = std::str::from_utf8(&ir_bytes).context("panel policy-base ROUND-IR 非 UTF-8")?;
+    let ir = crate::plan::parse_signed_round_ir(ir_text).map_err(anyhow::Error::msg)?;
+    if ir.round != round {
+        bail!("panel policy-base ROUND-IR round 漂移");
+    }
+    let task_ir = ir
+        .tasks
+        .iter()
+        .find(|candidate| candidate.id == task)
+        .with_context(|| format!("panel policy-base ROUND-IR 缺 task {task}"))?;
+    let expected_deadline = |role: &str| {
+        crate::wake::review_deadline_secs(role, task_ir.required_evidence.len())
+    };
+
+    let mut seen_agents = std::collections::BTreeSet::<String>::new();
+    for (position, event) in events.iter().enumerate() {
+        let Some(RuntimeEventPayloadV1::ReviewSeatRouted(route)) =
+            decode_runtime_event_v1(event)?
+        else {
+            continue;
+        };
+        if route.panel_id != selected.panel_id {
+            continue;
+        }
+        let candidate = policy
+            .candidates
+            .iter()
+            .find(|candidate| candidate.agent == route.agent)
+            .with_context(|| format!("panel route agent 不在 signed candidate union: {}", route.agent))?;
+        if route.agent == implementer
+            || candidate.role != route.role
+            || candidate.lineage != route.lineage
+            || route.deadline_secs != expected_deadline(&route.role)
+            || (route.route_kind == "retry" && route.retry_eligible)
+            || (route.route_kind != "retry" && route.retry_eligible != candidate.retry_eligible)
+        {
+            bail!("panel route signed candidate/implementer/deadline authority 漂移");
+        }
+        match route.route_kind.as_str() {
+            "initial" => {
+                if !seen_agents.insert(route.agent.clone()) {
+                    bail!("initial panel route 重复 signed voice");
+                }
+            }
+            "retry" => {
+                let sources = events[..position]
+                    .iter()
+                    .filter_map(|source_event| {
+                        let Ok(Some(RuntimeEventPayloadV1::ReviewSeatRouted(source))) =
+                            decode_runtime_event_v1(source_event)
+                        else {
+                            return None;
+                        };
+                        (source.panel_id == route.panel_id
+                            && source.seat_id == route.seat_id
+                            && source.generation == 1)
+                            .then_some(source)
+                    })
+                    .collect::<Vec<_>>();
+                let [source] = sources.as_slice() else {
+                    bail!("retry route 缺唯一 generation-1 signed source");
+                };
+                if source.agent != route.agent
+                    || source.role != route.role
+                    || source.lineage != route.lineage
+                    || !source.retry_eligible
+                {
+                    bail!("retry route 改写 source signed identity");
+                }
+            }
+            "backfill" => {
+                if !seen_agents.insert(route.agent.clone()) {
+                    bail!("backfill route 重复已使用 signed voice");
+                }
+                let source_id = route
+                    .source_terminal_event_id
+                    .as_deref()
+                    .context("backfill route 缺 sourceTerminalEventId")?;
+                let sources = events[..position]
+                    .iter()
+                    .filter(|source_event| source_event.event_id == source_id)
+                    .filter_map(|source_event| {
+                        let Ok(Some(RuntimeEventPayloadV1::ReviewSeatTerminated(source))) =
+                            decode_runtime_event_v1(source_event)
+                        else {
+                            return None;
+                        };
+                        Some(source)
+                    })
+                    .collect::<Vec<_>>();
+                let [source] = sources.as_slice() else {
+                    bail!("backfill route 缺唯一 signed source terminal");
+                };
+                let compatible_role = (candidate.role == "nongate" && source.role == "secondary")
+                    || (candidate.role != "nongate" && candidate.role == source.role);
+                if source.state != "system-terminal-invalid"
+                    || !compatible_role
+                    || candidate
+                        .fallback_for
+                        .as_deref()
+                        .is_some_and(|agent| agent != source.agent)
+                {
+                    bail!("backfill route 违反 signed fallback constraint");
+                }
+            }
+            _ => unreachable!("pure V1 validator closed routeKind"),
+        }
+        crate::scheduler::scheduling_admits(
+            &events[..position],
+            round,
+            &ir.scheduling,
+            &route.agent,
+            &format!("{}-review", route.role),
+        )
+        .map_err(anyhow::Error::msg)
+        .context("panel route historical H25 admission failed")?;
+    }
+    Ok(())
+}
+
+/// Add repository-backed authority to the pure V1 history validator. Policy
+/// transitions resolve exact committed binding bytes (including explicit
+/// carry-forward), while panel selection/routes recheck signed policy, H25
+/// admission, workload-derived deadlines, and pool-exhausted reachability.
+pub fn validate_runtime_event_history_v1_at_root(
+    root: &Path,
+    events: &[EventRecord],
+    round: &str,
+) -> Result<()> {
+    validate_runtime_event_history_v1(events, round)?;
+    let mut local_active = std::collections::BTreeMap::<String, String>::new();
+    for (position, event) in events.iter().enumerate() {
+        match decode_runtime_event_v1(event)? {
+            Some(RuntimeEventPayloadV1::RuntimePolicyActivated(payload)) => {
+                let resolved = crate::plan::resolve_runtime_policy_at(
+                    root,
+                    round,
+                    &payload.policy,
+                    &payload.activated_at_main_sha,
+                )?;
+                if resolved.state != crate::plan::RuntimePolicyStateV1::Dormant
+                    || resolved.owner_task != payload.owner_task
+                    || resolved.binding_sha256 != payload.binding_sha256
+                    || resolved.policy_sha256 != payload.policy_sha256
+                    || !crate::gitx::is_ancestor(
+                        root,
+                        &payload.owner_merge_sha,
+                        &payload.activated_at_main_sha,
+                    )?
+                {
+                    bail!("RuntimePolicyActivated repository-backed authority 漂移");
+                }
+                local_active.insert(payload.policy, event.event_id.clone());
+            }
+            Some(RuntimeEventPayloadV1::RuntimePolicyDeactivated(payload)) => {
+                let resolved = crate::plan::resolve_runtime_policy_at(
+                    root,
+                    round,
+                    &payload.policy,
+                    &payload.deactivated_at_main_sha,
+                )?;
+                if resolved.state != crate::plan::RuntimePolicyStateV1::Active
+                    || resolved.activation_event_id.as_deref()
+                        != Some(payload.activation_event_id.as_str())
+                    || resolved.binding_sha256 != payload.binding_sha256
+                    || resolved.policy_sha256 != payload.policy_sha256
+                {
+                    bail!("RuntimePolicyDeactivated carry-forward authority 漂移");
+                }
+                local_active.remove(&payload.policy);
+            }
+            Some(RuntimeEventPayloadV1::ReviewPanelSelected(selected)) => {
+                let resolved = crate::plan::resolve_runtime_policy_at(
+                    root,
+                    round,
+                    &selected.policy,
+                    &selected.policy_base_sha,
+                )?;
+                if resolved.state != crate::plan::RuntimePolicyStateV1::Active
+                    || resolved.policy_sha256 != selected.policy_sha256
+                {
+                    bail!("ReviewPanelSelected policy-as-of authority 漂移");
+                }
+                let policy = resolved
+                    .review_pool
+                    .as_ref()
+                    .context("ReviewPanelSelected 缺 signed review-pool descriptor")?;
+                validate_review_panel_repository_authority_v1(
+                    root,
+                    events,
+                    round,
+                    position,
+                    event,
+                    &selected,
+                    policy,
+                )?;
+            }
+            Some(RuntimeEventPayloadV1::ReviewPanelClosed(closed))
+                if closed.outcome == "pool-exhausted" =>
+            {
+                let selected = events
+                    .iter()
+                    .filter_map(|candidate| {
+                        let Ok(Some(RuntimeEventPayloadV1::ReviewPanelSelected(selected))) =
+                            decode_runtime_event_v1(candidate)
+                        else {
+                            return None;
+                        };
+                        (selected.panel_id == closed.panel_id).then_some(selected)
+                    })
+                    .collect::<Vec<_>>();
+                let [selected] = selected.as_slice() else {
+                    bail!("pool-exhausted close 缺唯一 selected policy binding");
+                };
+                let resolved = crate::plan::resolve_runtime_policy_at(
+                    root,
+                    round,
+                    &selected.policy,
+                    &selected.policy_base_sha,
+                )?;
+                let policy = resolved
+                    .review_pool
+                    .as_ref()
+                    .context("pool-exhausted close 缺 review-pool descriptor")?;
+                if crate::wake::review_panel_future_reachable_v1(
+                    events,
+                    &closed.panel_id,
+                    policy,
+                )? {
+                    bail!("ReviewPanelClosed(pool-exhausted) 尚可达到 quorum/primary");
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Return every selected V1 panel that lacks its unique ReviewPanelClosed
+/// terminal.  The history is fully validated first, so callers never treat a
+/// malformed close as resolution.
+pub fn unresolved_review_panels_v1(
+    events: &[EventRecord],
+    round: &str,
+) -> Result<Vec<(String, String, String)>> {
+    validate_runtime_event_history_v1(events, round)?;
+    let mut selected = std::collections::BTreeMap::<String, (String, String)>::new();
+    let mut closed = std::collections::BTreeSet::new();
+    for event in events {
+        match decode_runtime_event_v1(event)? {
+            Some(RuntimeEventPayloadV1::ReviewPanelSelected(payload)) => {
+                selected.insert(
+                    payload.panel_id,
+                    (
+                        event.task_id.clone().unwrap_or_default(),
+                        payload.attempt_id,
+                    ),
+                );
+            }
+            Some(RuntimeEventPayloadV1::ReviewPanelClosed(payload)) => {
+                closed.insert(payload.panel_id);
+            }
+            _ => {}
+        }
+    }
+    Ok(selected
+        .into_iter()
+        .filter_map(|(panel_id, (task_id, attempt_id))| {
+            (!closed.contains(&panel_id)).then_some((panel_id, task_id, attempt_id))
+        })
+        .collect())
+}
+
+fn validate_runtime_event_append_v1(
+    root: &Path,
+    existing: &[EventRecord],
+    proposed: &[EventRecord],
+    round: &str,
+) -> Result<()> {
+    let transition = proposed.iter().find(|event| {
+        matches!(
+            event.kind.as_str(),
+            "RuntimePolicyActivated" | "RuntimePolicyDeactivated"
+        )
+    });
+    if let Some(transition) = transition {
+        if proposed.len() != 1 {
+            bail!("runtime policy transition 必须是单事件 scoped batch");
+        }
+        crate::plan::ensure_runtime_policy_transition_idle(round, existing)?;
+        let captured_main = match decode_runtime_event_v1(transition)? {
+            Some(RuntimeEventPayloadV1::RuntimePolicyActivated(payload)) => {
+                payload.activated_at_main_sha
+            }
+            Some(RuntimeEventPayloadV1::RuntimePolicyDeactivated(payload)) => {
+                payload.deactivated_at_main_sha
+            }
+            _ => unreachable!("transition kind was matched above"),
+        };
+        if crate::gitx::rev_parse(root, "refs/heads/main^{commit}")? != captured_main {
+            bail!("runtime policy transition captured main 已漂移");
+        }
+    }
+    let mut complete = Vec::with_capacity(existing.len() + proposed.len());
+    complete.extend_from_slice(existing);
+    complete.extend_from_slice(proposed);
+    validate_runtime_event_history_v1_at_root(root, &complete, round)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -676,23 +2856,25 @@ pub(crate) fn gate_storage_pair_state(
     round: &str,
     identity: GateAuditIdentity<'_>,
 ) -> GateStoragePairState {
-    events.iter().fold(GateStoragePairState::NeverSeen, |state, event| {
-        let Some(audit) = canonical_gate_storage_audit_event(event) else {
-            return state;
-        };
-        if audit.round != round || audit.identity != identity {
-            return state;
-        }
-        match (state, audit.recovered) {
-            // An unpaired recovery is inert evidence, never authority to synthesize a cleared
-            // refusal lane. The dedicated admission transition treats it as a no-op; ordinary
-            // historical append compatibility cannot make it count as paired.
-            (GateStoragePairState::NeverSeen, true) => GateStoragePairState::NeverSeen,
-            (_, false) => GateStoragePairState::Refused,
-            (GateStoragePairState::Refused, true) => GateStoragePairState::Recovered,
-            (GateStoragePairState::Recovered, true) => GateStoragePairState::Recovered,
-        }
-    })
+    events
+        .iter()
+        .fold(GateStoragePairState::NeverSeen, |state, event| {
+            let Some(audit) = canonical_gate_storage_audit_event(event) else {
+                return state;
+            };
+            if audit.round != round || audit.identity != identity {
+                return state;
+            }
+            match (state, audit.recovered) {
+                // An unpaired recovery is inert evidence, never authority to synthesize a cleared
+                // refusal lane. The dedicated admission transition treats it as a no-op; ordinary
+                // historical append compatibility cannot make it count as paired.
+                (GateStoragePairState::NeverSeen, true) => GateStoragePairState::NeverSeen,
+                (_, false) => GateStoragePairState::Refused,
+                (GateStoragePairState::Refused, true) => GateStoragePairState::Recovered,
+                (GateStoragePairState::Recovered, true) => GateStoragePairState::Recovered,
+            }
+        })
 }
 
 fn nonempty_string(value: Option<&serde_json::Value>) -> bool {
@@ -954,6 +3136,101 @@ fn unresolved_merge_barrier(events: &[EventRecord]) -> MergeBarrierState {
     state
 }
 
+/// The disposition of one proposed append while a merge barrier is active.
+///
+/// Lifecycle candidates still pass through the existing canonical validators. The distinct
+/// observation variant is intentionally state-inert: accepting it never changes whether the
+/// merge has executed and never closes the barrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BarrierAppendVerdict {
+    /// A merge lifecycle candidate whose canonical arm may advance or close the barrier.
+    LifecycleAdvance,
+    /// A same-task, same-round runtime observation that may append without moving the barrier.
+    TransparentObservation,
+    /// An event that the active barrier refuses, together with the exact refusal reason.
+    Refused {
+        /// Human-readable reason identifying which barrier identity or kind check failed.
+        reason: String,
+    },
+}
+
+/// Classify an append against the narrow public surface of an active merge barrier.
+///
+/// `GateExecuted` for the exact task/round is transparent before merge; after
+/// merge, only a canonical postmerge `GateReused` may share that observation
+/// lane. Lifecycle kinds are routed to their existing canonical validation;
+/// every other kind, actor, task, or round is refused here.
+pub fn classify_barrier_append(
+    event: &EventRecord,
+    barrier_task: &str,
+    barrier_round: &str,
+    merge_executed: bool,
+) -> BarrierAppendVerdict {
+    if event.kind == "GateExecuted" {
+        if event.actor != "runtime:orch" {
+            return BarrierAppendVerdict::Refused {
+                reason: format!("GateExecuted actor {} != runtime:orch", event.actor),
+            };
+        }
+        if event.task_id.as_deref() != Some(barrier_task) {
+            return BarrierAppendVerdict::Refused {
+                reason: format!(
+                    "GateExecuted task {} != barrier task {barrier_task}",
+                    event.task_id.as_deref().unwrap_or("<none>")
+                ),
+            };
+        }
+        if event.round.as_deref() != Some(barrier_round) {
+            return BarrierAppendVerdict::Refused {
+                reason: format!(
+                    "GateExecuted round {} != barrier round {barrier_round}",
+                    event.round.as_deref().unwrap_or("<none>")
+                ),
+            };
+        }
+        return BarrierAppendVerdict::TransparentObservation;
+    }
+
+    if event.kind == "GateReused" {
+        let canonical = merge_executed
+            && canonical_runtime_event_v1(event, barrier_round).is_ok_and(|value| value)
+            && event.task_id.as_deref() == Some(barrier_task)
+            && matches!(
+                decode_runtime_event_v1(event),
+                Ok(Some(RuntimeEventPayloadV1::GateReused(ref payload)))
+                    if payload.target_phase == "postmerge"
+            );
+        return if canonical {
+            BarrierAppendVerdict::TransparentObservation
+        } else {
+            BarrierAppendVerdict::Refused {
+                reason: "GateReused is not an exact postmerge observation for the active barrier"
+                    .to_string(),
+            }
+        };
+    }
+
+    if event.kind == "MergeExecuted" {
+        return if merge_executed {
+            BarrierAppendVerdict::Refused {
+                reason: "active barrier already observed MergeExecuted".to_string(),
+            }
+        } else {
+            BarrierAppendVerdict::LifecycleAdvance
+        };
+    }
+    if matches!(event.kind.as_str(), "EscalationRaised" | "TaskRecorded") {
+        return BarrierAppendVerdict::LifecycleAdvance;
+    }
+
+    BarrierAppendVerdict::Refused {
+        reason: format!(
+            "active merge barrier refuses non-lifecycle event {}",
+            event.kind
+        ),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MergeBarrierState {
     Open,
@@ -1002,6 +3279,17 @@ impl MergeBarrierState {
                 Ok(())
             }
             Self::Active(barrier) => {
+                if matches!(
+                    classify_barrier_append(
+                        event,
+                        &barrier.task_id,
+                        &barrier.round,
+                        barrier.merge_executed,
+                    ),
+                    BarrierAppendVerdict::TransparentObservation
+                ) {
+                    return Ok(());
+                }
                 if canonical_merge_executed(event, barrier) {
                     if barrier.merge_executed {
                         bail!(
@@ -1103,9 +3391,7 @@ fn validate_merge_barrier_append(existing: &[EventRecord], proposed: &[EventReco
 #[derive(Debug, Clone, Copy)]
 enum AppendAuthority {
     Ordinary,
-    StorageAudit {
-        merge_lifecycle_capability: bool,
-    },
+    StorageAudit { merge_lifecycle_capability: bool },
 }
 
 fn validate_storage_audit_append(
@@ -1128,9 +3414,9 @@ fn validate_storage_audit_append(
     }
     match current_round_pointer(root)? {
         Some(current) if current == round => {}
-        Some(current) => bail!(
-            "storage audit append 目标轮 {round} 与 CURRENT-ROUND {current} 不一致，拒绝"
-        ),
+        Some(current) => {
+            bail!("storage audit append 目标轮 {round} 与 CURRENT-ROUND {current} 不一致，拒绝")
+        }
         None => bail!("storage audit append 缺 CURRENT-ROUND，拒绝"),
     }
 
@@ -1139,23 +3425,13 @@ fn validate_storage_audit_append(
         if !merge_lifecycle_capability {
             bail!(
                 "{}；storage audit 缺 exclusive merge lifecycle capability",
-                rejection_message(
-                    &event.kind,
-                    audit.task_id,
-                    &active.task_id,
-                    &active.round,
-                )
+                rejection_message(&event.kind, audit.task_id, &active.task_id, &active.round,)
             );
         }
         if audit.task_id != active.task_id || audit.round != active.round {
             bail!(
                 "{}；storage audit 必须绑定 active barrier exact task/round",
-                rejection_message(
-                    &event.kind,
-                    audit.task_id,
-                    &active.task_id,
-                    &active.round,
-                )
+                rejection_message(&event.kind, audit.task_id, &active.task_id, &active.round,)
             );
         }
     }
@@ -1174,8 +3450,9 @@ fn validate_storage_audit_append(
         // A concurrent guard may have observed the same old ledger before either writer acquired
         // the lock.  Fresh locked state makes the loser an idempotent no-op instead of a duplicate
         // refusal/recovery or a spurious gate failure.
-        (GateStoragePairState::Refused, false)
-        | (GateStoragePairState::Recovered, true) => Ok(false),
+        (GateStoragePairState::Refused, false) | (GateStoragePairState::Recovered, true) => {
+            Ok(false)
+        }
         (GateStoragePairState::NeverSeen, false)
         | (GateStoragePairState::Recovered, false)
         | (GateStoragePairState::Refused, true) => Ok(true),
@@ -1210,7 +3487,10 @@ fn guard_merge_lifecycle_authority(
     existing: &[EventRecord],
     proposed: &[EventRecord],
 ) -> Result<()> {
-    if !batch_touches_merge_lifecycle(existing, proposed) {
+    let contains_frozen_supersession = proposed
+        .iter()
+        .any(|event| event.kind == "FrozenContractSuperseded");
+    if !contains_frozen_supersession && !batch_touches_merge_lifecycle(existing, proposed) {
         return Ok(());
     }
     if !crate::close::has_merge_lifecycle_capability(root)? {
@@ -1224,6 +3504,16 @@ fn guard_merge_lifecycle_authority(
         if current != round {
             bail!("merge lifecycle append 目标轮 {round} 与 CURRENT-ROUND {current} 不一致，拒绝");
         }
+    }
+    if contains_frozen_supersession || proposed.iter().any(|event| event.kind == "TaskRecorded") {
+        // Capability is only the outer admission token.  Reconstruct the full
+        // signed TaskRecorded -> Frozen* -> SiteRetired* -> optional relaxation
+        // suffix while the ledger lock still protects `existing`; this also
+        // catches an authorized non-empty declaration whose Frozen event was
+        // omitted entirely.
+        crate::verify::validate_frozen_contract_supersession_append(
+            root, round, existing, proposed,
+        )?;
     }
     Ok(())
 }
@@ -1463,17 +3753,219 @@ pub fn append(root: &Path, round: &str, events: &[EventRecord]) -> Result<()> {
     })
 }
 
+struct ScopedAccountingIndexGuard(PathBuf);
+
+impl Drop for ScopedAccountingIndexGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+        let mut lock = self.0.as_os_str().to_os_string();
+        lock.push(".lock");
+        let _ = fs::remove_file(PathBuf::from(lock));
+    }
+}
+
+fn run_scoped_git(
+    root: &Path,
+    args: &[&str],
+    index: Option<&Path>,
+    context: &str,
+) -> Result<Vec<u8>> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(root).args(args);
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    let output = command
+        .output()
+        .with_context(|| format!("启动 scoped accounting git {args:?} 失败"))?;
+    if !output.status.success() {
+        bail!(
+            "{context}: git {args:?} 失败({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
+/// Commit only the current round ledger and optional canonical review blobs
+/// onto `refs/heads/main` with a one-parent CAS.  A temporary index preserves
+/// unrelated staged/worktree changes; retries that observe the exact committed
+/// bytes are idempotent.  The caller must already own an exclusive protocol
+/// transition spanning append through this commit.
+pub fn commit_scoped_accounting_paths(
+    root: &Path,
+    round: &str,
+    paths: &[String],
+    message: &str,
+) -> Result<String> {
+    if message.trim().is_empty() {
+        bail!("scoped accounting commit message 不能为空");
+    }
+    if !matches!(
+        crate::close::protocol_lease_kind(root)?,
+        crate::close::ProtocolLeaseKind::Exclusive
+    ) {
+        bail!("scoped accounting commit requires an exclusive protocol transition");
+    }
+    let ledger_rel = format!("coordination/rounds/{round}/events.jsonl");
+    let review_prefix = format!("coordination/rounds/{round}/reviews/");
+    let mut selected = paths.to_vec();
+    selected.sort();
+    selected.dedup();
+    if selected.is_empty()
+        || !selected.iter().any(|path| path == &ledger_rel)
+        || selected.iter().any(|path| {
+            path != &ledger_rel
+                && (!path.starts_with(&review_prefix)
+                    || !path.ends_with(".md")
+                    || !canonical_relative_path(path))
+        })
+    {
+        bail!("scoped accounting paths 只允许 current ledger + current round canonical reviews");
+    }
+    for rel in &selected {
+        let path = root.join(rel);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("scoped accounting path 不存在: {rel}"))?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            bail!("scoped accounting path 必须是 regular non-symlink: {rel}");
+        }
+    }
+    let main = crate::gitx::rev_parse(root, "refs/heads/main^{commit}")?;
+    if crate::gitx::current_branch(root)?.as_deref() != Some("main")
+        || crate::gitx::rev_parse(root, "HEAD")? != main
+    {
+        bail!("scoped accounting commit 要求主工作区检出 main 且 HEAD==main");
+    }
+    let committed = selected.iter().all(|rel| {
+        crate::gitx::show_bytes(root, &main, rel)
+            .ok()
+            .and_then(|bytes| fs::read(root.join(rel)).ok().map(|current| bytes == current))
+            == Some(true)
+    });
+    let selected_refs = selected.iter().map(String::as_str).collect::<Vec<_>>();
+    if committed {
+        let mut args = vec!["add", "--"];
+        args.extend(selected_refs.iter().copied());
+        run_scoped_git(root, &args, None, "align committed accounting index")?;
+        return Ok(main);
+    }
+
+    let scratch = root.join(".cowork-temp");
+    match fs::symlink_metadata(&scratch) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!("scoped accounting scratch 必须是 real directory")
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&scratch).context("创建 scoped accounting scratch 失败")?;
+            let metadata = fs::symlink_metadata(&scratch)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!("new scoped accounting scratch 不是 real directory");
+            }
+        }
+        Err(error) => return Err(error).context("检查 scoped accounting scratch 失败"),
+    }
+    let temp_index = scratch.join(format!(
+        "runtime-accounting-{}-{}.index",
+        std::process::id(),
+        ulid::Ulid::new()
+    ));
+    let _guard = ScopedAccountingIndexGuard(temp_index.clone());
+    run_scoped_git(
+        root,
+        &["read-tree", &main],
+        Some(&temp_index),
+        "initialize scoped accounting index",
+    )?;
+    let mut add = vec!["add", "--"];
+    add.extend(selected_refs.iter().copied());
+    run_scoped_git(
+        root,
+        &add,
+        Some(&temp_index),
+        "stage scoped accounting paths",
+    )?;
+    let tree = String::from_utf8(run_scoped_git(
+        root,
+        &["write-tree"],
+        Some(&temp_index),
+        "write scoped accounting tree",
+    )?)
+    .context("scoped accounting tree id 非 UTF-8")?
+    .trim()
+    .to_string();
+    if !valid_full_sha_text(&tree) {
+        bail!("scoped accounting write-tree 未返回 full SHA");
+    }
+    let commit = String::from_utf8(run_scoped_git(
+        root,
+        &["commit-tree", &tree, "-p", &main, "-m", message],
+        None,
+        "create scoped accounting commit",
+    )?)
+    .context("scoped accounting commit id 非 UTF-8")?
+    .trim()
+    .to_string();
+    if !valid_full_sha_text(&commit) {
+        bail!("scoped accounting commit-tree 未返回 full SHA");
+    }
+    let changed = String::from_utf8(run_scoped_git(
+        root,
+        &["diff-tree", "--no-commit-id", "--name-only", "-r", &main, &commit],
+        None,
+        "inspect scoped accounting commit",
+    )?)
+    .context("scoped accounting changed-path output 非 UTF-8")?
+    .lines()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    let changed_set = changed.iter().map(String::as_str).collect::<std::collections::BTreeSet<_>>();
+    let selected_set = selected_refs.iter().copied().collect::<std::collections::BTreeSet<_>>();
+    if changed_set != selected_set {
+        bail!(
+            "scoped accounting commit changed-path 漂移: expected={selected_set:?} actual={changed_set:?}"
+        );
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["update-ref", "refs/heads/main", &commit, &main])
+        .env("ORCH_MAIN_GUARD_CONTEXT", "runtime-accounting")
+        .output()
+        .context("启动 scoped accounting main CAS 失败")?;
+    if !output.status.success() {
+        bail!(
+            "scoped accounting main CAS 失败({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut align = vec!["add", "--"];
+    align.extend(selected_refs.iter().copied());
+    run_scoped_git(root, &align, None, "align scoped accounting real index")?;
+    if crate::gitx::rev_parse(root, "HEAD")? != commit
+        || crate::gitx::rev_parse(root, "refs/heads/main")? != commit
+    {
+        bail!("scoped accounting CAS 后 HEAD/main 未指向新 commit");
+    }
+    let mut diff = vec!["diff", "--exit-code", "HEAD", "--"];
+    diff.extend(selected_refs.iter().copied());
+    run_scoped_git(root, &diff, None, "verify scoped accounting worktree bytes")?;
+    let mut cached = vec!["diff", "--cached", "--exit-code", "HEAD", "--"];
+    cached.extend(selected_refs.iter().copied());
+    run_scoped_git(root, &cached, None, "verify scoped accounting index bytes")?;
+    Ok(commit)
+}
+
 /// Apply one exact gate-storage admission decision. Merge authority is captured
 /// before entering the ordinary ledger-effect wrapper, which deliberately
 /// strips ambient lifecycle authority from arbitrary descendants.  The fresh
 /// barrier and exact refusal/recovery pair are read later under the ledger lock.
 /// A recovery without a current refusal is an idempotent no-op, never an
 /// unpaired durable fact.
-pub(crate) fn append_storage_audit(
-    root: &Path,
-    round: &str,
-    event: EventRecord,
-) -> Result<()> {
+pub(crate) fn append_storage_audit(root: &Path, round: &str, event: EventRecord) -> Result<()> {
     let merge_lifecycle_capability = crate::close::has_merge_lifecycle_capability(root)?;
     crate::close::with_protocol_ledger_effect(root, "ledger storage audit", || {
         let mut noop = |_: AtomicBatchStage| Ok(());
@@ -2998,6 +5490,7 @@ fn append_under_effect_with_control(
     };
     validate_cross_arm_conflicts(&snapshot)?;
     let existing_events = snapshot.ledger.events();
+    validate_runtime_event_append_v1(root, &existing_events, events, round)?;
     let should_append = match authority {
         AppendAuthority::Ordinary => {
             guard_merge_lifecycle_authority(root, round, &existing_events, events)?;
@@ -3213,6 +5706,7 @@ where
         }
     }
     let new_events = decide(&existing_events)?;
+    validate_runtime_event_append_v1(root, &existing_events, &new_events, round)?;
     guard_merge_lifecycle_authority(root, round, &existing_events, &new_events)?;
     validate_merge_barrier_append(&existing_events, &new_events)?;
     if new_events.is_empty() {
