@@ -1,0 +1,20 @@
+[package]
+name = "orch-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Harness 调用通道与轻量 fusion CLI；任务机械由 selfhost feature 提供"
+
+[features]
+default = []
+selfhost = ["orch-host/selfhost"]
+
+[[bin]]
+name = "orch"
+path = "src/main.rs"
+
+[dependencies]
+orch-core = { path = "../orch-core" }
+orch-host = { path = "../orch-host" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"

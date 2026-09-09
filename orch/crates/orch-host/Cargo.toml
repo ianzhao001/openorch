@@ -1,0 +1,25 @@
+[package]
+name = "orch-host"
+version = "0.1.0"
+edition = "2021"
+description = "多 Agent 协同机制：IO 宿主层（git/worktree、Tier S 适配器、门执行、账本追加）"
+
+[features]
+default = []
+selfhost = []
+
+[dependencies]
+orch-core = { path = "../orch-core" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# TODO(design/05 选型注)：serde_yaml 已停维护，藏于 binding/card 薄封装后，可换维护 fork
+serde_yaml = "0.9"
+ulid = "1"
+fd-lock = "4"
+humantime = "2"
+wait-timeout = "0.2"
+sha2 = "0.10"
+hex = "0.4"
+# FSEvents 加速器（design/05 §5：扫描是保证，事件只是闹钟）——macOS 走 FSEvents 后端
+notify = "8"

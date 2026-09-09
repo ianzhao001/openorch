@@ -1,0 +1,152 @@
+//! B184 seed — Cargo-built CLI path is the only executable truth.
+//!
+//! B329: current target evolves for the authorized schedule retirement; historical B184 seed sources and commits stay unchanged.
+//!
+//! M1: restore a `<manifest>/../../target/debug/orch` path -> isolated target differs.
+//! M2: use `current_exe()` -> that is this integration-test harness, not the CLI.
+//! M3: leave any real subprocess regression in `main.rs`, or omit it from the
+//!     integration runtime target -> the exact migration inventory fails.
+//! M4: special-case stale-binary coverage or another integration target instead
+//!     of using the shared helper -> the shared-helper inventory fails.
+
+mod support;
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use support::orch_bin;
+
+const MOVED_SUBPROCESS_TESTS: [&str; 11] = [
+    "orch_current_is_idempotent_and_consistent",
+    "orch_current_refuses_bad_ledger",
+    "doctor_reports_current_md_missing_as_warn",
+    "doctor_shows_current_md_consistent_after_generate",
+    "cli_dry_run_uses_current_round_and_does_not_write",
+    "cli_apply_refuses_divergence_at_human_line_without_mutation",
+    "doctor_reports_both_real_closed_round_review_replays_without_writing",
+    "staged_rename_outside_audit_domain_still_names_the_old_source",
+    "staged_rename_to_summary_still_names_the_old_source",
+    "new_closed_artifacts_get_manual_quarantine_guidance_not_git_show",
+    "true_post_close_summary_and_open_round_work_stay_benign",
+];
+
+const CLI_INTEGRATION_TARGETS: [&str; 11] = [
+    "cli_process_runtime.rs",
+    "consult_cli.rs",
+    "dispatch_override_cli.rs",
+    "handshake_cli.rs",
+    "guide_cli.rs",
+    "root_verdict_cli.rs",
+    "standalone_channel_v1.rs",
+    "stale_binary_cli.rs",
+    "wake_message_cli.rs",
+    "review_reconcile_cli.rs",
+    "wake_signal_isolation_cli.rs",
+];
+
+fn tests_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests")
+}
+
+#[test]
+fn cargo_supplied_binary_is_the_only_executable_truth() {
+    let expected = PathBuf::from(env!("CARGO_BIN_EXE_orch"));
+    let actual = orch_bin();
+    assert_eq!(
+        actual, expected,
+        "the helper must return Cargo's exact path without fallback or canonicalization"
+    );
+    assert!(
+        actual.is_absolute(),
+        "Cargo's CLI path must be absolute: {actual:?}"
+    );
+    assert!(
+        fs::metadata(&actual)
+            .map(|meta| meta.is_file())
+            .unwrap_or(false),
+        "Cargo's CLI path must name a built regular file: {actual:?}"
+    );
+
+    let harness = std::env::current_exe().expect("resolve integration-test harness");
+    assert_ne!(
+        actual, harness,
+        "current_exe is the libtest harness and must never stand in for orch"
+    );
+
+    let output = Command::new(&actual)
+        .arg("--help")
+        .output()
+        .expect("launch Cargo-built orch --help");
+    assert!(
+        output.status.success(),
+        "Cargo-built orch --help failed; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Usage:"),
+        "the launched file must be the real clap CLI"
+    );
+}
+
+#[test]
+fn retained_subprocess_tests_stay_unique_and_retired_tests_stay_absent() {
+    let main_source = include_str!("../src/main.rs");
+    let runtime_path = tests_dir().join("cli_process_runtime.rs");
+    let runtime_source = fs::read_to_string(&runtime_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", runtime_path.display()));
+
+    for name in MOVED_SUBPROCESS_TESTS {
+        let declaration = format!("fn {name}(");
+        assert!(
+            !main_source.contains(&declaration),
+            "{name} must not remain in the binary unit-test harness"
+        );
+        assert_eq!(
+            runtime_source.matches(&declaration).count(),
+            1,
+            "{name} must exist exactly once in cli_process_runtime.rs"
+        );
+    }
+
+    for name in [
+        "schedule_cli_one_crash_keeps_candidate_and_is_readonly",
+        "schedule_cli_two_strikes_escalates_down_the_chain",
+    ] {
+        let declaration = format!("fn {name}(");
+        assert_eq!(runtime_source.matches(&declaration).count(), 0,
+            "retired schedule case must not return in cli_process_runtime.rs: {name}");
+        assert_eq!(main_source.matches(&declaration).count(), 0,
+            "retired schedule case must not return in main.rs: {name}");
+    }
+
+    let local_helper = ["fn orch_", "bin()"].concat();
+    assert!(
+        !main_source.contains(&local_helper),
+        "main.rs must not retain a test-only executable path algorithm"
+    );
+}
+
+#[test]
+fn every_real_cli_integration_target_uses_one_shared_helper() {
+    let tests = tests_dir();
+    let local_helper = ["fn orch_", "bin()"].concat();
+    for relative in CLI_INTEGRATION_TARGETS {
+        let path = tests.join(relative);
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        assert!(
+            source.contains("mod support;"),
+            "{relative} must import the shared integration-test support module"
+        );
+        assert!(
+            source.contains("support::orch_bin"),
+            "{relative} must consume support::orch_bin"
+        );
+        assert!(
+            !source.contains(&local_helper),
+            "{relative} must not define another executable path algorithm"
+        );
+    }
+}
