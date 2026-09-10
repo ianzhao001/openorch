@@ -1,0 +1,3 @@
+- insert:
+    - id: openorch-skill-provider
+      name: openorch

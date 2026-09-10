@@ -574,8 +574,11 @@ db,sid,cwd,prompt,answer=sys.argv[1:]; c=sqlite3.connect(db)
 c.executescript('CREATE TABLE cowork_sessions(id TEXT,title TEXT,status TEXT,cwd TEXT); CREATE TABLE cowork_messages(id TEXT,session_id TEXT,type TEXT,content TEXT,metadata TEXT,sequence INTEGER);')
 c.execute('INSERT INTO cowork_sessions VALUES(?,?,?,?)',('native-1','multica:'+sid,'completed',cwd))
 c.execute('INSERT INTO cowork_messages VALUES(?,?,?,?,?,?)',('user-1','native-1','user',prompt,'{}',0))
-c.execute('INSERT INTO cowork_messages VALUES(?,?,?,?,?,?)',('process-1','native-1','assistant','PROCESS PASS marker','{}',1))
-c.execute('INSERT INTO cowork_messages VALUES(?,?,?,?,?,?)',('final-1','native-1','assistant',answer,json.dumps({'isFinal':True}),2))
+c.execute('INSERT INTO cowork_messages VALUES(?,?,?,?,?,?)',('tool-1','native-1','tool_use','',json.dumps({'toolUseId':'native-tool'}),1))
+c.execute('INSERT INTO cowork_messages VALUES(?,?,?,?,?,?)',('denied-1','native-1','tool_result','Not executed: denied',json.dumps({'toolUseId':'native-tool','isError':True}),2))
+c.execute('INSERT INTO cowork_messages VALUES(?,?,?,?,?,?)',('denied-note','native-1','system','Native policy denied the tool','{}',3))
+c.execute('INSERT INTO cowork_messages VALUES(?,?,?,?,?,?)',('denied-2','native-1','tool_result','denied',json.dumps({'toolUseId':'native-tool','isError':True}),4))
+c.execute('INSERT INTO cowork_messages VALUES(?,?,?,?,?,?)',('final-1','native-1','assistant',answer,json.dumps({'isFinal':True}),5))
 c.commit()
 "#;
         assert!(Command::new("/usr/bin/python3")
@@ -642,6 +645,32 @@ c.commit()
                 managed_wake_terminated_event_with_record(round, Some(task), &closed, answer);
             attach_channel_action_binding(&native_wake, &mut event).unwrap();
             validate_unified_channel_terminal_shape(&native_wake, &event).unwrap();
+        }
+        // A completed native denial graph must not launder a supervisor deadline.
+        for claimed_terminal in [false, true] {
+            let mut deadline = status.clone();
+            deadline.completion_reason = ManagedWakeStopReason::HardDeadline;
+            deadline.hard_deadline_reached = true;
+            deadline.exited_naturally = false;
+            deadline.signals = vec!["TERM".into()];
+            deadline.exit_status = Some(-15);
+            deadline.terminal_seen = claimed_terminal;
+            let (closed, record) = terminal_record_from_status(
+                &root, &native_wake, &deadline,
+                crate::harness::CapabilitySource::Derived, &native_events,
+            ).unwrap();
+            assert_eq!(record.state, crate::harness::TerminalState::TimedOut);
+            assert!(!closed.terminal_seen);
+            assert_eq!(closed.completion_reason, ManagedWakeStopReason::HardDeadline);
+            assert_eq!(closed.signals, vec!["TERM"]);
+            assert_eq!(closed.exit_status, Some(-15));
+            assert_eq!(deadline.terminal_seen, claimed_terminal, "raw status is immutable");
+            let mut terminal = managed_wake_terminated_event_with_record(
+                round, Some(task), &closed, record,
+            );
+            attach_channel_action_binding(&native_wake, &mut terminal).unwrap();
+            validate_unified_channel_terminal_shape(&native_wake, &terminal).unwrap();
+            assert_eq!(payload_string(&terminal, "outcomeClass"), Some("StoppedByHardDeadline"));
         }
         let projection_path = log_path.with_extension("native-projection.json");
         let published = fs::read(&projection_path).unwrap();

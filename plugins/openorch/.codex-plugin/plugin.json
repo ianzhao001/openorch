@@ -1,0 +1,19 @@
+{
+  "name": "openorch",
+  "version": "0.1.0-alpha.4",
+  "description": "Consult your installed AI harnesses and combine their answers in Codex or DSH.",
+  "author": {"name": "ianzhao"},
+  "repository": "https://github.com/ianzhao001/openorch",
+  "homepage": "https://github.com/ianzhao001/openorch",
+  "license": "MIT",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "OpenOrch",
+    "shortDescription": "Consult one or several local AI harnesses.",
+    "longDescription": "Choose your own native clients and models, reuse personal defaults across Git projects, and synthesize answers with their original evidence.",
+    "developerName": "ianzhao",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": ["Set up OpenOrch for this project.", "Use OpenOrch to consult my default advisor.", "Use OpenOrch fusion and summarize the disagreements."]
+  }
+}

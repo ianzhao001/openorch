@@ -44,7 +44,7 @@ try:
     if not isinstance(user['content'],str) or hashlib.sha256(user['content'].encode('utf8')).hexdigest()!=wanted: stop('native request bytes differ from invocation')
     if not isinstance(user['sequence'],int) or user['sequence']<0: stop('native request sequence invalid')
     out['request']={'id':user['id'],'sequence':user['sequence'],'sha256':wanted}
-    pending=set(); finals=[]
+    pending=set(); declared=set(); results={}; finals=[]
     for row in con.execute('SELECT id,type,sequence,metadata FROM cowork_messages WHERE session_id=? AND sequence>? ORDER BY sequence',(session['id'],user['sequence'])):
         if time.monotonic()-started>2: stop('native observation budget exceeded')
         meta=json.loads(row['metadata'] or '{}')
@@ -52,11 +52,20 @@ try:
         if row['type']=='tool_use':
             tool_id=meta.get('toolUseId') or row['id']
             if not isinstance(tool_id,str) or not tool_id: stop('native tool identity missing')
+            if tool_id in declared: stop('native tool use identity repeated')
+            declared.add(tool_id)
             pending.add(tool_id)
         elif row['type']=='tool_result':
             tool_id=meta.get('toolUseId')
-            if not isinstance(tool_id,str) or tool_id not in pending: stop('native tool result identity ambiguous')
-            pending.remove(tool_id)
+            if not isinstance(tool_id,str) or tool_id not in declared: stop('native tool result identity ambiguous')
+            if tool_id in pending:
+                pending.remove(tool_id)
+                results[tool_id]={'allErrors':meta.get('isError') is True,'ids':[row['id']]}
+            else:
+                first=results[tool_id]
+                if not first['allErrors'] or meta.get('isError') is not True:
+                    stop('native repeated tool result is not strictly an error receipt')
+                first['ids'].append(row['id'])
         elif row['type']=='assistant' and meta.get('isFinal') is True:
             finals.append((row['id'],row['sequence']))
     if pending: stop('native tools remain pending')
@@ -64,6 +73,9 @@ try:
     # EOF alone therefore cannot authorize native cleanup or a completed wave.
     if session['status']!='completed': stop('native session completion is not established')
     out['nativeTerminated']=True
+    repeated=[{'toolUseId':key,'resultCount':len(value['ids']),'resultIds':value['ids']}
+              for key,value in results.items() if len(value['ids'])>1]
+    if repeated: out['duplicateErrorReceipts']=repeated
     if len(finals)!=1: stop('native final missing or ambiguous')
     final_id,sequence=finals[0]
     text=con.execute('SELECT content FROM cowork_messages WHERE session_id=? AND id=?',(session['id'],final_id)).fetchone()[0]
@@ -377,6 +389,108 @@ c.close(); s.close()
         let value = inspect_native_final(&root, &database, "orch-wake-native-fixture", &root, &expected, &raw(), true).unwrap();
         assert_eq!(value["nativeTerminated"], false);
         assert!(value["final"].is_null());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn receipt_graph_fixture(root: &Path, variant: &str) -> std::path::PathBuf {
+        let database = root.join(format!("{variant}.sqlite"));
+        let input = json!({"cwd": root, "variant": variant});
+        let script = r#"
+import json,sqlite3,sys
+database,encoded=sys.argv[1:]; data=json.loads(encoded); variant=data['variant']
+con=sqlite3.connect(database)
+con.executescript('CREATE TABLE cowork_sessions(id TEXT PRIMARY KEY,title TEXT,status TEXT,cwd TEXT); CREATE TABLE cowork_messages(id TEXT PRIMARY KEY,session_id TEXT,type TEXT,content TEXT,metadata TEXT,sequence INTEGER);')
+status=variant if variant in ('running','error') else 'completed'
+cwd=data['cwd'] if variant!='wrong-cwd' else data['cwd']+'/different'
+con.execute('INSERT INTO cowork_sessions VALUES(?,?,?,?)',('native-errors','multica:orch-wake-native-fixture',status,cwd))
+rows=[]
+def add(identity,kind,text,metadata): rows.append((identity,'native-errors',kind,text,json.dumps(metadata),len(rows)))
+prompt='exact denial request' if variant!='wrong-request' else 'different request'
+add('user','user',prompt,{})
+add('use','tool_use','',{'toolUseId':'tool-1'})
+if variant=='duplicate-use': add('use-copy','tool_use','',{'toolUseId':'tool-1'})
+first={'toolUseId':'tool-1','toolName':'Bash','isError':True}
+second=dict(first)
+if variant in ('duplicate-success','mixed-first-success'): first['isError']=False
+if variant in ('duplicate-success','mixed-second-success'): second['isError']=False
+if variant=='missing-error-flag': second.pop('isError')
+if variant=='string-error-flag': second['isError']='true'
+if variant=='numeric-error-flag': second['isError']=1
+if variant=='unknown-id': second['toolUseId']='never-declared'
+if variant!='pending':
+    add('result-first','tool_result','The tool was not executed. Permission denied.',first)
+    if variant=='reused-use': add('use-again','tool_use','',{'toolUseId':'tool-1'})
+    if variant!='duplicate-use':
+        add('denial-note','system','The native policy rejected the tool.',{})
+        add('result-second','tool_result','Permission denied.',second)
+if variant=='duplicate-user': add('second-user','user',prompt,{})
+if variant!='missing-final':
+    text=' ' if variant=='empty-final' else 'complete native review'
+    final_flag='true' if variant=='string-final-flag' else True
+    add('final','assistant',text,{'isFinal':final_flag})
+    if variant=='duplicate-final': add('final-copy','assistant',text,{'isFinal':True})
+con.executemany('INSERT INTO cowork_messages VALUES(?,?,?,?,?,?)',rows)
+con.commit();con.close()
+"#;
+        assert!(Command::new("/usr/bin/python3").args(["-I", "-c", script])
+            .arg(&database).arg(input.to_string()).status().unwrap().success());
+        database
+    }
+
+    #[test]
+    fn completed_native_duplicate_error_receipts_preserve_each_receipt() {
+        let root = crate::util::test_scratch_dir("r86-native-duplicate-errors");
+        let database = receipt_graph_fixture(&root, "duplicate-errors");
+        let expected = hex::encode(Sha256::digest(b"exact denial request"));
+        let value = inspect_native_final(&root, &database, "orch-wake-native-fixture",
+            &root, &expected, b"closed but truncated raw", true).unwrap();
+        assert_eq!(value["nativeTerminated"], true, "{value}");
+        assert_eq!(value["projectionStatus"], "available", "{value}");
+        assert_eq!(value["final"]["text"], "complete native review");
+        assert_eq!(value["duplicateErrorReceipts"], json!([{
+            "toolUseId":"tool-1", "resultCount":2,
+            "resultIds":["result-first","result-second"]
+        }]));
+        assert!(without_text(&value)["final"].get("text").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_uses_unknown_results_and_successful_replays_remain_untrusted() {
+        let root = crate::util::test_scratch_dir("r86-native-error-graph-negative");
+        let expected = hex::encode(Sha256::digest(b"exact denial request"));
+        for variant in ["unknown-id", "duplicate-use", "reused-use",
+            "duplicate-success", "mixed-first-success", "mixed-second-success",
+            "missing-error-flag", "string-error-flag", "numeric-error-flag"] {
+            let database = receipt_graph_fixture(&root, variant);
+            let value = inspect_native_final(&root, &database, "orch-wake-native-fixture",
+                &root, &expected, &raw(), true).unwrap();
+            assert_eq!(value["nativeTerminated"], false, "{variant}: {value}");
+            assert_eq!(value["projectionStatus"], "unavailable", "{variant}: {value}");
+            assert!(value["final"].is_null(), "{variant}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn error_receipt_replays_never_replace_completion_or_final_identity() {
+        let root = crate::util::test_scratch_dir("r86-native-error-anchor-negative");
+        let expected = hex::encode(Sha256::digest(b"exact denial request"));
+        for variant in ["running", "error", "pending", "wrong-cwd", "wrong-request",
+            "duplicate-user", "missing-final", "duplicate-final", "empty-final",
+            "string-final-flag"] {
+            let database = receipt_graph_fixture(&root, variant);
+            let value = inspect_native_final(&root, &database, "orch-wake-native-fixture",
+                &root, &expected, &raw(), true).unwrap();
+            assert_eq!(value["projectionStatus"], "unavailable", "{variant}: {value}");
+            assert!(value["final"].is_null(), "{variant}");
+        }
+        let database = fixture(&root, "completed", "exact denial request", "ordinary final", "ordinary");
+        let value = inspect_native_final(&root, &database, "orch-wake-native-fixture",
+            &root, &expected, &raw(), true).unwrap();
+        assert_eq!(value["projectionStatus"], "available");
+        assert!(value.get("duplicateErrorReceipts").is_none(),
+            "normal historical observations must not acquire an empty new field");
         fs::remove_dir_all(root).unwrap();
     }
 }

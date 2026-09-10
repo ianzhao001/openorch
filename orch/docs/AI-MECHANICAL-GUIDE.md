@@ -414,9 +414,13 @@ hash 与 closed raw hash 的独立投影；不得从过程文本或 PASS/INPUT �
 文本不提供或否决投影权限；其原字节与hash仍保全。旧代际live parser继续只接受LF-complete终帧。
 原生仍运行、绑定歧义或观察不可用均 HOLD，receiptless 也不能跳过原生结束核验。已证明原生结束但
 缺有效 final 的调用只保留零票结果；有原生 final 也不能豁免 accepted receipt 或正式 review artifact。
+单个请求中的工具调用 ID 必须唯一，未知 ID 的结果或无结果调用仍拒绝。已声明 ID 的多条结果仅在
+全部为严格 boolean isError=true 时作为重复错误回执；成功、混合或非布尔重复仍 HOLD。重复原生行
+ID 与数量记录为 duplicateErrorReceipts；普通投影不添加空字段，原始数据库和回执逐字保留。
 新代际有效native final可覆盖socket的EOF诊断（wrapper70/71），但原退出码原样保留；72、显式取消、
 身份/请求不一致或未闭合状态不因已有正文而升级。旧wrapper终态ABI本身不变，只有新native证据源
 选择独立的作业终态；只改投影helper而让后续EOF分类继续否决终答不算交付。
+supervisor 的 hard-deadline/信号证据不会因晚到的 native final 变成自然结束或 answered。
 只有有效独立投影首次发布；相同字节 replay 幂等，已发布身份/final/raw 变化拒绝。已退役的 Panel
 spool、fixed-primary magic 或 descriptor-less bridge 不能产生新的 terminal。
 
