@@ -159,6 +159,26 @@ rejection 不释放 managed process/workspace 容量，attempt/root/TaskRecorded
 answered/failed/empty/timedOut/canceled 均在 exact release 后释放调用容量，但只有 answered + substantive artifact 可生成 `ReviewDelivered`，backend receipt
 本身不能替代 live terminal。
 
+已提交账本后缀对 backend acceptance receipt 保留精确形状：历史请求为20个既有字段，
+unified 请求恰多一个与唯一前驱 `WakeIssued` 完全一致的 `channelBinding`；通用 `review`
+角色同样须绑定唯一匹配的 `ReviewRequested`。缺失、额外、篡改字段或重复前驱仍拒绝。
+识别 accepted receipt 不认证原生结束，不产生审查票、交付或回收授权。
+
+当已接受的通用审查无法完成可信裁决时，root 可显式使用
+`verdict --verdict blocked --reason <原因> --quarantine-review <wakeId>`；可重复参数选择多席。
+仅限当前 schema3 task/attempt/fixed HEAD 的完整 request/wake/lease/accepted receipt，且没有
+terminal、delivery 或冲突 rejection。逐席 `ActionRejected(operation=review-quarantine)` 与同一
+BLOCKED 构成紧邻的原子记账批次；既有 verdict 门与 GateExecuted 记账保留。隔离记录七字段中的
+exitCode=5/alert=true 表示审查仍无法确认，成功记录 BLOCKED 的命令仍退出0；它不声称 wrapper 或
+原生作业已结束。dry-run 不新增业务事实，精确重放不重复追加；选择、原因或固定身份改变则拒绝。
+生成新裁决时，即使预演中已有未来 root 标记，仍须核对当前仓库与原始 cwd，不套用历史回放规则。
+
+隔离只结清裁决，为旧席保留零票。该记录不能用于 PASS/FAIL、不能替代后继审查，不会生成
+ManagedWakeTerminated、WorkspaceReleased、ReviewDelivered 或回收许可；无收据、无配对 BLOCKED、
+后置或篡改隔离均拒绝。accepted wake 及其 lease/容量继续保留，后继 TaskRecorded 不会退休仍 pending
+的旧现场。同 wake/同 attempt+harness 的身份拒绝保持；跨 attempt/跨轮的席位复用仍按操作者的原生
+结束核验与项目 HOLD 策略执行，此参数不新增自动重试或全局 alias 调度器。
+
 缺失 backend acceptance receipt 时，仅原生退出失败、已认证 hard-deadline 或 manual-cancel 的非自然退出终态，
 在明确记录 receipt absent、managed scope 已终止、无 answer/final/output 字节且无交付后可结清为零票；
 timeout 还要求没有取消请求；cancel 须为 canceled/StoppedByAuthenticatedCancel/manual-cancel、
@@ -895,6 +915,7 @@ manifest 保留码。本表不覆盖 `wake-opus-review.sh`、`wake-multica.sh` �
 | collect 报 live owner/Busy | 最新同 action 的 owner、generation、`leaseUntil` | 等租约到期后重跑 `await-report` | 不 kill、不伪造 release、不改时钟 |
 | collect 门红 | `GateExecuted`、完整日志、`ReportCollectReleased` | 修复真实原因或按 attempt 规则返工；再次收取会重新跑门 | 租约已释放不代表门会绿 |
 | review FAIL / root verdict FAIL·BLOCKED / PASS | 固定 HEAD、review/evidence binding、IR；root verdict 还须核对 exact actor、attempt identity 与 verdict payload | exact root FAIL/BLOCKED 可进入卡面定义的 repair/takeover 流程，并在修卡后重跑 `plan`；PASS 继续既有 `seal`/merge barrier | 非 root 或畸形 verdict 不释放 replan 守卫；不改审查产物冒充 PASS，也不以 replan 绕过 PASS merge barrier |
+| accepted generic review 缺可信终态且需放弃本次裁决 | exact task/attempt/HEAD、完整 request/wake/lease/receipt、无 terminal/delivery，保全原答卷与物理未知现场 | root 显式 BLOCKED + `--quarantine-review`，先 dry-run，再原子记账；后继用其它合格通道完整审查 | 隔离不代表原生结束，不放开原 alias/现场，不导入旧 PASS；不手写 rejection 或借 receiptless 路径放行 |
 | backend receipt degraded | exact wake、current `ReviewRequested`、immutable log window 与 degraded/rejection identity | 修复合法 request lineage 后只对 exact wake 做 late reconcile；保持现场 | 非零不证明 provider 未启动；不再 wake 双开、不手写 accepted receipt、不把 degraded 当 review/reissue 授权 |
 | stale-binary 拒绝状态变更 | build imprint 与 main 差异 | 用当前源码 locked rebuild，再重试原命令 | `--allow-stale-binary` 不是默认恢复 |
 | merge 后门红 | MergeStarted/MergeExecuted、失败门、main 拓扑 | 同一 tuple 重放 seal；旧专用恢复 CLI 已退役，额外历史逃生情形须保全证据并明确裁定 | 不 reset main，不伪造 TaskRecorded |

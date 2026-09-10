@@ -1,0 +1,345 @@
+[
+  {
+    "eventId": "01M2534J2BYWZSA5AX6YBC0QZM",
+    "ts": "2026-09-10T07:22:26Z",
+    "actor": "runtime:orch",
+    "type": "RoundOpened",
+    "round": "r83",
+    "payload": {
+      "contractSchemaVersion": 3,
+      "purpose": "lifecycle fixture"
+    },
+    "initiatorKind": "human-interactive",
+    "invocationMode": "unknown"
+  },
+  {
+    "eventId": "01M2534PHFQ40YN0PPR6QRB6KP",
+    "ts": "2026-09-10T07:22:30Z",
+    "actor": "runtime:orch",
+    "type": "ReportCollectCompleted",
+    "taskId": "B901",
+    "round": "r83",
+    "payload": {
+      "actionId": "fbf581992327e2f9f065ae5faa8e19cafc2c410f1ab60178cf2040e5cd9ff2e6",
+      "agent": "local",
+      "attemptId": "B901-A0001",
+      "attemptNo": 1,
+      "baseSha": "a96ef2cc8301d6b01b4ace141ba4cb1c29cfd64d",
+      "branchSha": "b94e7d73dba84e8d442f3dabbd5d4319399cbe19",
+      "controlEpoch": "01M2534M0X1QRKT54MVTV07DV0",
+      "evidenceLen": 483,
+      "evidencePath": "/repo/.worktrees/B901/coordination/rounds/r83/reports/B901-REPORT.md",
+      "evidenceSha256": "93192c007b150cd0362b533e44a0a1348486d5344a7ead343c534ce7e70ba60f",
+      "gateReceipt": "01M2534PE0AVVD42JTE9ZRADGM",
+      "gateReceiptDigest": "bcada780a37a8cfeeaf89b0b5ed528b81843043b7fa6e0e85064e193ee927559",
+      "goPath": "coordination/rounds/r83/dispatch/local/GO-B901-A0001.md",
+      "leaseGeneration": "01M2534MBX95YNCN5G5S3MWN7E",
+      "owner": "01M2534MBX4WZ1VKFC2ZCM9R46",
+      "receiptAttestationLen": 2545,
+      "receiptAttestationSha256": "bcada780a37a8cfeeaf89b0b5ed528b81843043b7fa6e0e85064e193ee927559"
+    },
+    "initiatorKind": "human-interactive",
+    "invocationMode": "unknown"
+  },
+  {
+    "eventId": "01M2534QCJD0WG8BZWS3Y6HZRA",
+    "ts": "2026-09-10T07:22:31Z",
+    "actor": "runtime:orch",
+    "type": "WorkspaceLeased",
+    "taskId": "B901",
+    "round": "r83",
+    "payload": {
+      "agent": "held-native",
+      "attemptId": "B901-A0001",
+      "generation": 1,
+      "paths": {
+        "target": "orch/target/B901-A0001-review-held-native-g01",
+        "worktree": ".worktrees/B901-A0001-review-held-native-g01"
+      },
+      "reviewedHead": "b94e7d73dba84e8d442f3dabbd5d4319399cbe19",
+      "role": "review",
+      "siteId": "B901-review-held-native-g01",
+      "wakeId": "01a0b902-1111-4222-8333-000000000001"
+    },
+    "initiatorKind": "human-interactive",
+    "invocationMode": "unknown"
+  },
+  {
+    "eventId": "01M2534QCJWHFPW2BKAPS50TKH",
+    "ts": "2026-09-10T07:22:31Z",
+    "actor": "runtime:orch",
+    "type": "WakeIssued",
+    "taskId": "B901",
+    "round": "r83",
+    "payload": {
+      "action": "review",
+      "agent": "held-native",
+      "attachmentManifestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "attemptId": "B901-A0001",
+      "backendState": "pending",
+      "commandDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "configDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "continuationId": "review:r83:B901:B901-A0001:review:held-native",
+      "controlWakeId": "01a0b902-1111-4222-8333-000000000001",
+      "cwdSelection": "project-root",
+      "driver": "smartclaw",
+      "effectiveTuple": {
+        "effort": null,
+        "mode": null,
+        "model": null,
+        "provider": null
+      },
+      "executable": "/usr/bin/true",
+      "executableIdentityDigest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "fixedHead": "b94e7d73dba84e8d442f3dabbd5d4319399cbe19",
+      "harness": "held-native",
+      "invocationCwd": "/repo",
+      "logPath": "/repo/coordination/runtime/logs/01a0b902-1111-4222-8333-000000000001.jsonl",
+      "method": "unified-channel-v1",
+      "observationSource": "dewusmartclaw-native-final-and-stream-v1",
+      "probeOffset": 0,
+      "providerKind": "smartclaw",
+      "renderedMessageSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "requestDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "requestMessageSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "requestSessionId": "orch-wake-01a0b902-1111-4222-8333-000000000001",
+      "requestedEffort": null,
+      "requestedModel": null,
+      "requestedProvider": null,
+      "requestedTuple": {
+        "effort": null,
+        "mode": null,
+        "model": null,
+        "provider": null
+      },
+      "wakeId": "01a0b902-1111-4222-8333-000000000001"
+    },
+    "initiatorKind": "human-interactive",
+    "invocationMode": "unknown"
+  },
+  {
+    "eventId": "01M2534QCJMQNE024GNWSMRSP1",
+    "ts": "2026-09-10T07:22:31Z",
+    "actor": "runtime:orch",
+    "type": "ReviewRequested",
+    "taskId": "B901",
+    "round": "r83",
+    "payload": {
+      "action": "review",
+      "agent": "held-native",
+      "attachmentManifestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "attemptId": "B901-A0001",
+      "backendState": "pending",
+      "channelBinding": {
+        "attachmentManifestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "commandDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "configDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "cwdSelection": "project-root",
+        "driver": "smartclaw",
+        "effectiveTuple": {
+          "effort": null,
+          "mode": null,
+          "model": null,
+          "provider": null
+        },
+        "executableIdentityDigest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "fixedHead": "b94e7d73dba84e8d442f3dabbd5d4319399cbe19",
+        "harness": "held-native",
+        "invocationCwd": "/repo",
+        "observationSource": "dewusmartclaw-native-final-and-stream-v1",
+        "requestDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "requestedTuple": {
+          "effort": null,
+          "mode": null,
+          "model": null,
+          "provider": null
+        }
+      },
+      "commandDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "configDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "continuationId": "review:r83:B901:B901-A0001:review:held-native",
+      "controlWakeId": "01a0b902-1111-4222-8333-000000000001",
+      "cwdSelection": "project-root",
+      "driver": "smartclaw",
+      "effectiveTuple": {
+        "effort": null,
+        "mode": null,
+        "model": null,
+        "provider": null
+      },
+      "executable": "/usr/bin/true",
+      "executableIdentityDigest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "fixedHead": "b94e7d73dba84e8d442f3dabbd5d4319399cbe19",
+      "harness": "held-native",
+      "invocationCwd": "/repo",
+      "logPath": "/repo/coordination/runtime/logs/01a0b902-1111-4222-8333-000000000001.jsonl",
+      "method": "unified-channel-v1",
+      "observationSource": "dewusmartclaw-native-final-and-stream-v1",
+      "probeOffset": 0,
+      "providerKind": "smartclaw",
+      "renderedMessageSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "requestDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "requestMessageSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "requestSessionId": "orch-wake-01a0b902-1111-4222-8333-000000000001",
+      "requestedEffort": null,
+      "requestedModel": null,
+      "requestedProvider": null,
+      "requestedTuple": {
+        "effort": null,
+        "mode": null,
+        "model": null,
+        "provider": null
+      },
+      "reviewOutputPath": "/repo/coordination/runtime/review-inbox/r83/B901-A0001-review-held-native.md",
+      "reviewedHead": "b94e7d73dba84e8d442f3dabbd5d4319399cbe19",
+      "role": "review",
+      "wakeId": "01a0b902-1111-4222-8333-000000000001"
+    },
+    "initiatorKind": "human-interactive",
+    "invocationMode": "unknown"
+  },
+  {
+    "eventId": "01M2534QCJ7P2P9XBPSR81XST3",
+    "ts": "2026-09-10T07:22:31Z",
+    "actor": "runtime:orch",
+    "type": "AgentEventReceived",
+    "taskId": "B901",
+    "round": "r83",
+    "payload": {
+      "actionId": "01a0b902-1111-4222-8333-000000000001",
+      "agent": "held-native",
+      "agentEvent": "wake-backend-receipt",
+      "attemptId": "B901-A0001",
+      "backendState": "accepted",
+      "channelBinding": {
+        "attachmentManifestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "commandDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "configDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "cwdSelection": "project-root",
+        "driver": "smartclaw",
+        "effectiveTuple": {
+          "effort": null,
+          "mode": null,
+          "model": null,
+          "provider": null
+        },
+        "executableIdentityDigest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "fixedHead": "b94e7d73dba84e8d442f3dabbd5d4319399cbe19",
+        "harness": "held-native",
+        "invocationCwd": "/repo",
+        "observationSource": "dewusmartclaw-native-final-and-stream-v1",
+        "requestDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "requestedTuple": {
+          "effort": null,
+          "mode": null,
+          "model": null,
+          "provider": null
+        }
+      },
+      "continuationId": "review:r83:B901:B901-A0001:review:held-native",
+      "logPath": "/repo/coordination/runtime/logs/01a0b902-1111-4222-8333-000000000001.jsonl",
+      "observedSessionId": "native-1",
+      "probeEnd": 9,
+      "probeOffset": 0,
+      "providerKind": "smartclaw",
+      "receiptKind": "smartclaw",
+      "renderedMessageSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "requestMessageSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "requestSessionId": "orch-wake-01a0b902-1111-4222-8333-000000000001",
+      "requestedEffort": null,
+      "requestedModel": null,
+      "requestedProvider": null,
+      "wakeId": "01a0b902-1111-4222-8333-000000000001",
+      "windowSha256": "4825c38ba9e071bc3e19961e7c1bd0c1a2fcc575a5cff7e416d7f7c772597271"
+    },
+    "initiatorKind": "human-interactive",
+    "invocationMode": "unknown"
+  },
+  {
+    "eventId": "01M2534R0R699K6WZRX64AS8MN",
+    "ts": "2026-09-10T07:22:32Z",
+    "actor": "runtime:orch",
+    "type": "ActionRejected",
+    "taskId": "B901",
+    "round": "r83",
+    "payload": {
+      "actionId": "01a0b902-1111-4222-8333-000000000001",
+      "alert": true,
+      "attemptId": "B901-A0001",
+      "attemptNo": 1,
+      "exitCode": 5,
+      "operation": "review-quarantine",
+      "reason": "unverifiable review; native scope remains held"
+    },
+    "initiatorKind": "human-interactive",
+    "invocationMode": "unknown"
+  },
+  {
+    "eventId": "01M2534SAXW2083NBKA2E1BXVQ",
+    "ts": "2026-09-10T07:22:33Z",
+    "actor": "verifier:root",
+    "type": "VerdictIssued",
+    "taskId": "B901",
+    "round": "r83",
+    "payload": {
+      "attemptId": "B901-A0001",
+      "attemptNo": 1,
+      "collectCompletedEventId": "01M2534PHFQ40YN0PPR6QRB6KP",
+      "evidence": [],
+      "gates": [
+        {
+          "exitCode": 0,
+          "gateRunId": "01M2534R4NARAKSRHVRPSX3NVV",
+          "logBytes": 0,
+          "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "name": "testFast"
+        },
+        {
+          "exitCode": 0,
+          "gateRunId": "01M2534R95FX6FH22CV52P478C",
+          "logBytes": 0,
+          "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "name": "testExclusive"
+        },
+        {
+          "exitCode": 0,
+          "gateRunId": "01M2534RDMS336C812J659DKE3",
+          "logBytes": 0,
+          "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "name": "check"
+        },
+        {
+          "exitCode": 0,
+          "gateRunId": "01M2534RJ8V8QPYE8GAXW0X6PK",
+          "logBytes": 0,
+          "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "name": "checkDefault"
+        },
+        {
+          "exitCode": 0,
+          "gateRunId": "01M2534RPZNGQG0YFZC98RTJH3",
+          "logBytes": 0,
+          "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "name": "buildDefault"
+        },
+        {
+          "exitCode": 0,
+          "gateRunId": "01M2534RVMCBKW6C9EBAZ0Y93R",
+          "logBytes": 0,
+          "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "name": "buildSelfhost"
+        }
+      ],
+      "headSha": "b94e7d73dba84e8d442f3dabbd5d4319399cbe19",
+      "implementerAgent": "local",
+      "irRevision": 1,
+      "mainHeadSha": "4f24a1c5059a5416a54bd5109c0ccbcb49768b9f",
+      "reason": "unverifiable review; native scope remains held",
+      "reviews": [],
+      "validationDigest": "ce996f6ea3929bb88a096e2f0642dc71ec919cb5b7ec72d2a9a02592d098e8da",
+      "verdict": "BLOCKED"
+    },
+    "initiatorKind": "human-interactive",
+    "invocationMode": "unknown"
+  }
+]

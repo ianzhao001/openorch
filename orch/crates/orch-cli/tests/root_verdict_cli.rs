@@ -274,6 +274,30 @@ fn verdict_attempt_and_reason_are_rejected_syntax_first_without_filesystem_write
 }
 
 #[test]
+fn quarantine_flags_are_blocked_only_and_reject_bad_selection_without_writes() {
+    let full = "0".repeat(40);
+    for (verdict, reason, ids) in [
+        ("pass", None, vec!["wake-one"]),
+        ("fail", Some("failed review"), vec!["wake-one"]),
+        ("blocked", Some("held review"), vec!["wake-one", "wake-one"]),
+        ("blocked", Some("held review"), vec!["../foreign"]),
+        ("blocked", Some("held review"), vec![""]),
+    ] {
+        let root = root();
+        let mut command = fixture_orch_command(&[]);
+        command.arg("--root").arg(&root).args(["verdict", "B130", "--attempt", "B130-A0001",
+            "--expected-head", &full, "--expected-main", &full, "--verdict", verdict]);
+        if let Some(reason) = reason { command.args(["--reason", reason]); }
+        for id in ids { command.args(["--quarantine-review", id]); }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("quarantine-review"));
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn retired_step_serve_and_wave_never_spawn_external_provider() {
     for (label, args) in [
         ("step", vec!["step"]),

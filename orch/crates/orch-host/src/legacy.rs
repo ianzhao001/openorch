@@ -2452,7 +2452,7 @@ mod load_audit {
                         && event.task_id.as_deref() == Some(key.0.as_str())
                         && event_payload_string(event, "attemptId") == Some(key.1.as_str())
                         && payload.is_some_and(|payload| payload.len() == 7)
-                        && event_payload_string(event, "operation") == Some("wake-backend-receipt")
+                        && matches!(event_payload_string(event, "operation"), Some("wake-backend-receipt" | "review-quarantine"))
                         && event_payload_string(event, "reason")
                             .is_some_and(|reason| !reason.trim().is_empty())
                         && event
@@ -2475,6 +2475,10 @@ mod load_audit {
                             == Some(true);
                     if !exact {
                         return Err("generic ActionRejected authority is not exact".to_string());
+                    }
+                    if crate::generic_review::is_review_quarantine(event) {
+                        crate::generic_review::validate_review_quarantine_shape(event)
+                            .map_err(|error| error.to_string())?;
                     }
                     // A degraded post-spawn rejection closes adjudication only;
                     // it cannot release managed process/workspace capacity.

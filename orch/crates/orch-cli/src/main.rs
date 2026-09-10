@@ -97,6 +97,9 @@ enum Cmd {
         verdict: String,
         #[arg(long)]
         reason: Option<String>,
+        /// Quarantine exact accepted reviews only with BLOCKED; native scopes stay held.
+        #[arg(long)]
+        quarantine_review: Vec<String>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -911,6 +914,7 @@ fn preflight_cli_command(root: &std::path::Path, command: &Cmd) -> Result<()> {
         expected_main,
         verdict,
         reason,
+        quarantine_review,
         ..
     } = command
     {
@@ -931,6 +935,16 @@ fn preflight_cli_command(root: &std::path::Path, command: &Cmd) -> Result<()> {
                 bail!("FAIL/BLOCKED verdict 强制非空 --reason")
             }
             _ => {}
+        }
+        if !quarantine_review.is_empty() {
+            if verdict != "blocked" {
+                bail!("--quarantine-review requires --verdict blocked");
+            }
+            let unique = quarantine_review.iter().collect::<std::collections::BTreeSet<_>>();
+            if unique.len() != quarantine_review.len()
+                || quarantine_review.iter().any(|s| s.is_empty()
+                    || !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+            { bail!("--quarantine-review requires canonical unique wake ids"); }
         }
         validate_full_sha_syntax(expected_head, "--expected-head")?;
         validate_full_sha_syntax(expected_main, "--expected-main")?;
@@ -1157,6 +1171,7 @@ fn main() -> ExitCode {
             expected_main,
             verdict,
             reason,
+            quarantine_review,
             dry_run,
         } => cmd_verdict(
             &root,
@@ -1167,6 +1182,7 @@ fn main() -> ExitCode {
             &verdict,
             reason.as_deref(),
             dry_run,
+            &quarantine_review,
         ),
         #[cfg(feature = "selfhost")]
         Cmd::Seal {
@@ -2871,9 +2887,10 @@ fn cmd_verdict(
     verdict: &str,
     reason: Option<&str>,
     dry_run: bool,
+    quarantine_review: &[String],
 ) -> Result<ExitCode> {
     let verdict = orch_host::verify::RootVerdict::parse(verdict)?;
-    let out = orch_host::verify::run_root_verdict(
+    let out = orch_host::verify::run_root_verdict_with_quarantine(
         root,
         task,
         attempt,
@@ -2882,6 +2899,7 @@ fn cmd_verdict(
         verdict,
         reason,
         dry_run,
+        quarantine_review,
     )?;
     println!(
         "orch verdict {task}: {}{}{} · gates={}",

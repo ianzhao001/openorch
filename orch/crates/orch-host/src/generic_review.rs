@@ -981,6 +981,184 @@ fn unique_position(events: &[orch_core::EventRecord], event_id: &str) -> Result<
     }
 }
 
+/// Distinguish adjudication quarantine from launch or acceptance-receipt failure.
+pub(crate) const REVIEW_QUARANTINE_OPERATION: &str = "review-quarantine";
+
+/// Recognize the operation tag only; this does not validate or authorize the record.
+pub(crate) fn is_review_quarantine(event: &orch_core::EventRecord) -> bool {
+    event.kind == "ActionRejected"
+        && payload_string(event, "operation") == Some(REVIEW_QUARANTINE_OPERATION)
+}
+
+/// Check the closed rejection envelope without inferring process or native completion.
+pub(crate) fn validate_review_quarantine_shape(event: &orch_core::EventRecord) -> Result<()> {
+    let payload = event.payload.as_ref().and_then(serde_json::Value::as_object)
+        .context("review quarantine payload must be an object")?;
+    if !is_review_quarantine(event)
+        || event.actor != "runtime:orch"
+        || event.round.as_deref().is_none_or(str::is_empty)
+        || event.task_id.as_deref().is_none_or(str::is_empty)
+        || payload.len() != 7
+        || payload_string(event, "actionId").is_none_or(str::is_empty)
+        || payload_string(event, "attemptId").is_none_or(str::is_empty)
+        || payload.get("attemptNo").and_then(serde_json::Value::as_u64).is_none_or(|n| n == 0)
+        || payload.get("exitCode").and_then(serde_json::Value::as_i64) != Some(5)
+        || payload.get("alert").and_then(serde_json::Value::as_bool) != Some(true)
+        || payload_string(event, "reason").is_none_or(|s| s.is_empty() || s.trim() != s)
+    {
+        bail!("review quarantine rejection envelope is not exact");
+    }
+    Ok(())
+}
+
+/// Recognize only a complete quarantine block immediately paired with root BLOCKED.
+/// The accepted request remains physically pending; no cleanup fact is returned.
+pub(crate) fn canonical_review_quarantine(
+    event: &orch_core::EventRecord,
+    events: &[orch_core::EventRecord],
+    round: &str,
+) -> Result<bool> {
+    if !is_review_quarantine(event) { return Ok(false); }
+    validate_review_quarantine_shape(event)?;
+    if event.round.as_deref() != Some(round) { bail!("review quarantine round mismatch"); }
+    if crate::round::contract_schema_from_events(events, round)?
+        != Some(crate::plan::ACTORLESS_ROUND_IR_SCHEMA_VERSION)
+    { bail!("review quarantine requires schema3 history"); }
+    let position = unique_position(events, &event.event_id)?;
+    let root_position = events.iter().enumerate().skip(position + 1)
+        .find(|(_, candidate)| !is_review_quarantine(candidate))
+        .map(|(position, _)| position)
+        .context("review quarantine has no adjacent root BLOCKED partner")?;
+    let root = &events[root_position];
+    if root.kind != "VerdictIssued" || root.actor != "verifier:root"
+        || root.round != event.round || root.task_id != event.task_id
+    { bail!("review quarantine is not adjacent to its root BLOCKED partner"); }
+    let root_payload: crate::verify::RootVerdictPayload = serde_json::from_value(
+        root.payload.clone().context("review quarantine root payload missing")?
+    ).context("review quarantine root payload is not canonical")?;
+    if root_payload.verdict != "BLOCKED"
+        || Some(root_payload.attempt_id.as_str()) != payload_string(event, "attemptId")
+        || root_payload.attempt_no as u64 != event.payload.as_ref().unwrap()["attemptNo"].as_u64().unwrap()
+        || root_payload.reason.as_deref() != payload_string(event, "reason")
+        || !canonical_sha(&root_payload.head_sha, 40)
+        || !canonical_sha(&root_payload.main_head_sha, 40)
+    { bail!("review quarantine root identity/reason/verdict mismatch"); }
+    let task = event.task_id.as_deref().unwrap();
+    let wake_id = payload_string(event, "actionId").unwrap();
+    let prefix = &events[..position];
+    let requests = prefix.iter().filter(|candidate| candidate.kind == "ReviewRequested"
+        && payload_string(candidate, "wakeId") == Some(wake_id)).collect::<Vec<_>>();
+    let [request] = requests.as_slice() else { bail!("review quarantine needs one preceding request"); };
+    let identity = request_identity(request)?;
+    if identity.task != task || identity.attempt != root_payload.attempt_id
+        || identity.harness == "local" || identity.wake_id != wake_id
+    { bail!("review quarantine request identity mismatch"); }
+    let request = exact_request(prefix, round, &identity)?;
+    if prefix.iter().filter(|candidate| candidate.kind == "WakeIssued"
+        && payload_string(candidate, "wakeId") == Some(wake_id)).count() != 1
+        || prefix.iter().filter(|candidate| candidate.kind == "WorkspaceLeased"
+            && payload_string(candidate, "wakeId") == Some(wake_id)).count() != 1
+        || prefix.iter().filter(|candidate| candidate.kind == "AgentEventReceived"
+            && payload_string(candidate, "agentEvent") == Some("wake-backend-receipt")
+            && (payload_string(candidate, "wakeId") == Some(wake_id)
+                || payload_string(candidate, "actionId") == Some(wake_id))).count() != 1
+    { bail!("review quarantine has missing, duplicate or foreign request lineage"); }
+    let wake = exact_wake(prefix, round, &identity)?;
+    if payload_string(wake, "method") != Some("unified-channel-v1")
+        || payload_string(wake, "action") != Some("review")
+        || payload_string(wake, "controlWakeId") != Some(wake_id)
+        || payload_string(wake, "backendState") != Some("pending")
+        || payload_string(wake, "fixedHead") != Some(root_payload.head_sha.as_str())
+    { bail!("review quarantine requires a pending unified review wake"); }
+    let request_position = unique_position(events, &request.event_id)?;
+    let wake_position = unique_position(events, &wake.event_id)?;
+    let receipt = exact_backend_receipt(prefix, round, &identity)?
+        .context("review quarantine requires a bound accepted backend receipt")?;
+    let receipt_position = unique_position(events, &receipt.event_id)?;
+    crate::wake::validate_existing_channel_action_binding(wake, receipt)?;
+    if !(wake_position < request_position && request_position < receipt_position && receipt_position < position) {
+        bail!("review quarantine request/receipt order is invalid");
+    }
+    let collects = events[..wake_position].iter().filter(|candidate| candidate.kind == "ReportCollectCompleted"
+        && candidate.actor == "runtime:orch" && candidate.round.as_deref() == Some(round)
+        && candidate.task_id.as_deref() == Some(task)
+        && payload_string(candidate, "attemptId") == Some(identity.attempt.as_str())
+        && payload_string(candidate, "branchSha") == Some(root_payload.head_sha.as_str())).count();
+    if collects != 1 { bail!("review quarantine requires one preceding fixed-head collect"); }
+    let leases = events[..wake_position].iter().filter(|candidate| candidate.kind == "WorkspaceLeased"
+        && candidate.actor == "runtime:orch" && candidate.round.as_deref() == Some(round)
+        && candidate.task_id.as_deref() == Some(task)
+        && payload_string(candidate, "attemptId") == Some(identity.attempt.as_str())
+        && payload_string(candidate, "role") == Some("review")
+        && payload_string(candidate, "agent") == Some(identity.harness.as_str())
+        && payload_string(candidate, "wakeId") == Some(wake_id)
+        && payload_string(candidate, "reviewedHead") == Some(root_payload.head_sha.as_str())).collect::<Vec<_>>();
+    let [lease] = leases.as_slice() else { bail!("review quarantine needs one exact preceding lease"); };
+    let worktree = lease.payload.as_ref().and_then(|p| p.get("paths"))
+        .and_then(|p| p.get("worktree")).and_then(serde_json::Value::as_str)
+        .context("review quarantine lease worktree missing")?;
+    let relative = Path::new(worktree);
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+        bail!("review quarantine lease worktree is not canonical relative");
+    }
+    validate_channel_request_facts(request, wake, &identity, round, &root_payload.head_sha, relative)?;
+    for candidate in &events[..root_position] {
+        let same_wake = payload_string(candidate, "wakeId") == Some(wake_id)
+            || payload_string(candidate, "actionId") == Some(wake_id);
+        if same_wake && (matches!(candidate.kind.as_str(), "ManagedWakeTerminated" | "WorkspaceReleased" | "ReviewDelivered")
+            || (candidate.kind == "ActionRejected" && candidate.event_id != event.event_id))
+        { bail!("review quarantine cannot replace a terminal/delivery/rejection"); }
+    }
+    if events[..root_position].iter().any(|candidate| candidate.kind == "VerdictIssued"
+        && candidate.actor == "verifier:root" && candidate.round.as_deref() == Some(round)
+        && candidate.task_id.as_deref() == Some(task)
+        && payload_string(candidate, "attemptId") == Some(identity.attempt.as_str()))
+    { bail!("review quarantine cannot follow an earlier root verdict"); }
+    Ok(true)
+}
+
+/// Prepare new quarantines or recover the exact previously recorded selection.
+/// Only the caller's checked root BLOCKED batch may publish these inert review refusals.
+pub(crate) fn prepare_review_quarantines(
+    events: &[orch_core::EventRecord], round: &str, task: &str, attempt: &str,
+    reason: &str, selected: &[String],
+) -> Result<Vec<orch_core::EventRecord>> {
+    let wanted = selected.iter().cloned().collect::<BTreeSet<_>>();
+    if wanted.len() != selected.len() { bail!("duplicate --quarantine-review wake id"); }
+    let existing = events.iter().filter(|event| is_review_quarantine(event)
+        && event.round.as_deref() == Some(round) && event.task_id.as_deref() == Some(task)
+        && payload_string(event, "attemptId") == Some(attempt)).collect::<Vec<_>>();
+    let roots = events.iter().filter(|event| event.kind == "VerdictIssued" && event.actor == "verifier:root"
+        && event.round.as_deref() == Some(round) && event.task_id.as_deref() == Some(task)
+        && payload_string(event, "attemptId") == Some(attempt)).count();
+    if !existing.is_empty() || roots > 0 {
+        if roots != 1 { bail!("recorded quarantine lacks unique root verdict"); }
+        let observed = existing.iter().map(|event| {
+            canonical_review_quarantine(event, events, round)?;
+            if payload_string(event, "reason") != Some(reason) { bail!("review quarantine replay reason changed"); }
+            Ok(payload_string(event, "actionId").unwrap().to_string())
+        }).collect::<Result<BTreeSet<_>>>()?;
+        if observed != wanted || observed.len() != existing.len() {
+            bail!("review quarantine replay selection changed");
+        }
+        return Ok(Vec::new());
+    }
+    let current = crate::attempt::current_attempt(events, task)?.context("review quarantine lacks current attempt")?;
+    if current.attempt_id != attempt { bail!("review quarantine attempt is not current"); }
+    wanted.into_iter().map(|wake_id| {
+        if wake_id.is_empty() || !wake_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            bail!("review quarantine wake id is not canonical");
+        }
+        if events.iter().any(|event| event.kind == "ActionRejected" && payload_string(event, "actionId") == Some(wake_id.as_str())) {
+            bail!("review quarantine cannot replace an existing rejection");
+        }
+        let rejection = crate::failure::ActionRejection::from_disposition(REVIEW_QUARANTINE_OPERATION,
+            &wake_id, reason, crate::failure::CliDisposition::EffectUnknown)?.with_attempt(&current);
+        Ok(crate::failure::rejection_event(round, Some(task), &rejection))
+    }).collect()
+}
+
 fn exact_rejection<'a>(
     events: &'a [orch_core::EventRecord],
     round: &str,
@@ -1005,7 +1183,7 @@ fn exact_rejection<'a>(
                 || event.round.as_deref() != Some(round)
                 || event.task_id.as_deref() != Some(identity.task.as_str())
                 || payload.len() != 7
-                || payload_string(event, "operation") != Some("wake-backend-receipt")
+                || !matches!(payload_string(event, "operation"), Some("wake-backend-receipt" | "review-quarantine"))
                 || payload_string(event, "attemptId") != Some(identity.attempt.as_str())
                 || payload
                     .get("attemptNo")
@@ -1020,6 +1198,7 @@ fn exact_rejection<'a>(
             {
                 bail!("generic ActionRejected 非 exact typed rejection");
             }
+            if is_review_quarantine(event) { validate_review_quarantine_shape(event)?; }
             Ok(Some(*event))
         }
         _ => bail!("generic review ActionRejected 重复"),
@@ -1955,6 +2134,7 @@ pub fn validate_generic_review_facts(
         reviewed_head,
         main_sha,
         crate::verify::RootVerdict::Pass,
+        false,
     )
 }
 
@@ -2198,7 +2378,8 @@ fn validate_historical_b319_request_facts(
 }
 
 /// Validate generic review facts under one explicit root verdict, preserving
-/// the public validator's strict PASS semantics for every other caller.
+/// the public validator's strict PASS semantics for every other caller. A
+/// prospective root is still a live write and retains the current-cwd check.
 pub(crate) fn validate_generic_review_facts_for_verdict(
     root: &Path,
     events: &[orch_core::EventRecord],
@@ -2208,6 +2389,7 @@ pub(crate) fn validate_generic_review_facts_for_verdict(
     reviewed_head: &str,
     main_sha: &str,
     verdict: crate::verify::RootVerdict,
+    prospective_root: bool,
 ) -> Result<Vec<crate::verify::ReviewBinding>> {
     if !canonical_sha(reviewed_head, 40) || !canonical_sha(main_sha, 40) {
         bail!("generic review validation 要求 full reviewed/main SHA");
@@ -2420,7 +2602,7 @@ pub(crate) fn validate_generic_review_facts_for_verdict(
                 relative,
             )?
         };
-        if roots.is_empty() {
+        if roots.is_empty() || prospective_root {
             let current_root = std::fs::canonicalize(root)?;
             if current_root != request_paths.historical_root {
                 bail!("live generic review repository root 与 immutable request 漂移");
@@ -2431,6 +2613,12 @@ pub(crate) fn validate_generic_review_facts_for_verdict(
         let terminal = exact_terminal(prefix, round, &identity)?;
         let rejection = exact_rejection(prefix, round, &identity)?;
         let receipt = exact_backend_receipt(prefix, round, &identity)?;
+        if let Some(quarantine) = rejection.filter(|event| is_review_quarantine(event)) {
+            if verdict != crate::verify::RootVerdict::Blocked {
+                bail!("review quarantine is only valid for root BLOCKED");
+            }
+            canonical_review_quarantine(quarantine, events, round)?;
+        }
         let deliveries = events[..boundary]
             .iter()
             .filter(|event| {
@@ -2595,7 +2783,7 @@ pub(crate) fn validate_generic_review_facts_for_verdict(
         if let Some(terminal) = terminal.filter(|event| terminal_answered(event)) {
             let inbox_rel =
                 crate::wake::review_inbox_relpath(round, attempt, "review", &identity.harness)?;
-            let terminal_root = if roots.is_empty() {
+            let terminal_root = if roots.is_empty() || prospective_root {
                 root
             } else {
                 request_paths.historical_root.as_path()
@@ -2725,7 +2913,7 @@ pub(crate) fn validate_generic_review_facts_for_verdict(
             || (event.kind == "ActionRejected"
                 && matches!(
                     payload_string(event, "operation"),
-                    Some("wake" | "wake-backend-receipt")
+                    Some("wake" | "wake-backend-receipt" | "review-quarantine")
                 ));
         known_wake || (same_attempt && lifecycle)
     }) {
@@ -2733,6 +2921,119 @@ pub(crate) fn validate_generic_review_facts_for_verdict(
     }
     bindings.sort_by(|left, right| left.reviewer.cmp(&right.reviewer));
     Ok(bindings)
+}
+
+#[cfg(test)]
+mod quarantine_contract_tests {
+    use super::*;
+
+    // Sanitized events produced by the integration fixture; no native process existed.
+    fn history() -> Vec<orch_core::EventRecord> {
+        serde_json::from_str(include_str!("../tests/support_review_quarantine/history.json")).unwrap()
+    }
+
+    fn recognized(events: &[orch_core::EventRecord]) -> bool {
+        let Some(q) = events.iter().find(|event| is_review_quarantine(event)) else { return false; };
+        canonical_review_quarantine(q, events, "r83").is_ok_and(|value| value)
+    }
+
+    fn extra(kind: &str, wake: &str) -> orch_core::EventRecord {
+        crate::ledger::event(kind, "runtime:orch", Some("B901"), Some("r83"),
+            serde_json::json!({"attemptId":"B901-A0001", "wakeId":wake, "actionId":wake}))
+    }
+
+    #[test]
+    fn quarantine_history_requires_exact_blocked_pair_receipt_and_unfinished_scope() {
+        let original = history();
+        assert!(recognized(&original));
+        for index in 0..original.len() {
+            let mut changed = original.clone(); changed.remove(index);
+            assert!(!recognized(&changed), "missing event {index}");
+        }
+        let qi = original.len() - 2;
+        let wake = payload_string(&original[qi], "actionId").unwrap();
+        for kind in ["ManagedWakeTerminated", "WorkspaceReleased", "ReviewDelivered", "ActionRejected"] {
+            let mut changed = original.clone(); changed.insert(qi, extra(kind, wake));
+            assert!(!recognized(&changed), "cannot replace {kind}");
+        }
+        let mut shadowed = original.clone();
+        let mut rejection = extra("ActionRejected", wake);
+        rejection.payload.as_mut().unwrap()["wakeId"] = serde_json::json!("foreign");
+        shadowed.insert(qi, rejection);
+        assert!(!recognized(&shadowed), "wakeId cannot mask a conflicting actionId");
+        for kind in ["WorkspaceLeased", "WakeIssued", "ReviewRequested", "AgentEventReceived", "ActionRejected"] {
+            let mut changed = original.clone();
+            let mut duplicate = changed.iter().find(|event| event.kind == kind).unwrap().clone();
+            duplicate.event_id = ulid::Ulid::new().to_string();
+            changed.insert(qi, duplicate);
+            assert!(!recognized(&changed), "duplicate {kind} with a distinct eventId");
+        }
+        let mut separated = original.clone(); separated.insert(qi + 1, extra("GateExecuted", "another"));
+        assert!(!recognized(&separated));
+        let mut late = original.clone(); late.swap(qi, qi + 1);
+        assert!(!recognized(&late));
+        let mut legacy = original.clone(); legacy[0].payload.as_mut().unwrap()["contractSchemaVersion"] = serde_json::json!(2);
+        assert!(!recognized(&legacy));
+        let mut empty_path = original.clone(); empty_path[2].payload.as_mut().unwrap()["paths"]["worktree"] = serde_json::json!("");
+        assert!(!recognized(&empty_path));
+    }
+
+    #[test]
+    fn quarantine_envelope_and_root_fields_are_not_extensible_or_substitutable() {
+        let original = history(); let qi = original.len() - 2; let ri = qi + 1;
+        for key in original[qi].payload.as_ref().unwrap().as_object().unwrap().keys() {
+            let mut missing = original.clone(); missing[qi].payload.as_mut().unwrap().as_object_mut().unwrap().remove(key);
+            assert!(!recognized(&missing), "missing quarantine {key}");
+        }
+        for (key, value) in [
+            ("exitCode", serde_json::json!(2)), ("alert", serde_json::json!(false)),
+            ("attemptNo", serde_json::json!(2)), ("attemptId", serde_json::json!("B901-A0002")),
+            ("reason", serde_json::json!("changed")), ("actionId", serde_json::json!("foreign")),
+            ("extra", serde_json::json!(true)),
+        ] {
+            let mut changed = original.clone(); changed[qi].payload.as_mut().unwrap()[key] = value;
+            assert!(!recognized(&changed), "quarantine {key}");
+        }
+        for key in ["actor", "round", "task"] {
+            let mut changed = original.clone();
+            match key { "actor" => changed[qi].actor = "other".to_string(),
+                "round" => changed[qi].round = Some("other".to_string()),
+                _ => changed[qi].task_id = Some("other".to_string()) }
+            assert!(!recognized(&changed), "quarantine {key}");
+        }
+        for (key, value) in [
+            ("verdict", serde_json::json!("PASS")), ("verdict", serde_json::json!("FAIL")),
+            ("reason", serde_json::json!("changed")), ("attemptNo", serde_json::json!(2)),
+            ("headSha", serde_json::json!("f".repeat(40))), ("mainHeadSha", serde_json::json!("short")),
+            ("extra", serde_json::json!(true)),
+        ] {
+            let mut changed = original.clone(); changed[ri].payload.as_mut().unwrap()[key] = value;
+            assert!(!recognized(&changed), "root {key}");
+        }
+        for key in original[5].payload.as_ref().unwrap()["channelBinding"].as_object().unwrap().keys() {
+            let mut changed = original.clone();
+            changed[5].payload.as_mut().unwrap()["channelBinding"][key] = serde_json::json!("tampered");
+            assert!(!recognized(&changed), "receipt binding {key}");
+        }
+    }
+
+    #[test]
+    fn quarantine_is_zero_vote_blocked_only_and_keeps_existing_identity_fences() {
+        let events = history(); let root = events.last().unwrap().payload.as_ref().unwrap();
+        let head = root["headSha"].as_str().unwrap(); let main = root["mainHeadSha"].as_str().unwrap();
+        for verdict in [crate::verify::RootVerdict::Pass, crate::verify::RootVerdict::Fail] {
+            assert!(validate_generic_review_facts_for_verdict(Path::new("/repo"), &events,
+                "r83", "B901", "B901-A0001", head, main, verdict, false).is_err());
+        }
+        assert!(validate_generic_review_facts_for_verdict(Path::new("/repo"), &events,
+            "r83", "B901", "B901-A0001", head, main, crate::verify::RootVerdict::Blocked, false).unwrap().is_empty());
+        let q = &events[events.len() - 2]; let wake = payload_string(q, "actionId").unwrap();
+        assert!(validate_generic_review_admission_v1(&events, "r83", "B901", "B901-A0002", "fresh", wake).is_err());
+        assert!(validate_generic_review_admission_v1(&events, "r83", "B901", "B901-A0001", "held-native", "new-wake").is_err());
+        assert!(validate_generic_review_admission_v1(&events, "r83", "B901", "B901-A0002", "fresh", "new-wake").is_ok());
+        let load = crate::legacy::agent_inflight_load_from_events(&events, "r83").unwrap();
+        assert_eq!(load.get("held-native").unwrap().len(), 1);
+    }
 }
 
 #[cfg(test)]

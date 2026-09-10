@@ -6646,7 +6646,9 @@ fn canonical_wake_backend_receipt(
         "windowSha256",
         "backendState",
     ];
-    if payload.len() != KEYS.len() || KEYS.iter().any(|key| !payload.contains_key(*key)) {
+    if (payload.len() != KEYS.len() && payload.len() != KEYS.len() + 1)
+        || KEYS.iter().any(|key| !payload.contains_key(*key))
+    {
         bail!("wake-backend-receipt payload shape is not exact");
     }
     let required = |key: &str| -> Result<&str> {
@@ -6669,7 +6671,7 @@ fn canonical_wake_backend_receipt(
             if *continuation_round == round
                 && *continuation_task == task_id
                 && *continuation_attempt == attempt_id
-                && matches!(*role, "primary" | "secondary" | "nongate")
+                && matches!(*role, "primary" | "secondary" | "nongate" | "review")
                 && *continuation_agent == agent =>
         {
             true
@@ -6770,6 +6772,13 @@ fn canonical_wake_backend_receipt(
         bail!("wake-backend-receipt requires exactly one preceding WakeIssued");
     }
     let wake = wakes[0];
+    // The producer appends exactly one additional field for a unified action.
+    // Accepting that field recognizes an existing receipt; it proves no terminal.
+    let binding = crate::wake::channel_action_binding_from_wake(wake)?;
+    if payload.len() != KEYS.len() + usize::from(binding.is_some()) {
+        bail!("wake-backend-receipt payload shape disagrees with issued channel binding");
+    }
+    crate::wake::validate_existing_channel_action_binding(wake, event)?;
     let same = wake.task_id.as_deref() == Some(task_id)
         && event_payload_str(wake, "continuationId") == Some(continuation_id)
         && event_payload_str(wake, "attemptId") == Some(attempt_id)
@@ -7275,6 +7284,8 @@ fn validate_expected_main_contract(
                     bail!("late review durable pair crosses the expected-main commit boundary");
                 }
             }
+            let mut complete_quarantine_history = prior.clone();
+            complete_quarantine_history.extend(suffix_events.iter().cloned());
             for (index, event) in suffix_events.into_iter().enumerate() {
                 let verdict = event.kind == "VerdictIssued"
                     && event.actor == "verifier:root"
@@ -7314,6 +7325,9 @@ fn validate_expected_main_contract(
                     && event.actor == "runtime:orch"
                     && event.round.as_deref() == Some(round);
                 let backend_receipt = canonical_wake_backend_receipt(&event, &prior, round)?;
+                let review_quarantine = crate::generic_review::canonical_review_quarantine(
+                    &event, &complete_quarantine_history, round,
+                )?;
                 let late_review = late.event_ids.contains(&event.event_id);
                 let frozen_contract_supersession = frozen_supersessions.contains(&event.event_id);
                 let budget_threshold = canonical_budget_threshold_suffix(&event, round);
@@ -7333,6 +7347,8 @@ fn validate_expected_main_contract(
                     || gate_executed
                     || review_quorum_event
                     || runtime_v1
+                    || (review_quarantine
+                        && !matches!(ledger_mode, CommittedLedgerMode::CanonicalStorageSuffix))
                     || (verdict
                         && !matches!(ledger_mode, CommittedLedgerMode::CanonicalStorageSuffix))
                     || (matches!(ledger_mode, CommittedLedgerMode::CanonicalRootSuffix)
@@ -8660,6 +8676,7 @@ fn required_file_bindings(
     implementer_agent: &str,
     ir_task: &crate::plan::IrTask,
     verdict: RootVerdict,
+    prospective_root: bool,
 ) -> Result<(
     Vec<ReviewBinding>,
     Vec<EvidenceBinding>,
@@ -8680,6 +8697,7 @@ fn required_file_bindings(
             head_sha,
             main_sha,
             verdict,
+            prospective_root,
         )?;
         let mut evidence = Vec::new();
         if verdict == RootVerdict::Pass {
@@ -11802,6 +11820,35 @@ pub fn run_root_verdict(
     reason: Option<&str>,
     dry_run: bool,
 ) -> Result<RootVerdictOutcome> {
+    run_root_verdict_with_quarantine(root, task_id, attempt_id, expected_head,
+        expected_main, verdict, reason, dry_run, &[])
+}
+
+/// Record root BLOCKED with explicit refusals for exact accepted reviews whose
+/// adjudication must be abandoned. Quarantines and BLOCKED form one checked batch;
+/// native termination, leases, answers and cleanup authority remain unchanged.
+/// Dry-run writes no business facts, and replay requires the original selection.
+pub fn run_root_verdict_with_quarantine(
+    root: &Path,
+    task_id: &str,
+    attempt_id: &str,
+    expected_head: &str,
+    expected_main: &str,
+    verdict: RootVerdict,
+    reason: Option<&str>,
+    dry_run: bool,
+    quarantine_review: &[String],
+) -> Result<RootVerdictOutcome> {
+    if !quarantine_review.is_empty() {
+        if verdict != RootVerdict::Blocked || reason.is_none_or(|s| s.trim().is_empty()) {
+            bail!("--quarantine-review requires BLOCKED and a reason");
+        }
+        let unique = quarantine_review.iter().collect::<BTreeSet<_>>();
+        if unique.len() != quarantine_review.len()
+            || quarantine_review.iter().any(|s| s.is_empty()
+                || !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+        { bail!("--quarantine-review requires canonical unique wake ids"); }
+    }
     let round = require_current_open_schema3_verdict_generation(root, None)?;
     crate::close::with_protocol_transition_named(root, "orch verdict", Some(task_id), || {
         let locked_round = require_current_open_schema3_verdict_generation(root, Some(&round))?;
@@ -11815,6 +11862,7 @@ pub fn run_root_verdict(
             verdict,
             reason,
             dry_run,
+            quarantine_review,
         )
     })
 }
@@ -11829,6 +11877,7 @@ fn run_root_verdict_locked(
     verdict: RootVerdict,
     reason: Option<&str>,
     dry_run: bool,
+    quarantine_review: &[String],
 ) -> Result<RootVerdictOutcome> {
     if matches!(verdict, RootVerdict::Fail | RootVerdict::Blocked)
         && reason.is_none_or(|text| text.trim().is_empty())
@@ -11871,18 +11920,6 @@ fn run_root_verdict_locked(
     let lineage =
         current_attempt_and_collect(&lr.events, task_id, round, attempt_id, expected_head)?;
     validate_current_implementer(&active.candidate, &lineage.implementer_agent)?;
-    let (reviews, evidence, substitutions) = required_file_bindings(
-        root,
-        &lr.events,
-        round,
-        task_id,
-        attempt_id,
-        expected_head,
-        expected_main,
-        &lineage.implementer_agent,
-        ir_task,
-        verdict,
-    )?;
     let mut payload = RootVerdictPayload {
         verdict: verdict.as_event_str().to_string(),
         reason: reason.map(str::trim).map(str::to_string),
@@ -11895,10 +11932,30 @@ fn run_root_verdict_locked(
         main_head_sha: expected_main.to_string(),
         collect_completed_event_id: lineage.collect.event_id.clone(),
         bootstrap_pre_signoff_attempt: ir_task.bootstrap_pre_signoff_attempt.clone(),
-        reviews,
-        evidence,
+        reviews: Vec::new(),
+        evidence: Vec::new(),
         gates: Vec::new(),
     };
+    let quarantines = crate::generic_review::prepare_review_quarantines(
+        &lr.events, round, task_id, attempt_id, reason.unwrap_or("").trim(), quarantine_review,
+    )?;
+    let prospective_root = ledger::event("VerdictIssued", "verifier:root", Some(task_id),
+        Some(round), serde_json::to_value(&payload)?);
+    let mut prospective = lr.events.clone();
+    if !quarantines.is_empty() {
+        prospective.extend(quarantines.iter().cloned());
+        prospective.push(prospective_root.clone());
+        for quarantine in &quarantines {
+            crate::generic_review::canonical_review_quarantine(quarantine, &prospective, round)?;
+        }
+    }
+    let (reviews, evidence, substitutions) = required_file_bindings(
+        root, &prospective, round, task_id, attempt_id, expected_head, expected_main,
+        &lineage.implementer_agent, ir_task, verdict,
+        !quarantines.is_empty(),
+    )?;
+    payload.reviews = reviews;
+    payload.evidence = evidence;
 
     let existing = matching_existing_root_verdict(&lr.events, &round, task_id, &payload)?;
     let root_position = existing
@@ -12071,9 +12128,29 @@ fn run_root_verdict_locked(
         if fresh_task.bootstrap_pre_signoff_attempt != payload.bootstrap_pre_signoff_attempt {
             bail!("verdict append 前 bootstrapPreSignoffAttempt 漂移");
         }
+        let fresh_quarantines = crate::generic_review::prepare_review_quarantines(
+            events, &round, task_id, attempt_id, reason.unwrap_or("").trim(), quarantine_review,
+        )?;
+        let same_quarantines = fresh_quarantines.len() == quarantines.len()
+            && fresh_quarantines.iter().zip(&quarantines).all(|(fresh, prepared)| {
+                fresh.kind == prepared.kind && fresh.actor == prepared.actor
+                    && fresh.round == prepared.round && fresh.task_id == prepared.task_id
+                    && fresh.payload == prepared.payload
+            });
+        if !same_quarantines { bail!("review quarantine plan changed before append"); }
+        let mut fresh_prospective = events.to_vec();
+        if !quarantines.is_empty() {
+            fresh_prospective.extend(quarantines.iter().cloned());
+            let mut root_event = prospective_root.clone();
+            root_event.payload = Some(payload_value.clone());
+            fresh_prospective.push(root_event);
+            for quarantine in &quarantines {
+                crate::generic_review::canonical_review_quarantine(quarantine, &fresh_prospective, round)?;
+            }
+        }
         let (fresh_reviews, fresh_evidence, fresh_substitutions) = required_file_bindings(
             root,
-            events,
+            &fresh_prospective,
             &round,
             task_id,
             attempt_id,
@@ -12082,6 +12159,7 @@ fn run_root_verdict_locked(
             &fresh_lineage.implementer_agent,
             fresh_task,
             verdict,
+            !quarantines.is_empty(),
         )?;
         if fresh_reviews != payload.reviews
             || fresh_evidence != payload.evidence
@@ -12162,13 +12240,8 @@ fn run_root_verdict_locked(
             )?;
             return Ok(Vec::new());
         }
-        let verdict_event = ledger::event(
-            "VerdictIssued",
-            "verifier:root",
-            Some(task_id),
-            Some(&round),
-            payload_value.clone(),
-        );
+        let verdict_event = ledger::event("VerdictIssued", "verifier:root", Some(task_id),
+            Some(&round), payload_value.clone());
         let mut batch = reused_events.clone();
         batch.extend(substitutions.iter().map(|substitution| {
                 ledger::event(
@@ -12188,6 +12261,7 @@ fn run_root_verdict_locked(
                     }),
                 )
             }));
+        batch.extend(quarantines.iter().cloned());
         batch.push(verdict_event);
         Ok(batch)
     })?;
@@ -12356,6 +12430,7 @@ pub fn validate_root_merge_authorization(
         &lineage.implementer_agent,
         ir_task,
         RootVerdict::Pass,
+        false,
     )?;
     if reviews != payload.reviews || evidence != payload.evidence {
         bail!("root PASS 后 review/evidence bytes 已改变");
@@ -12765,6 +12840,7 @@ fn validate_root_record_authorization_inner(
         &lineage.implementer_agent,
         ir_task,
         RootVerdict::Pass,
+        false,
     )?;
     if reviews != payload.reviews || evidence != payload.evidence {
         bail!("record 前 review/evidence bytes 已改变");
@@ -13523,6 +13599,7 @@ pub fn validate_archived_record_chain(
             &root_payload.implementer_agent,
             historical_task,
             RootVerdict::Pass,
+            false,
         )?;
         if !substitutions.is_empty()
             || reviews != root_payload.reviews
@@ -14551,6 +14628,7 @@ git: {pushPolicy: forbidden, mergePolicy: ff-only-else-no-ff}
             &lineage.implementer_agent,
             task,
             RootVerdict::Pass,
+            false,
         )
         .unwrap();
         assert!(substitutions.is_empty());
@@ -15058,6 +15136,200 @@ git: {pushPolicy: forbidden, mergePolicy: ff-only-else-no-ff}
             CommittedLedgerMode::CanonicalVerdictSuffix,
         )
         .is_err());
+    }
+
+    #[test]
+    fn unified_review_backend_receipt_keeps_exact_action_binding_in_suffix() {
+        let site = MergeSite::new("unified-review-receipt-suffix");
+        let (wake, review, receipt) = unified_review_receipt_fixture(&site);
+        let prior = [wake.clone(), review.clone()];
+        assert!(crate::wake::accepted_backend_receipt_matches_wake(&wake, &receipt).unwrap());
+        assert!(canonical_wake_backend_receipt(&receipt, &prior, "r58").unwrap());
+        // Exercise the committed-suffix reader with an already recorded request.
+        // MergeSite supplies a legacy archive fixture, not a live schema3 writer.
+        let ledger_rel = "coordination/rounds/r58/events.jsonl";
+        let mut bytes = fs::read(site.root.join(ledger_rel)).unwrap();
+        for event in [wake, review] {
+            bytes.extend(serde_json::to_vec(&event).unwrap());
+            bytes.push(b'\n');
+        }
+        site.commit_path(ledger_rel, &bytes);
+        let request_main = git_output(&site.root, &["rev-parse", "main"]);
+        bytes.extend(serde_json::to_vec(&receipt).unwrap());
+        bytes.push(b'\n');
+        fs::write(site.root.join(ledger_rel), bytes).unwrap();
+        let events = site.events();
+        let active = crate::plan::require_active_round_ir(&site.root, "r58", &events).unwrap();
+        for mode in [
+            CommittedLedgerMode::CanonicalRootSuffix,
+            CommittedLedgerMode::CanonicalPostMergeSuffix,
+        ] {
+            validate_expected_main_contract(
+                &site.root,
+                "r58",
+                "B172T",
+                &request_main,
+                &active,
+                mode,
+            )
+            .unwrap();
+        }
+        assert!(validate_expected_main_contract(
+            &site.root,
+            "r58",
+            "B172T",
+            &request_main,
+            &active,
+            CommittedLedgerMode::CanonicalVerdictSuffix,
+        )
+        .is_err());
+        assert!(!events.iter().any(|event| matches!(
+            event.kind.as_str(),
+            "ManagedWakeTerminated" | "WorkspaceReleased" | "ReviewDelivered" | "TaskRecorded"
+        )));
+    }
+
+    fn unified_review_receipt_fixture(site: &MergeSite) -> (EventRecord, EventRecord, EventRecord) {
+        let identity = serde_json::json!({
+            "wakeId": "wake-unified-review",
+            "continuationId": "review:r58:B172T:B172T-A0001:review:reviewer-native",
+            "attemptId": "B172T-A0001",
+            "agent": "reviewer-native",
+            "providerKind": "codex",
+            "requestedProvider": null,
+            "requestedModel": null,
+            "requestedEffort": null,
+            "requestMessageSha256": "a".repeat(64),
+            "renderedMessageSha256": "b".repeat(64),
+            "requestSessionId": null,
+            "backendState": "pending",
+            "logPath": site.root.join("coordination/runtime/logs/unified.jsonl"),
+            "probeOffset": 0,
+        });
+        let binding = serde_json::json!({
+            "configDigest": "1".repeat(64),
+            "requestDigest": "2".repeat(64),
+            "attachmentManifestSha256": "3".repeat(64),
+            "commandDigest": "4".repeat(64),
+            "executableIdentityDigest": "5".repeat(64),
+            "requestedTuple": {"provider": null, "model": null, "effort": null, "mode": null},
+            "effectiveTuple": {"provider": null, "model": null, "effort": null, "mode": "read-only"},
+            "driver": "codex",
+            "harness": "reviewer-native",
+            "observationSource": "native-final",
+            "invocationCwd": site.root,
+            "cwdSelection": "review-site",
+            "fixedHead": site.task_head,
+        });
+        let mut wake_payload = identity.clone();
+        wake_payload["method"] = serde_json::json!("unified-channel-v1");
+        wake_payload
+            .as_object_mut()
+            .unwrap()
+            .extend(binding.as_object().unwrap().clone());
+        let wake = ledger::event(
+            "WakeIssued",
+            "runtime:orch",
+            Some("B172T"),
+            Some("r58"),
+            wake_payload,
+        );
+        let mut review_payload = identity.clone();
+        review_payload["role"] = serde_json::json!("review");
+        review_payload["channelBinding"] = binding.clone();
+        let review = ledger::event(
+            "ReviewRequested",
+            "runtime:orch",
+            Some("B172T"),
+            Some("r58"),
+            review_payload,
+        );
+        let mut receipt_payload = identity;
+        receipt_payload["agentEvent"] = serde_json::json!("wake-backend-receipt");
+        receipt_payload["actionId"] = serde_json::json!("wake-unified-review");
+        receipt_payload["receiptKind"] = serde_json::json!("codex");
+        receipt_payload["observedSessionId"] = serde_json::json!("native-review-session");
+        receipt_payload["probeEnd"] = serde_json::json!(10);
+        receipt_payload["windowSha256"] = serde_json::json!("c".repeat(64));
+        receipt_payload["backendState"] = serde_json::json!("accepted");
+        receipt_payload["channelBinding"] = binding;
+        let receipt = ledger::event(
+            "AgentEventReceived",
+            "runtime:orch",
+            Some("B172T"),
+            Some("r58"),
+            receipt_payload,
+        );
+        (wake, review, receipt)
+    }
+
+    #[test]
+    fn unified_review_backend_receipt_rejects_shape_and_lineage_tampering() {
+        let site = MergeSite::new("unified-review-receipt-refusals");
+        let (wake, review, receipt) = unified_review_receipt_fixture(&site);
+        let prior = [wake.clone(), review.clone()];
+        let reject = |changed: &EventRecord, before: &[EventRecord]| {
+            assert!(canonical_wake_backend_receipt(changed, before, "r58").is_err());
+        };
+        for key in receipt
+            .payload
+            .as_ref()
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+        {
+            let mut changed = receipt.clone();
+            changed
+                .payload
+                .as_mut()
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            if key == "agentEvent" {
+                assert!(!canonical_wake_backend_receipt(&changed, &prior, "r58").unwrap());
+            } else {
+                reject(&changed, &prior);
+            }
+        }
+        let mut extra = receipt.clone();
+        extra.payload.as_mut().unwrap()["extra"] = serde_json::json!(true);
+        reject(&extra, &prior);
+        for key in receipt.payload.as_ref().unwrap()["channelBinding"]
+            .as_object()
+            .unwrap()
+            .keys()
+        {
+            let mut changed = receipt.clone();
+            changed.payload.as_mut().unwrap()["channelBinding"][key] =
+                serde_json::json!("tampered");
+            reject(&changed, &prior);
+        }
+        let mut legacy = wake.clone();
+        legacy
+            .payload
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("method");
+        reject(&receipt, &[legacy, review.clone()]);
+        let mut malformed_wake = wake.clone();
+        malformed_wake.payload.as_mut().unwrap()["configDigest"] = serde_json::json!(false);
+        reject(&receipt, &[malformed_wake, review.clone()]);
+        reject(&receipt, &[]);
+        reject(&receipt, std::slice::from_ref(&wake));
+        reject(&receipt, &[wake.clone(), wake.clone(), review.clone()]);
+        reject(&receipt, &[wake.clone(), review.clone(), review.clone()]);
+        reject(&receipt, &[wake.clone(), review.clone(), receipt.clone()]);
+        let mut foreign_review = review.clone();
+        foreign_review.payload.as_mut().unwrap()["agent"] = serde_json::json!("another");
+        reject(&receipt, &[wake.clone(), foreign_review]);
+        let mut unknown_role = receipt.clone();
+        unknown_role.payload.as_mut().unwrap()["continuationId"] =
+            serde_json::json!("review:r58:B172T:B172T-A0001:unknown:reviewer-native");
+        reject(&unknown_role, &prior);
     }
 
     #[test]
