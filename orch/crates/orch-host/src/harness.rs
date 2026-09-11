@@ -827,6 +827,10 @@ const STATUS_CANCEL_CONTROL: ControlCapabilities = ControlCapabilities {
 
 impl HarnessId {
     /// Report whether this driver implements the requested action at all.
+    /// Pi and ZCode Consult require a complete native terminal body and its digest;
+    /// advertised support alone does not turn tool output or an unsuccessful run into an answer.
+    /// DSH Consult also requires exact native history publication in the calling project.
+    /// Synchronous consultation does not invent a native acceptance receipt.
     pub fn supports_action(self, action: DriverAction) -> bool {
         match self {
             Self::Cursor | Self::Mimo | Self::CodeBuddy => action == DriverAction::Consult,
@@ -834,8 +838,8 @@ impl HarnessId {
                 matches!(action, DriverAction::Review | DriverAction::Consult)
             }
             Self::Dclaw => false,
-            Self::Pi | Self::ZCode | Self::Dsh | Self::Agy => action != DriverAction::Consult,
-            Self::OpenCode | Self::Codex | Self::Claude => true,
+            Self::Agy => action != DriverAction::Consult,
+            Self::Dsh | Self::Pi | Self::ZCode | Self::OpenCode | Self::Codex | Self::Claude => true,
         }
     }
 

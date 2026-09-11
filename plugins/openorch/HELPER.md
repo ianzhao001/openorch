@@ -114,10 +114,10 @@ the complete version; a development checkout is not an integrity fallback.
 Checksums detect local changes, not publisher identity or reproducible builds.
 
 The current core supports consultation for Codex, Claude, OpenCode, Cursor,
-MiMo, CodeBuddy and SmartClaw, subject to actual configuration discovery.
-DSH, Pi, AGY and ZCode are not consultation targets in this core release.
-DSH Web can host this plugin and invoke supported targets. Host integration
-and target capabilities are separate. Runtime discovery is the final authority.
+MiMo, CodeBuddy, SmartClaw, DSH, Pi and ZCode, subject to actual configuration
+discovery. AGY is not a consultation target in this core release. DSH Web can
+host this plugin and invoke supported targets. Host integration and target
+capabilities are separate. Runtime discovery is the final authority.
 
 ## Errors and recovery
 

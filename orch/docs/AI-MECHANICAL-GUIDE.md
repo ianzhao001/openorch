@@ -212,6 +212,29 @@ B328 已物理删除 live 永久 landed/prefix/source-shape 准入、公开 srcs
 不能把历史审计失败改成固定空摘要，也不能从 legacy 重新生成 supersession。新 `TaskRecorded` 批次
 仍受原有根裁决、相邻事件、祖先关系和收口门检查约束。
 
+Cargo 种子观测只解析签名目标的运行块，忽略其他目标的模拟测试输出；局部计数不覆盖
+原命令退出码或既有全门判定。断言观测必须由唯一的 `Running tests/<target>.rs (<binary>)` 运行块、逐用例
+`ok`/`FAILED` 结果与一致的闭合汇总证明。静态 seed 测试名只定义预期集合，不能用
+“测试总数减失败数”推导通过。前置套件失败、部分用例未运行、ignored/过滤、截断或
+缺少有效汇总时，以 `seed-not-observed` 拒绝本次测量；目标/用例重复、冲突或外来 binary 以
+`seed-not-attributable` 拒绝。诊断附目标/用例和原门日志，不产生虚构的 Measured。
+Cargo 文本没有 package ID；当前工作区中存在同名 integration target 时也保守拒绝，
+不能用一个 crate 的运行块替代另一个尚未执行的 crate。
+这不是零效果入口拒绝：门可能已经执行。只有具备完整观测后才进行 E12 的 REPORT
+精确数字复算；无法观测不能被误报成 REPORT 造假。既有 compile-red 的 canonical
+rustc 身份与 Measured 历史序列化形状保持不变。
+
+Pi / ZCode 的 `consult` 使用调用项目的规范绝对根目录作为 cwd，并从原生终态提取完整答复。
+Pi 需要同一会话的 assistant stop 与 agent_settled；ZCode 需要唯一原生终态对象，并使用原生 plan 模式。
+两者都传递 finalText 与 UTF-8 SHA-256；空答、缺失结束、身份漂移、重复终态或原生非零退出不构成有效答卷。
+工具输出与原始转录不能补成终答。既有 review/execute 的投影与模式保持，Native 回执能力也不改变；
+同步咨询未产生可信 acceptance receipt 时诚实显示 unknown，不制造回执。原项目目录中的原生历史仍由客户端保存和查询。
+
+DSH 的 `consult` 同样显式绑定调用项目根；受控环境仅为 DSH Consult 保留非空 DSH_HOME 原生数据目录覆盖，模型不从环境取值。仅 CONSULT/CONSULT-A0000 的 Consult 可把受核验的 Cargo runtime target 放在调用目录内；原有 /tmp/TMPDIR、profile、CACHEDIR.TAG、符号链接与可写性检查仍保留。Consult 只使用原生 headless 通路，不把 minimal preset 名称当作只读保障。
+调用前用所选 DSH 安装自带的 YAML 解析器读取配置，生成0600单次 settings 快照，固定实际 provider/model/effort、read-only 权限及 watch:false；全局设置不改。只识别默认或明确字面量的 settings 路径，以及默认 dshHomePath('sessions') 或绝对字面量的 zstd 会话根；不执行 !!js，未建模的自定义配置明确失败。
+完成后用同一安装的原生 persistence API 检查唯一 completed turn、完整 final、request/header pins、无 tornMarker 与未完成工具，再把原生压缩日志逐字节独立复制到 native locate 给出的项目目录。独占发布不覆盖任何已有会话；原生 list/loadStored/readRaw 必须能找到并打开完整对话。只有成功且验真的咨询发布历史；失败/未知记录留在私有证据目录，不冒充项目原生历史或有效票。
+空答、超长正文、身份/模型漂移、写入/委派工具、残留工具或历史发布失败返回 failed；复用 exit74 并记录具体失败阶段。若发布后复验失败，保留已发生的文件效果与证据，不宣称零效果。已有 review/execute 行为及回执能力不改变，同步 Consult 不补造 acceptance receipt。
+
 schema 3 的 `consult` 在 PlanSignedOff 前后均可调用，形状为一个或多个重复 `--harness <ALIAS>` 与
 可重复 `--attach`。timeout 只来自显式 CLI 覆盖或 code-owned 默认；所有成员共享一次捕获的 config 与
 ordered attachment snapshot，完成预检后并发运行于各自 process group。deadline 到达即终止对应整组；
@@ -461,6 +484,14 @@ Pi、ZCode 与 DSH 的受管 wrapper 通过同一份 provider-neutral 环境信�
 `review|consult`；implement/consult 的 review 落点必须用
 显式 `NO_REVIEW_OUTPUT` 哨兵。`ORCH_HARNESS_CWD` 与 review 落点必须是绝对路径，fixed head 必须是
 完整 40 位小写 SHA；provider/orch binary 必须是绝对、存在且可执行的常规文件。
+
+Pi 另由 renderer 派生 `ORCH_PI_PROJECT_ROOT`，把 original project identity 与工具 cwd 分开；它不扩充
+上述闭合十六键信封。两者不同时，受管 wrapper 必须调用所选 Pi 安装包的 native
+`getDefaultSessionDir(originalProject)`，以原样 `--session-dir` 打开项目 history，同时 provider/tool cwd
+仍保持目标 worktree。SDK 缺失、项目路径无效或 native lookup 失败均在 Pi 启动前拒绝，不能把 worktree
+history 冒充 original-project history；同根与 legacy 调用继续使用 Pi 的 native 默认路径。
+CodeBuddy 的 schema-3 renderer 保留 native session persistence，使 original-project process context 中的
+完整 history 可由原生客户端查找；导出文件不替代 native history。
 
 <!-- orch-guide-harness:envelope-complete-or-refuse -->
 只要出现任一信封键，十六键就必须全部非空并在任何 provider `spawn` 之前完成校验；缺键、空白、

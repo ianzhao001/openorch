@@ -34,6 +34,7 @@ Never substitute a development checkout or a globally found `orch` for its runti
    limitations/failures and links to original answers. Keep actual model identity
    separate from requested configuration when native evidence is unavailable.
 
-DSH Web is a plugin **host**. In this release DSH, Pi, AGY and ZCode are not
-supported Consult targets; actual core discovery is authoritative. This plugin
+DSH Web is a plugin **host** and DSH is also a supported Consult target. Pi and
+ZCode are supported Consult targets in this release; AGY is not. Actual core
+discovery is authoritative. This plugin
 does not add execution/review scheduling or background orchestration.

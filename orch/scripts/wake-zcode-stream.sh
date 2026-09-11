@@ -12,11 +12,12 @@
 # orch-exit-code: 70 empty zero-frame-eof
 # orch-exit-code: 71 empty truncated-no-terminal
 # orch-exit-code: 72 timedOut hard-deadline
+# orch-exit-code: 74 failed identity-drift
 #
 # 设计目标（B228）：
 # - 保留 launch argv 不变：node <bundle>/zcode.cjs -p "$MSG" --json --cwd "$WORKDIR"。
 # - 以 --json 会话落盘文件（~/.zcode/cli/rollout/*.jsonl）为证据输入，不再依赖 stderr。
-# - 仅投影 role=="tool" 的内容到 wake 日志（按 messageCount 增量逐条输出单行帧）。
+# - Review/Execute 仅投影完成的 tool 内容；Consult 另投影完整原生终答与摘要。
 # - 每帧有界；超限打 truncation 标记，避免 prompt/response 泄露与“日志暴风”。
 #
 # 为什么放在 orch/ 而不是 coordination/scripts/：
@@ -85,6 +86,7 @@ def legacy_conflict(alias, envelope_key, selected):
 
 present_envelope_keys = [key for key in ENVELOPE_KEYS if key in os.environ]
 envelope_mode = bool(present_envelope_keys)
+consult_mode = envelope_mode and os.environ.get("ORCH_HARNESS_ROLE") == "consult"
 if envelope_mode:
     missing = [
         key
@@ -272,6 +274,8 @@ argv = ([bundle] if envelope_mode else ["node", bundle]) + [
     "--cwd",
     workdir,
 ]
+if consult_mode:
+    argv.extend(["--mode", "plan"])
 max_frame_bytes = 64 * 1024
 deadline = time.time() + timeout
 script_started = time.time()
@@ -453,6 +457,8 @@ finally:
 
 out = output or ""
 terminal = None
+terminal_candidates = 0
+malformed_native_stdout = False
 if out.strip():
     # ZCode's --json terminal object is commonly pretty-printed across many
     # lines. Parse the complete stdout object first; retain the compact
@@ -467,6 +473,7 @@ if out.strip():
         and whole_value.get("response") is not None
     ):
         terminal = whole_value
+        terminal_candidates += 1
     else:
         for line in out.splitlines():
             candidate = line.strip()
@@ -475,6 +482,7 @@ if out.strip():
             try:
                 value = json.loads(candidate)
             except Exception:
+                malformed_native_stdout = True
                 continue
             if (
                 isinstance(value, dict)
@@ -482,9 +490,18 @@ if out.strip():
                 and value.get("response") is not None
             ):
                 terminal = value
-                break
+                terminal_candidates += 1
+                if not consult_mode:
+                    break
 
 elapsed = time.time() - (deadline - timeout)
+if consult_mode and malformed_native_stdout:
+    diag("incomplete native stdout; no consult answer exit=71")
+    sys.exit(71)
+if consult_mode and terminal_candidates > 1:
+    diag("multiple native terminal/session objects; no consult answer exit=74")
+    sys.exit(74)
+
 session_id = terminal.get("sessionId") if terminal else None
 usage = terminal.get("usage") if terminal else None
 if terminal is not None:
@@ -494,6 +511,11 @@ if terminal is not None:
         if isinstance(response, str) and response.strip()
         else None
     )
+    if consult_mode and (
+        not isinstance(session_id, str) or not session_id.strip() or response_sha256 is None
+    ):
+        diag("native terminal has no complete bound consult text exit=71")
+        sys.exit(71)
     projection = terminal.get("projection")
     context_window = (
         projection.get("contextWindow") if isinstance(projection, dict) else None
@@ -511,6 +533,8 @@ if terminal is not None:
         "contextWindow": context_window,
         "traceId": trace_id,
     }
+    if consult_mode:
+        terminal_frame["finalText"] = response
     if not synthetic_b228_fixture:
         terminal_frame.update({"provider": provider, "model": model, "effort": effort})
     print(json.dumps(terminal_frame, ensure_ascii=False, separators=(",", ":")), flush=True)

@@ -10,7 +10,7 @@ Git projects.
 ## 安装 / Install
 
 下载 [OpenOrch Release](https://github.com/ianzhao001/openorch/releases) 中的完整
-Apple Silicon macOS 插件归档并解压。插件版本为 `0.1.0-alpha.4`，核心版本仍是
+Apple Silicon macOS 插件归档并解压。插件版本为 `0.1.0-alpha.5`，核心版本仍是
 `orch 0.1.0`。源码仓本身不含运行核心，不能代替完整 Release 安装包。
 
 Download and extract the complete Apple Silicon macOS plugin archive. It includes
@@ -77,11 +77,11 @@ independent model diversity. Native clients may incur their normal usage costs.
 | Surface | Current behavior |
 | --- | --- |
 | Plugin hosts | Codex Desktop and DSH Web |
-| Consult targets | Codex, Claude, OpenCode, Cursor, MiMo, CodeBuddy, SmartClaw, subject to actual discovery/configuration |
-| Unsupported Consult targets | DSH, Pi, AGY, ZCode |
+| Consult targets | Codex, Claude, OpenCode, Cursor, MiMo, CodeBuddy, SmartClaw, DSH, Pi, ZCode, subject to actual discovery/configuration |
+| Unsupported Consult targets | AGY |
 | Core surfaces | Default CLI 6 commands; selfhost CLI 30; existing UI preserved |
 
-DSH 作为插件宿主可调用受支持的其它通道；这与 DSH 自身能否成为 Consult 目标是两件事。
+DSH 既可作为插件宿主，也可作为 Consult 目标；宿主集成与目标通道能力仍需分别核验。
 执行和审查动作的支持范围没有由本插件扩展。配置模型名称不等于原生证据已验证该身份。
 
 Missing clients, unsupported members, failed/partial calls and empty or tool-only

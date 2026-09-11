@@ -2831,7 +2831,7 @@ fn cmd_round(root: &std::path::Path, action: RoundCmd) -> Result<ExitCode> {
                 if !o.unrecorded.is_empty() {
                     println!("  ⚠️ 未收任务（--force 放行）: {}", o.unrecorded.join(", "));
                 }
-                println!("  DONE.md 已写（Tier F 客户端 wait 返回 ROUND_COMPLETE 后写 SUMMARY）");
+                println!("  DONE.md 已写（root planner 继续完成 handoff；下一轮显式规划并 dispatch）");
                 match orch_host::logrotate::rotate_closed_round_logs(root) {
                     Ok(rotated) => println!(
                         "· 收轮后日志轮转：closed={} orphaned={}（legacy handshake relink 永不轮转）",

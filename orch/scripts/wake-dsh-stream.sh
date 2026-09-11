@@ -1,5 +1,9 @@
 #!/bin/sh
-# wake-dsh-stream.sh <message> -- DeepSeek Harness completed-tool projection.
+# wake-dsh-stream.sh <message> -- DeepSeek Harness managed native projection.
+# Authenticated Consult additionally uses a private settings snapshot, native
+# final-message validation and exact native-history publication in the calling
+# project. The legacy wake projection/capability-floor notes below describe
+# the retained non-Consult route; they do not substitute for Consult evidence.
 #
 # Reserved wrapper outcomes. Provider-native non-zero codes are preserved as
 # failed exact reasons and therefore deliberately remain outside this manifest.
@@ -263,9 +267,143 @@ def completed_tool_text(record):
     return "\n".join(chunks) if chunks else None
 
 
+# Use the selected installation's parser and persistence reader. The small
+# helper lives in this authenticated wrapper, not in the calling repository.
+# Native !!js profile values are inspected as data, never evaluated.
+NATIVE_CONSULT_HELPER = r"""
+import fs from 'node:fs';
+import path from 'node:path';
+import {createRequire} from 'node:module';
+import {pathToFileURL} from 'node:url';
+import {createHash, randomBytes} from 'node:crypto';
+const action=process.argv[2], info=JSON.parse(fs.readFileSync(process.argv[3],'utf8'));
+const req=createRequire(fs.realpathSync(info.bin));
+const nativeImport=async name=>import(pathToFileURL(req.resolve(name)).href);
+const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
+function requireValue(ok, message) { if(!ok) throw Error(message); }
+function utf8(bytes) {
+ const text=bytes.toString('utf8');requireValue(Buffer.from(text).equals(bytes),'invalid UTF-8');return text;
+}
+function noLinks(value, create=false) {
+ requireValue(path.isAbsolute(value),'native path must be absolute');
+ let current=path.parse(value).root;
+ for(const part of value.slice(current.length).split(path.sep).filter(Boolean)) {
+  current=path.join(current,part);
+  if(create&&!fs.existsSync(current))fs.mkdirSync(current,{mode:0o700});
+  const st=fs.lstatSync(current);requireValue(st.isDirectory()&&!st.isSymbolicLink(),'native directory is not a plain directory');
+ }
+ return value;
+}
+function fileBytes(file) {
+ noLinks(path.dirname(file));
+ const fd=fs.openSync(file,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
+ try {const before=fs.fstatSync(fd);requireValue(before.isFile()&&before.size<=64*1024*1024,'native file type/size rejected');
+  const bytes=fs.readFileSync(fd);const after=fs.fstatSync(fd);
+  requireValue(before.size===bytes.length&&before.size===after.size&&before.mtimeMs===after.mtimeMs,'native file changed');return bytes;
+ }finally{fs.closeSync(fd);}
+}
+function syncDir(dir) {const fd=fs.openSync(dir,'r');try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
+if(action==='prepare') {
+ const yaml=await import(pathToFileURL(createRequire(req.resolve('@deepseek-ai/dsh-settings-file')).resolve('yaml')).href);
+ const profile=yaml.parseDocument(utf8(fileBytes(info.profile)),{customTags:[{tag:'tag:yaml.org,2002:js',resolve:value=>({nativeExpression:value})}]});
+ requireValue(!profile.errors.length&&!profile.warnings?.length,'native profile cannot be parsed');
+ const tree=profile.toJS();requireValue(Array.isArray(tree),'native profile must be a flat composition');
+ function entry(id) {const rows=tree.filter(x=>x.id===id);requireValue(rows.length===1&&!rows[0].disabled,'native profile entry unavailable: '+id);return rows[0].config??{};}
+ const storage=entry('session-persistence-jsonl'), settingConfig=entry('settings');
+ requireValue(!storage.compression||storage.compression==='zstd','native history requires zstd storage');
+ let nativeRoot=storage.root;
+ if(nativeRoot?.nativeExpression==="dshHomePath('sessions')"||nativeRoot?.nativeExpression==='dshHomePath("sessions")')nativeRoot=path.join(info.home,'sessions');
+ requireValue(typeof nativeRoot==='string'&&path.isAbsolute(nativeRoot),'unsupported native session-root expression');
+ nativeRoot=path.resolve(nativeRoot);
+ requireValue(nativeRoot!==info.cwd&&!nativeRoot.startsWith(info.cwd+path.sep),'native history root cannot be inside consultation workspace');
+ requireValue(!settingConfig.dshHome,'custom settings dshHome is not modeled');
+ requireValue(settingConfig.path===undefined||typeof settingConfig.path==='string','unsupported native settings-path expression');
+ const source=settingConfig.path===undefined?path.join(info.home,'settings.yaml'):path.resolve(info.cwd,settingConfig.path);
+ const original=fs.existsSync(source)?fileBytes(source):Buffer.from('{}');
+ const doc=yaml.parseDocument(utf8(original));requireValue(!doc.errors.length&&!doc.warnings?.length,'native settings cannot be parsed');
+ const settings=doc.toJS()??{};requireValue(typeof settings==='object'&&!Array.isArray(settings),'native settings must be a map');
+ settings['agent-default-model']=info.pins;
+ settings.permission={defaultPreset:'read-only'};
+ const fd=fs.openSync(info.settings,fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);
+ try{fs.writeFileSync(fd,JSON.stringify(settings)+'\n');fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
+ console.log(JSON.stringify({nativeRoot,settingsPath:info.settings,originalSettingsPath:source,originalSettingsSha256:sha(original)}));
+} else if(action==='publish') {
+ const {Context}=await nativeImport('@deepseek-ai/cordis');
+ const {SessionStore}=await nativeImport('@deepseek-ai/dsh-session');
+ const {JsonlSessionPersistence}=await nativeImport('@deepseek-ai/dsh-session-persistence-jsonl');
+ const ctx=new Context();new SessionStore(ctx);const contexts=[ctx];
+ try {
+  const privateStore=new JsonlSessionPersistence(ctx,{root:info.privateRoot,compression:'zstd'});
+  const source=privateStore.locate({id:info.id,cwd:info.cwd}).path;
+  const bytes=fileBytes(source), loaded=await privateStore.loadStored(info.id);
+  requireValue(loaded&&!loaded.tornMarker,'native history is absent or torn');
+  requireValue(loaded.meta.id===info.id&&loaded.meta.cwd===info.cwd,'native history identity drift');
+  const events=loaded.events, end=events.at(-1);
+  requireValue(events.filter(x=>x.type==='turn/start').length===1&&events.filter(x=>x.type==='turn/end').length===1&&end?.type==='turn/end'&&end.data?.reason?.kind==='completed','native turn did not complete exactly once');
+  const headers=events.filter(x=>x.type==='request/header');requireValue(headers.length>0,'native request pin absent');
+  for(const h of headers)for(const key of ['provider','model','reasoningEffort'])requireValue(h.data?.header?.config?.[key]===info.pins[key],'native request pin drift');
+  const pending=new Set(), seenCalls=new Set();
+  const mutations=new Set(['write','edit','str_replace_editor','subagent','subagent_fork','subagent_codex','subagent_claude_code','ralph','workflow']);
+  for(const e of events) {
+   if(e.type==='tool/call') {const d=e.data;requireValue(typeof d?.callId==='string'&&!seenCalls.has(d.callId),'native tool identity is ambiguous');const editorView=d.name==='str_replace_editor'&&d.arguments?.command==='view';requireValue(editorView||!mutations.has(d.name),'mutating/delegating tool in read-only consultation');seenCalls.add(d.callId);pending.add(d.callId);}
+   if(e.type==='tool/result')for(const block of e.data?.message?.content??[])if(block.type==='tool-result')requireValue(pending.delete(block.toolCallId),'native result has no unique pending call');
+  }
+  requireValue(pending.size===0,'native tools are still pending');
+  const finalEvent=events.filter(x=>x.type==='assistant/message').at(-1);
+  requireValue(finalEvent?.data?.turn===end.data.turn,'native final belongs to another turn');
+  const last=finalEvent?.data?.message;
+  requireValue(last?.role==='assistant'&&Array.isArray(last.content),'native final message missing');
+  const text=last.content.filter(x=>x.type==='text').map(x=>{requireValue(typeof x.text==='string','invalid native text');return x.text;}).join('');
+  requireValue(text.trim().length>0&&Buffer.byteLength(text)<=60*1024,'native final is empty or oversized');
+  const raw=await privateStore.readRaw(info.id);requireValue(raw&&fileBytes(source).equals(bytes),'private native evidence changed');
+  noLinks(info.nativeRoot,true);
+  const nativeContext=new Context();new SessionStore(nativeContext);contexts.push(nativeContext);
+  const nativeStore=new JsonlSessionPersistence(nativeContext,{root:info.nativeRoot,compression:'zstd'});
+  requireValue(!(await nativeStore.loadStored(info.id)),'native publication ID collision');
+  requireValue(!(await nativeStore.list()).some(x=>x.id===info.id),'native publication ID collision');
+  for(const project of fs.readdirSync(info.nativeRoot,{withFileTypes:true}))if(project.isDirectory())requireValue(!fs.existsSync(path.join(info.nativeRoot,project.name,info.id)),'existing native session directory');
+  const destination=nativeStore.locate(loaded.meta).path;
+  requireValue(destination.startsWith(info.nativeRoot+path.sep),'native locator escaped root');
+  const dir=path.dirname(destination);noLinks(path.dirname(dir),true);fs.mkdirSync(dir,{mode:0o700});syncDir(path.dirname(dir));
+  const temporary=path.join(dir,'.orch-publish-'+randomBytes(12).toString('hex'));
+  const fd=fs.openSync(temporary,fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);
+  try{fs.writeFileSync(fd,bytes);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
+  try{fs.linkSync(temporary,destination);syncDir(dir);}finally{fs.unlinkSync(temporary);}
+  const discovered=(await nativeStore.list()).filter(x=>x.id===info.id&&x.cwd===info.cwd);
+  const opened=await nativeStore.loadStored(info.id), reopenedRaw=await nativeStore.readRaw(info.id);
+  requireValue(discovered.length===1&&opened&&!opened.tornMarker&&opened.meta.cwd===info.cwd&&reopenedRaw?.content===raw.content,'published native history failed lookup/open');
+  requireValue(fileBytes(destination).equals(bytes)&&fileBytes(source).equals(bytes),'published native bytes differ');
+  console.log(JSON.stringify({finalText:text,finalTextSha256:sha(Buffer.from(text)),nativeHistoryPath:destination,nativeHistorySha256:sha(bytes)}));
+ }finally{for(const context of contexts.reverse())await context.fiber.dispose();}
+}else{throw Error('unknown native consultation operation');}
+"""
+
+
+def native_consult_operation(action, info):
+    metadata = os.path.join(runtime_target, ".orch-dsh-native-" + action + "-" + launch_nonce + ".json")
+    install_exact_file(metadata, json.dumps(info).encode("utf-8"), "native consultation input")
+    errors = metadata + ".stderr"
+    fd = os.open(errors, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    env = os.environ.copy()
+    env["DSH_HOME"] = dsh_home
+    with os.fdopen(fd, "wb") as stderr:
+        result = subprocess.run(
+            [executable("node", "DSH native API Node"), "--input-type=module", "-", action, metadata],
+            input=NATIVE_CONSULT_HELPER.encode("utf-8"), stdout=subprocess.PIPE,
+            stderr=stderr, cwd=workdir, env=env, timeout=30,
+        )
+    if result.returncode != 0:
+        raise RuntimeError("native consultation %s failed; private diagnostics: %s" % (action, errors))
+    value = json.loads(result.stdout.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise RuntimeError("native consultation helper did not return an object")
+    return value
+
+
 message = os.environ["MSG"]
 present_envelope_keys = [key for key in ENVELOPE_KEYS if key in os.environ]
 envelope_mode = bool(present_envelope_keys)
+consult_mode = envelope_mode and os.environ.get("ORCH_HARNESS_ROLE") == "consult"
 if envelope_mode:
     missing = [
         key
@@ -332,7 +470,14 @@ manual_envelope = envelope_mode and (
     os.environ["ORCH_HARNESS_TASK_ID"] == "MANUAL"
     and os.environ["ORCH_HARNESS_ATTEMPT_ID"] == "MANUAL-A0000"
 )
-if (target_is_in_workspace and not manual_envelope) or target_is_temporary:
+consult_envelope = consult_mode and (
+    os.environ.get("ORCH_HARNESS_TASK_ID") == "CONSULT"
+    and os.environ.get("ORCH_HARNESS_ATTEMPT_ID") == "CONSULT-A0000"
+)
+if consult_mode and not consult_envelope:
+    diag("consult requires the exact CONSULT/CONSULT-A0000 envelope")
+    sys.exit(66)
+if (target_is_in_workspace and not (manual_envelope or consult_envelope)) or target_is_temporary:
     diag("CARGO_TARGET_DIR 必须位于 WORKTREE 与 /tmp 之外: %s" % runtime_target)
     sys.exit(65)
 
@@ -366,6 +511,40 @@ patch_entries = [
     {"id": "session-persistence-jsonl", "config": {"root": session_store}}
 ]
 preset = os.environ.get("ORCH_DSH_PRESET") or "minimal"
+profile = os.environ.get("ORCH_DSH_PROFILE") or "headless"
+consult_prepared = None
+if consult_mode:
+    if os.environ.get("ORCH_DSH_PRESET"):
+        diag("DSH consult does not model the minimal preset; select headless")
+        sys.exit(66)
+    profile_path = os.path.join(runtime_target, ".orch-dsh-profile-" + launch_nonce + ".yaml")
+    profile_errors = profile_path + ".stderr"
+    profile_fd = os.open(profile_errors, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        profile_env = os.environ.copy()
+        profile_env["DSH_HOME"] = dsh_home
+        with os.fdopen(profile_fd, "wb") as errors:
+            composed = subprocess.run([dsh_bin, "--profile", profile, "--dump-config"], cwd=workdir,
+                env=profile_env, stdout=subprocess.PIPE, stderr=errors, timeout=30)
+        if composed.returncode != 0 or len(composed.stdout) > 2 * 1024 * 1024:
+            raise RuntimeError("native profile dump failed or exceeded its size bound")
+        install_exact_file(profile_path, composed.stdout, "native profile snapshot")
+        consult_prepared = native_consult_operation("prepare", {
+            "bin": dsh_bin, "home": dsh_home, "cwd": workdir, "profile": profile_path,
+            "settings": os.path.join(runtime_target, ".orch-dsh-settings-" + launch_nonce + ".json"),
+            "pins": {"provider": pin_provider, "model": pin_model, "reasoningEffort": pin_effort},
+        })
+        patch_entries.extend([
+            {"id": "settings", "config": {"path": consult_prepared["settingsPath"], "watch": False}},
+            {"id": "permission", "config": {"presets": {"read-only": {"sandbox": "read-only", "approval": "ask"}}, "defaultPreset": "read-only"}},
+            {"id": "tool-subagent", "disabled": True},
+            {"id": "tool-subagent-fork", "disabled": True},
+            {"id": "tool-ralph", "disabled": True},
+            {"id": "tool-workflow", "disabled": True},
+        ])
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        diag("consult preparation failed: %s" % exc)
+        sys.exit(74)
 if envelope_mode:
     patch_entries.extend(
         [
@@ -377,9 +556,10 @@ if envelope_mode:
                     "reasoningEffort": pin_effort,
                 },
             },
-            {"id": "agent-presets", "config": {"default": preset}},
         ]
     )
+    if not consult_mode:
+        patch_entries.append({"id": "agent-presets", "config": {"default": preset}})
 patch_payload = (
     json.dumps(
         patch_entries, ensure_ascii=False, separators=(",", ":")
@@ -766,6 +946,17 @@ if not terminal_seen:
     sys.exit(code)
 
 usage = terminal_record.get("usage") if isinstance(terminal_record, dict) else None
+consult_final = {}
+if consult_mode:
+    try:
+        consult_final = native_consult_operation("publish", {
+            "bin": dsh_bin, "home": dsh_home, "cwd": workdir,
+            "privateRoot": session_store, "nativeRoot": consult_prepared["nativeRoot"], "id": selected_id,
+            "pins": {"provider": pin_provider, "model": pin_model, "reasoningEffort": pin_effort},
+        })
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        diag("consult native final/history failed (private evidence retained): %s" % exc)
+        sys.exit(74)
 print(
     json.dumps(
         {
@@ -776,6 +967,7 @@ print(
             "usageAbsentReason": None
             if isinstance(usage, dict)
             else "dsh turn/end record omitted usage",
+            **consult_final,
         },
         ensure_ascii=False,
         separators=(",", ":"),

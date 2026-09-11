@@ -63,16 +63,7 @@ fn classifier() -> PathBuf {
 }
 
 fn temp_root(label: &str) -> PathBuf {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "orch-b286-{label}-{}-{nonce}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&root).unwrap();
-    root
+    orch_host::util::test_scratch_dir(&format!("b286-{label}"))
 }
 
 /// 跑分类器。`now_ms` 显式传入，使断言与真实时钟无关（可重放）。

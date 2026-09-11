@@ -9,7 +9,7 @@ const CONFIG: &str = r#"
 version: 1
 harnesses:
   writer:
-    driver: dsh
+    driver: agy
     executable: /bin/echo
     enabled: true
     cwdPolicy: project-root

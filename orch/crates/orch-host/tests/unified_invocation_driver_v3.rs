@@ -237,16 +237,16 @@ fn driver_catalog_is_the_closed_action_support_truth() {
     assert!(HarnessId::SmartClaw.supports_action(DriverAction::Review));
     assert!(!HarnessId::Agy.supports_action(DriverAction::Consult));
     assert!(!HarnessId::Dclaw.supports_action(DriverAction::Consult));
-    assert!(!HarnessId::Pi.supports_action(DriverAction::Consult));
-    assert!(!HarnessId::ZCode.supports_action(DriverAction::Consult));
-    assert!(!HarnessId::Dsh.supports_action(DriverAction::Consult));
+    assert!(HarnessId::Pi.supports_action(DriverAction::Consult));
+    assert!(HarnessId::ZCode.supports_action(DriverAction::Consult));
+    assert!(HarnessId::Dsh.supports_action(DriverAction::Consult));
 }
 
 #[test]
 fn unsupported_action_override_is_row_local_while_driver_without_actions_is_unavailable() {
     let fixture = Fixture::new("row-local-action");
     let yaml = format!(
-        "version: 1\nharnesses:\n  alpha:\n    driver: dsh\n    executable: {}\n    enabled: true\n    defaults: {{provider: local, model: model-a, effort: high}}\n    consult: {{mode: headless}}\n    cwdPolicy: project-root\n  beta:\n    driver: dclaw\n    executable: {}\n    enabled: true\n    cwdPolicy: project-root\n",
+        "version: 1\nharnesses:\n  alpha:\n    driver: agy\n    executable: {}\n    enabled: true\n    defaults: {{provider: antigravity, model: model-a, effort: high}}\n    consult: {{model: unsupported-action-model}}\n    cwdPolicy: project-root\n  beta:\n    driver: dclaw\n    executable: {}\n    enabled: true\n    cwdPolicy: project-root\n",
         fixture.executable.display(),
         fixture.executable.display()
     );

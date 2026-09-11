@@ -2826,7 +2826,9 @@ fn cargo_test_names(seed_source: &str) -> Vec<String> {
     names
 }
 
-/// cargo 没有 per-file 汇总行：从种子源码提取测试函数，再与失败全名做后缀匹配。
+/// Count expected Cargo tests and matching failure names from seed source.
+/// This static inventory does not prove execution or passing outcomes; live
+/// assertion observations must use `observed_cargo_seed_counts` instead.
 pub fn cargo_file_counts(seed_source: &str, failed_cases: &[String]) -> FileCounts {
     let test_names = cargo_test_names(seed_source);
     let failed = failed_cases
@@ -2841,6 +2843,345 @@ pub fn cargo_file_counts(seed_source: &str, failed_cases: &[String]) -> FileCoun
         tests: test_names.len(),
         failed,
     }
+}
+
+/// Expected seed cases and their signed Cargo integration-test target.
+/// This inventory identifies required observations; it never supplies passing
+/// results for tests that Cargo did not report running.
+#[derive(Debug, Clone)]
+pub struct CargoSeedRunSpec {
+    /// Canonical repository-relative integration target from the signed seed.
+    pub target: String,
+    /// Test names extracted from that seed's source, each requiring one result.
+    pub test_names: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ObservedCargoRun {
+    target: String,
+    binary: String,
+    declared: Option<usize>,
+    outcomes: Vec<(String, Option<bool>)>,
+    summary: Option<(usize, usize, usize)>,
+}
+
+fn cargo_observed_summary(line: &str) -> Option<(usize, usize, usize)> {
+    let (success, body) = line
+        .strip_prefix("test result: ok. ")
+        .map(|body| (true, body))
+        .or_else(|| {
+            line.strip_prefix("test result: FAILED. ")
+                .map(|body| (false, body))
+        })?;
+    let count = |label: &str| -> Option<usize> {
+        let matching = body
+            .split(';')
+            .filter(|part| part.split_whitespace().last() == Some(label))
+            .collect::<Vec<_>>();
+        let [part] = matching.as_slice() else {
+            return None;
+        };
+        let words = part.split_whitespace().collect::<Vec<_>>();
+        let [number, _] = words.as_slice() else {
+            return None;
+        };
+        number.parse().ok()
+    };
+    let summary = (count("passed")?, count("failed")?, count("ignored")?);
+    (success == (summary.1 == 0)).then_some(summary)
+}
+
+/// Count seed outcomes only from complete, uniquely attributable Cargo runs.
+/// Each signed integration target needs its own `Running` boundary, matching
+/// test binary, named `ok`/`FAILED` results and consistent closing summary.
+/// Missing, ignored, filtered, duplicate or truncated observations are errors,
+/// never inferred passes. This does not alter compile-red or `Measured` JSON.
+/// Cargo text has no package ID; the live oracle also checks source ownership
+/// in the workspace before publishing these counts.
+/// Other targets' runtime chatter is not seed evidence. This function counts
+/// selected targets; it does not decide whether the entire Cargo command passed.
+pub fn observed_cargo_seed_counts(
+    log: &str,
+    seeds: &[CargoSeedRunSpec],
+) -> Result<SuiteCounts, String> {
+    let missing = |detail: String| format!("seed-not-observed: {detail}");
+    let ambiguous = |detail: String| format!("seed-not-attributable: {detail}");
+    if seeds.is_empty() {
+        return Err(missing("no signed seed targets".into()));
+    }
+    if !log.ends_with('\n') {
+        return Err(missing(
+            "Cargo log is empty or lacks a complete final line".into(),
+        ));
+    }
+    let normalized = strip_ansi_csi(log);
+    let selected_labels = seeds
+        .iter()
+        .filter_map(|seed| {
+            Path::new(&seed.target)
+                .file_name()
+                .and_then(|name| name.to_str())
+        })
+        .map(|name| format!("tests/{name}"))
+        .collect::<HashSet<_>>();
+    let mut runs: Vec<ObservedCargoRun> = Vec::new();
+    let mut current: Option<usize> = None;
+    for line in normalized.lines().map(str::trim) {
+        if let Some(header) = line.strip_prefix("Running ") {
+            let boundary = header.rsplit_once(" (").and_then(|(target, binary)| {
+                binary.strip_suffix(')').map(|binary| (target, binary))
+            });
+            let Some((target, binary)) = boundary else {
+                let selected = selected_labels
+                    .iter()
+                    .any(|label| header.split_whitespace().next() == Some(label.as_str()));
+                if selected || current.is_some_and(|index| runs[index].summary.is_none()) {
+                    return Err(ambiguous(format!(
+                        "malformed Cargo seed target boundary: {line}"
+                    )));
+                }
+                current = None;
+                continue;
+            };
+            if !selected_labels.contains(target) {
+                if current.is_some_and(|index| runs[index].summary.is_none()) {
+                    return Err(missing(format!(
+                        "{} was interrupted before its summary",
+                        runs[current.unwrap()].target
+                    )));
+                }
+                current = None;
+                continue;
+            }
+            if current.is_some_and(|index| runs[index].summary.is_none()) {
+                return Err(missing(format!(
+                    "{target} began before the previous seed target summary"
+                )));
+            }
+            runs.push(ObservedCargoRun {
+                target: target.to_string(),
+                binary: binary.to_string(),
+                declared: None,
+                outcomes: Vec::new(),
+                summary: None,
+            });
+            current = Some(runs.len() - 1);
+            continue;
+        }
+        if line.starts_with("Doc-tests ") {
+            if current.is_some_and(|index| runs[index].summary.is_none()) {
+                return Err(missing(
+                    "doctests began before a Cargo target completed".into(),
+                ));
+            }
+            current = None;
+            continue;
+        }
+        let Some(index) = current else { continue };
+        let run = &mut runs[index];
+        if let Some(rest) = line.strip_prefix("running ") {
+            let words = rest.split_whitespace().collect::<Vec<_>>();
+            if words.len() == 2 && matches!(words[1], "test" | "tests") {
+                if run.declared.is_some() || run.summary.is_some() {
+                    return Err(ambiguous(format!(
+                        "duplicate run declaration for {}",
+                        run.target
+                    )));
+                }
+                run.declared = Some(
+                    words[0]
+                        .parse()
+                        .map_err(|_| ambiguous(format!("invalid run count: {line}")))?,
+                );
+            }
+        } else if line.starts_with("test result:") {
+            if run.summary.is_some() {
+                return Err(ambiguous(format!("duplicate summary for {}", run.target)));
+            }
+            let summary = cargo_observed_summary(line).ok_or_else(|| {
+                missing(format!("invalid or incomplete summary for {}", run.target))
+            })?;
+            if line.starts_with("test result: ok.") && summary.1 != 0 {
+                return Err(ambiguous(format!(
+                    "success summary reports failures for {}",
+                    run.target
+                )));
+            }
+            run.summary = Some(summary);
+        } else if let Some((name, result)) = line
+            .strip_prefix("test ")
+            .and_then(|rest| rest.split_once(" ... "))
+        {
+            let outcome = match result {
+                "ok" => Some(Some(true)),
+                "FAILED" => Some(Some(false)),
+                value if value == "ignored" || value.starts_with("ignored,") => Some(None),
+                _ => None,
+            };
+            if let Some(outcome) = outcome {
+                if run.summary.is_some() || name.is_empty() {
+                    return Err(ambiguous(format!("result outside an open target: {line}")));
+                }
+                run.outcomes.push((name.to_string(), outcome));
+            }
+        }
+    }
+    let mut counts = SuiteCounts {
+        passed: 0,
+        failed: 0,
+        total: 0,
+    };
+    let mut seen_targets = HashSet::new();
+    let mut seen_labels = HashSet::new();
+    for seed in seeds {
+        let parts = seed.target.split('/').collect::<Vec<_>>();
+        let ["orch", "crates", package, "tests", file] = parts.as_slice() else {
+            return Err(ambiguous(format!(
+                "unsupported signed integration target {}",
+                seed.target
+            )));
+        };
+        let Some(stem) = file.strip_suffix(".rs").filter(|stem| !stem.is_empty()) else {
+            return Err(ambiguous(format!("invalid seed target {}", seed.target)));
+        };
+        let safe_component = |value: &str| {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        };
+        if !safe_component(package)
+            || !safe_component(stem)
+            || !seen_targets.insert(seed.target.as_str())
+        {
+            return Err(ambiguous(format!(
+                "duplicate or invalid seed target {}",
+                seed.target
+            )));
+        }
+        let label = format!("tests/{file}");
+        if !seen_labels.insert(label.clone()) {
+            return Err(ambiguous(format!(
+                "{} shares a Cargo label with another seed target",
+                seed.target
+            )));
+        }
+        let matching = runs
+            .iter()
+            .filter(|run| run.target == label)
+            .collect::<Vec<_>>();
+        let run = match matching.as_slice() {
+            [] => {
+                return Err(missing(format!(
+                    "{} has no Cargo target execution",
+                    seed.target
+                )))
+            }
+            [run] => *run,
+            _ => {
+                return Err(ambiguous(format!(
+                    "{} has multiple Cargo target executions",
+                    seed.target
+                )))
+            }
+        };
+        let binary = run.binary.rsplit(['/', '\\']).next().unwrap_or_default();
+        let binary = binary.strip_suffix(".exe").unwrap_or(binary);
+        let prefix = format!("{}-", stem.replace('-', "_"));
+        if !binary.strip_prefix(&prefix).is_some_and(|hash| {
+            !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err(ambiguous(format!(
+                "{} has foreign test binary {}",
+                seed.target, run.binary
+            )));
+        }
+        let (passed, failed, ignored) = run
+            .summary
+            .ok_or_else(|| missing(format!("{} has no complete summary", seed.target)))?;
+        let observed = (
+            run.outcomes
+                .iter()
+                .filter(|(_, outcome)| *outcome == Some(true))
+                .count(),
+            run.outcomes
+                .iter()
+                .filter(|(_, outcome)| *outcome == Some(false))
+                .count(),
+            run.outcomes
+                .iter()
+                .filter(|(_, outcome)| outcome.is_none())
+                .count(),
+        );
+        let total = passed
+            .checked_add(failed)
+            .and_then(|count| count.checked_add(ignored));
+        if observed != (passed, failed, ignored) || total != run.declared || total.is_none() {
+            return Err(missing(format!(
+                "{} results and closing counts disagree",
+                seed.target
+            )));
+        }
+        if seed.test_names.is_empty() {
+            return Err(missing(format!(
+                "{} has no expected test cases",
+                seed.target
+            )));
+        }
+        let mut expected = HashSet::new();
+        let mut matched = HashSet::new();
+        for name in &seed.test_names {
+            if name.trim().is_empty() || name.trim() != name || !expected.insert(name) {
+                return Err(ambiguous(format!(
+                    "{} has duplicate or invalid expected case {name}",
+                    seed.target
+                )));
+            }
+            let cases = run
+                .outcomes
+                .iter()
+                .enumerate()
+                .filter(|(_, (actual, _))| {
+                    actual == name
+                        || (!name.contains("::") && actual.ends_with(&format!("::{name}")))
+                })
+                .collect::<Vec<_>>();
+            let (index, (_, outcome)) = match cases.as_slice() {
+                [] => {
+                    return Err(missing(format!(
+                        "{}::{name} has no observed result",
+                        seed.target
+                    )))
+                }
+                [entry] => *entry,
+                _ => {
+                    return Err(ambiguous(format!(
+                        "{}::{name} has repeated or ambiguous results",
+                        seed.target
+                    )))
+                }
+            };
+            if !matched.insert(index) {
+                return Err(ambiguous(format!(
+                    "{} reuses a result for {name}",
+                    seed.target
+                )));
+            }
+            match outcome {
+                Some(true) => counts.passed += 1,
+                Some(false) => counts.failed += 1,
+                None => return Err(missing(format!("{}::{name} was ignored", seed.target))),
+            }
+        }
+        if matched.len() != run.outcomes.len() {
+            return Err(ambiguous(format!(
+                "{} contains cases absent from the signed seed inventory",
+                seed.target
+            )));
+        }
+    }
+    counts.total = counts.passed + counts.failed;
+    Ok(counts)
 }
 
 /// 预验/复跑的实测记录（进 SeedOracleVerified.measured / RedProven.replay，机器可比对）
@@ -4219,6 +4560,7 @@ fn measure_cargo_observation(
     log: &str,
     exit_code: i32,
     seed_sources: &[String],
+    seed_targets: &[String],
 ) -> Result<OracleObservation> {
     let failed_cases = parse_cargo_failed_cases(log);
     let file_counts = seed_sources
@@ -4248,19 +4590,24 @@ fn measure_cargo_observation(
         });
     }
 
+    if seed_sources.len() != seed_targets.len() {
+        bail!("seed-not-attributable: seed target/source snapshot lengths differ");
+    }
+    let specs = seed_targets
+        .iter()
+        .zip(seed_sources)
+        .map(|(target, source)| CargoSeedRunSpec {
+            target: target.clone(),
+            test_names: cargo_test_names(source),
+        })
+        .collect::<Vec<_>>();
+    let observed = observed_cargo_seed_counts(log, &specs).map_err(anyhow::Error::msg)?;
     let suite =
         parse_cargo_suite_counts(log).context("无法从门日志解析 cargo test result 汇总行")?;
-    let file_failed = file_counts
-        .iter()
-        .map(|counts| counts.failed)
-        .sum::<usize>();
-    if file_failed > file_tests {
-        bail!("cargo 种子失败数 {file_failed} > 静态提取测试数 {file_tests}");
-    }
     Ok(OracleObservation {
         measured: Measured {
-            file_failed,
-            file_passed: file_tests - file_failed,
+            file_failed: observed.failed,
+            file_passed: observed.passed,
             total_failed: suite.failed,
             total_passed: suite.passed,
             total: suite.total,
@@ -4274,7 +4621,43 @@ fn measure_cargo_observation(
 
 #[cfg(test)]
 fn measure_cargo(log: &str, exit_code: i32, seed_sources: &[String]) -> Result<Measured> {
-    measure_cargo_observation(log, exit_code, seed_sources).map(|observation| observation.measured)
+    let targets = seed_sources
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("orch/crates/orch-host/tests/seed_{index}.rs"))
+        .collect::<Vec<_>>();
+    measure_cargo_observation(log, exit_code, seed_sources, &targets)
+        .map(|observation| observation.measured)
+}
+
+fn validate_cargo_seed_target_owners(workdir: &Path, targets: &[String]) -> Result<()> {
+    // Two packages can print the same tests/name.rs and binary basename. A
+    // workspace replay must reject that ambiguity instead of adopting the
+    // first package's outcomes for a later package that never executed.
+    for target in targets {
+        let name = Path::new(target)
+            .file_name()
+            .context("seed target lacks filename")?;
+        let expected = workdir.join(target);
+        let mut owners = Vec::new();
+        for entry in fs::read_dir(workdir.join("orch/crates"))? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if !kind.is_dir() && !kind.is_symlink() {
+                continue;
+            }
+            let candidate = entry.path().join("tests").join(name);
+            if candidate.try_exists()? {
+                owners.push(candidate);
+            }
+        }
+        if owners.len() != 1 || owners[0] != expected {
+            bail!(
+                "seed-not-attributable: {target} has ambiguous workspace source owners: {owners:?}"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn parse_test_gate_observation(
@@ -4294,8 +4677,18 @@ fn parse_test_gate_observation(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            measure_cargo_observation(&log, g.exit_code, &seed_sources)
-                .with_context(|| format!("无法解析 cargo 门日志: {}", g.log_path))
+            let seed_targets = seeds
+                .iter()
+                .map(|seed| seed.target.clone())
+                .collect::<Vec<_>>();
+            let observation =
+                measure_cargo_observation(&log, g.exit_code, &seed_sources, &seed_targets)
+                    .with_context(|| format!("无法解析 cargo 门日志: {}", g.log_path))?;
+            if observation.measured.red_form.as_deref() != Some("compile") {
+                validate_cargo_seed_target_owners(workdir, &seed_targets)
+                    .with_context(|| format!("无法归属 cargo 门日志: {}", g.log_path))?;
+            }
+            Ok(observation)
         }
         "vitest" => {
             let suite = parse_suite_counts(&log)
@@ -5139,6 +5532,71 @@ pub fn seed_red_localized(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observed_seed_runs_ignore_unrelated_harness_chatter() {
+        let other = "Running tests/other.rs (target/debug/deps/other-0123456789abcdef)\nrunning 1 test\nrunning 99 tests\ntest result: FAILED. invalid counts\n";
+        let selected = "Running tests/seed.rs (target/debug/deps/seed-0123456789abcdef)\nrunning 1 test\ntest one ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored\n";
+        let seed = CargoSeedRunSpec { target: "orch/crates/fixture/tests/seed.rs".into(), test_names: vec!["one".into()] };
+        let counts = observed_cargo_seed_counts(&format!("{other}{selected}{other}"), &[seed]).unwrap();
+        assert_eq!((counts.passed, counts.failed), (1, 0));
+    }
+
+    #[test]
+    fn observed_seed_run_cannot_be_closed_by_another_target() {
+        let log = "Running tests/seed.rs (target/debug/deps/seed-0123456789abcdef)\nrunning 1 test\ntest one ... ok\nRunning tests/other.rs (target/debug/deps/other-0123456789abcdef)\nrunning 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored\n";
+        let seed = CargoSeedRunSpec { target: "orch/crates/fixture/tests/seed.rs".into(), test_names: vec!["one".into()] };
+        assert!(observed_cargo_seed_counts(log, &[seed]).is_err());
+    }
+
+    #[test]
+    fn observed_summaries_reject_contradictory_or_duplicate_totals() {
+        for summary in [
+            "test result: FAILED. 1 passed; 0 failed; 0 ignored",
+            "test result: ok. 0 passed; 1 failed; 0 ignored",
+            "test result: ok. 1 passed; NaN passed; 0 failed; 0 ignored",
+            "test result: ok. 1 passed; 1 passed; 0 failed; 0 ignored",
+            "test result: ok.extra 1 passed; 0 failed; 0 ignored",
+        ] {
+            assert!(cargo_observed_summary(summary).is_none(), "{summary}");
+        }
+        assert_eq!(cargo_observed_summary("test result: ok. 1 passed; 0 failed; 0 ignored"), Some((1, 0, 0)));
+        assert_eq!(cargo_observed_summary("test result: FAILED. 0 passed; 1 failed; 0 ignored"), Some((0, 1, 0)));
+    }
+
+    #[test]
+    fn observed_seed_target_components_must_be_canonical() {
+        let log = "Running tests/seed.rs (target/debug/deps/seed-0123456789abcdef)\nrunning 1 test\ntest one ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored\n";
+        for target in ["orch/crates//tests/seed.rs", "orch/crates/../tests/seed.rs", "orch/crates/a b/tests/seed.rs"] {
+            let seed = CargoSeedRunSpec { target: target.into(), test_names: vec!["one".into()] };
+            assert!(observed_cargo_seed_counts(log, &[seed]).is_err());
+        }
+    }
+
+    #[test]
+    fn observed_seed_counts_do_not_reuse_one_run_for_two_packages() {
+        let log = "Running tests/same.rs (target/debug/deps/same-0123456789abcdef)\nrunning 1 test\ntest one ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored\n";
+        let seeds = ["first", "second"].map(|package| CargoSeedRunSpec {
+            target: format!("orch/crates/{package}/tests/same.rs"),
+            test_names: vec!["one".into()],
+        });
+        assert!(observed_cargo_seed_counts(log, &seeds).is_err());
+    }
+
+    #[test]
+    fn workspace_source_ownership_rejects_a_foreign_same_named_target() {
+        let root = std::env::current_dir().unwrap().join(".cowork-temp")
+            .join(format!("B339-target-owners-{}", ulid::Ulid::new()));
+        let target = "orch/crates/first/tests/same.rs".to_string();
+        fs::create_dir_all(root.join("orch/crates/first/tests")).unwrap();
+        fs::write(root.join(&target), "#[test]\nfn one() {}\n").unwrap();
+        assert!(validate_cargo_seed_target_owners(&root, std::slice::from_ref(&target)).is_ok());
+        fs::create_dir_all(root.join("orch/crates/second/tests")).unwrap();
+        fs::write(root.join("orch/crates/second/tests/same.rs"), "#[test]\nfn one() {}\n").unwrap();
+        let error = validate_cargo_seed_target_owners(&root, &[target]).unwrap_err();
+        assert!(error.to_string().contains("seed-not-attributable"));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ExpectedDynamicAnchor {
@@ -6028,6 +6486,7 @@ pub const VALUE: usize = 1;
             "error[E0432]: unresolved import `crate::missing_api`\n",
             101,
             &[source],
+            &["orch/crates/orch-host/tests/seed_0.rs".into()],
         )
         .unwrap();
         let observation_json = serde_json::to_value(&observation).unwrap();
@@ -6044,7 +6503,8 @@ pub const VALUE: usize = 1;
             "clang: error: unknown argument\n",
             "error: could not compile `orch-host`\n",
         ] {
-            assert!(measure_cargo_observation(log, 101, std::slice::from_ref(&source)).is_err());
+            assert!(measure_cargo_observation(log, 101, std::slice::from_ref(&source),
+                &["orch/crates/orch-host/tests/seed_0.rs".into()]).is_err());
         }
     }
 
@@ -6069,6 +6529,8 @@ pub const VALUE: usize = 1;
     fn cargo_assertion_red_marks_assertion_form() {
         let source = "#[test]\nfn rejects_bad_value() {}\n".to_string();
         let log = "\
+Running tests/seed_0.rs (orch/target/debug/deps/seed_0-0123456789abcdef)\n\
+running 1 test\n\
 test oracle::tests::rejects_bad_value ... FAILED\n\
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n";
         let measured = measure_cargo(log, 101, &[source]).unwrap();

@@ -560,7 +560,11 @@ pub(crate) fn code_owned_wrapper_identity_digest_v1(path: &Path) -> Result<Strin
     Ok(capture_code_owned_wrapper_identity(path)?.sha256)
 }
 
-/// Render one driver-owned command without reading `PATH`, legacy registries, adapters, or presets.
+/// Render one driver-owned command without reading legacy registries, adapters, or presets.
+///
+/// Pi keeps tool execution in the selected worktree while receiving the original
+/// project separately so its native project history can be opened there. CodeBuddy
+/// likewise keeps native session persistence enabled instead of discarding history.
 pub fn render_invocation_v1(
     prepared: PreparedInvocation,
     context: InvocationContextV1,
@@ -683,7 +687,10 @@ fn validate_dsh_runtime_target_v1(rendered: &RenderedInvocationV1) -> Result<()>
     let cwd = fs::canonicalize(rendered.prepared.cwd())?;
     let manual =
         rendered.context.task_id == "MANUAL" && rendered.context.attempt_id == "MANUAL-A0000";
-    if !manual && runtime_target.starts_with(&cwd) {
+    let consult = rendered.prepared.requested().action == InvocationAction::Consult
+        && rendered.context.task_id == "CONSULT"
+        && rendered.context.attempt_id == "CONSULT-A0000";
+    if !manual && !consult && runtime_target.starts_with(&cwd) {
         bail!(
             "DSH runtime target 必须位于 invocation cwd 之外；请从仓外、非临时 target 构建并运行 Orch: {}",
             runtime_target.display()
@@ -1314,7 +1321,22 @@ fn render_wrapper_environment(
                     context.deadline_secs.to_string(),
                 ),
             ]));
-            if prepared.driver() == HarnessId::Dsh {
+            if prepared.driver() == HarnessId::Pi {
+                env.insert(
+                    "ORCH_PI_PROJECT_ROOT".to_string(),
+                    path_text(prepared.project_root(), "Pi project root")?,
+                );
+            } else if prepared.driver() == HarnessId::Dsh {
+                // Consult alone opts into the native account-directory override;
+                // previous Review/Execute environment behavior stays unchanged.
+                if prepared.requested().action == InvocationAction::Consult {
+                    if let Some(value) = std::env::var_os("DSH_HOME") {
+                        let value = value.to_str().context("DSH_HOME is not UTF-8")?;
+                        if !value.trim().is_empty() {
+                            env.insert("DSH_HOME".to_string(), value.to_string());
+                        }
+                    }
+                }
                 match prepared.effective().mode.as_deref() {
                     Some("minimal") => {
                         env.insert("ORCH_DSH_PRESET".to_string(), "minimal".to_string());
@@ -1476,7 +1498,6 @@ fn render_direct_arguments(prepared: &PreparedInvocation, context: &InvocationCo
             args.extend([
                 "--output-format".to_string(),
                 "stream-json".to_string(),
-                "--no-session-persistence".to_string(),
                 "--dangerously-skip-permissions".to_string(),
             ]);
             Ok(args)

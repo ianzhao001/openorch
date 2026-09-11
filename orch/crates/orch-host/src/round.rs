@@ -986,9 +986,8 @@ fn run_close_locked(root: &Path, force: bool, note: Option<&str>) -> Result<Clos
     if !done.is_file() {
         fs::write(&done, format!(
             "# ROUND {round} COMPLETE\n\n本轮已收口（main = `{short}`；任务 {recorded}/{total} Recorded）。\n\
-             请把你的会话小结写到 coordination/rounds/{round}/reports/<你的agentId>-SUMMARY.md，\n\
-             然后**重新运行 coordination/scripts/wait-dispatch.sh <你的agentId> 回到等待**——新一轮开启后你会收到新 GO\n\
-             （跨轮会话复用；若上下文将尽可写明后结束会话，运行时会以 RESUME 重建现场）。感谢协作。\n"
+             root planner 请完成本轮 handoff 与收轮核账；下一轮须重新规划、签核并显式 dispatch。\n\
+             本文件不触发后台等待、RESUME 或自动跨轮续接。\n"
         ))?;
     }
 

@@ -6,6 +6,16 @@ This file records the public OpenOrch release line. Internal selfhost rounds, ta
 
 ## 中文
 
+### [v0.1.0-alpha.5](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.5) — 2026-09-12
+
+本版将更多原生通道接入 Consult，并把原生设置与调用项目历史绑定纳入真实验证。
+
+- DSH、Pi、ZCode 进入 Consult 目标；每次 action 保留 provider/model/effort 与原生终态事实
+- DSH Consult 支持原生设置快照和完整项目历史定位，Pi/ZCode 支持原生终答与项目历史分离
+- 强化 action discovery、账号环境边界、Pi legacy envelope、凭据漂移与失败/未知终态的保留语义
+- 增加 review quarantine 与 pending-receipt 类型化恢复，避免错误或晚到答卷越过裁决边界
+- 继续保留默认6/selfhost30、插件安装边界与无后台自动编排约束；AGY 仍不是 Consult 目标
+
 ### [v0.1.0-alpha.4](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.4) — 2026-09-10
 
 OpenOrch 现在提供 Codex Desktop 与 DSH Web 共用的插件包。核心版本仍为 `orch 0.1.0`。
@@ -20,7 +30,7 @@ OpenOrch 现在提供 Codex Desktop 与 DSH Web 共用的插件包。核心版�
 - 显式产品源导出和公开输入/制品对照，继续排除私有历史、配置、账本与转写
 
 本版仅验证 Apple Silicon macOS。Codex/DSH 宿主不代表所有同名通道均支持 Consult：
-当前 DSH、Pi、AGY、ZCode 仍不是受支持的 Consult 目标。执行/审查能力、默认6/selfhost30
+当前 AGY 仍不是受支持的 Consult 目标。执行/审查能力、默认6/selfhost30
 命令边界及现有 UI 保持；不新增后台自动编排。二进制为 ad-hoc 签名，非 Developer ID，
 不宣称不存在的 attestation 或可复现构建。
 
@@ -69,6 +79,16 @@ OpenOrch 现在提供 Codex Desktop 与 DSH Web 共用的插件包。核心版�
 
 ## English
 
+### [v0.1.0-alpha.5](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.5) — 2026-09-12
+
+This release expands native Consult coverage and binds native settings and original-project history to actual invocation evidence.
+
+- DSH, Pi, and ZCode are now Consult targets with provider/model/effort and native-terminal facts preserved per action
+- DSH Consult uses pinned native settings and full calling-project history; Pi/ZCode retain native final answers and project-history separation
+- Hardened action discovery, account-environment boundaries, the Pi legacy envelope, credential-drift handling, and failed/unknown terminal preservation
+- Added review quarantine and typed pending-receipt recovery so bad or late answers cannot cross verdict boundaries
+- Retained default6/selfhost30, plugin installation boundaries, and the absence of background automatic orchestration; AGY remains unsupported for Consult
+
 ### [v0.1.0-alpha.4](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.4) — 2026-09-10
 
 OpenOrch now ships one plugin for Codex Desktop and DSH Web. The core still reports `orch 0.1.0`.
@@ -82,7 +102,7 @@ OpenOrch now ships one plugin for Codex Desktop and DSH Web. The core still repo
 - Correct handling of duplicate error-only SmartClaw tool receipts without promoting a late answer past a hard deadline
 - Explicit product-source export and source/artifact comparisons, excluding private history, configuration, ledgers and transcripts
 
-Only Apple Silicon macOS is validated. DSH, Pi, AGY and ZCode remain unsupported Consult targets even though
+Only Apple Silicon macOS is validated. AGY remains an unsupported Consult target even though
 DSH Web is a supported plugin host. Execution/review capabilities, default6/selfhost30 and retained UI boundaries
 are unchanged; no automatic orchestration is added. The binary is ad-hoc signed, not Developer ID signed;
 no unavailable attestation or reproducible-build guarantee is claimed.

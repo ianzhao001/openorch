@@ -11,6 +11,7 @@
 # orch-exit-code: 70 empty zero-frame-eof
 # orch-exit-code: 71 empty truncated-no-terminal
 # orch-exit-code: 72 timedOut hard-deadline
+# orch-exit-code: 74 failed identity-drift
 #
 # WHY THIS LIVES UNDER orch/ AND NOT coordination/scripts/:
 # this is project-specific glue, but `coordination/**` is a frozen path for
@@ -24,15 +25,19 @@
 # --provider PROVIDER --model MODEL --thinking EFFORT, in ORCH_PI_CWD. Every
 # value is a signed runtime pin; this wrapper deliberately has no local
 # provider/model fallback.
-# This layer emits only lifecycle markers and completed tool output needed by
-# orch's review-consumption proof. Prompt and assistant message frames are never
-# copied to the wake log.
+# Review/Execute retain lifecycle markers and completed tool output only.
+# Consult additionally projects the complete native final answer and its digest;
+# input prompts and intermediate assistant messages are never copied.
+# Schema-3 calls carry the original project separately from the tool cwd. When
+# those roots differ, this wrapper asks Pi's installed native SDK for the
+# original project's session directory and passes it through unchanged.
 
 msg="$1"
 [ -n "$msg" ] || { echo "usage: wake-pi-stream.sh <message>  (env: ORCH_PI_CWD, ORCH_PI_TIMEOUT)" >&2; exit 64; }
 
 MSG="$msg" python3 - <<'PY'
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -82,6 +87,7 @@ def legacy_conflict(alias, envelope_key, selected):
 
 
 present_envelope_keys = [key for key in ENVELOPE_KEYS if key in os.environ]
+consult_mode = bool(present_envelope_keys) and os.environ.get("ORCH_HARNESS_ROLE") == "consult"
 if present_envelope_keys:
     missing = [
         key
@@ -132,6 +138,20 @@ else:
 if not os.path.isdir(workdir):
     diag("ORCH_HARNESS_CWD/ORCH_PI_CWD 不是目录: %s" % workdir)
     sys.exit(65)
+
+project_root = os.environ.get("ORCH_PI_PROJECT_ROOT")
+if present_envelope_keys and project_root is not None:
+    if not isinstance(project_root, str) or not os.path.isabs(project_root):
+        diag("ORCH_PI_PROJECT_ROOT must be an absolute original-project directory")
+        sys.exit(66)
+    if not os.path.isdir(project_root):
+        diag("ORCH_PI_PROJECT_ROOT is not a directory: %s" % project_root)
+        sys.exit(66)
+    project_root = os.path.realpath(project_root)
+    workdir_real = os.path.realpath(workdir)
+else:
+    project_root = None
+    workdir_real = os.path.realpath(workdir)
 try:
     timeout = float(timeout_text)
 except ValueError:
@@ -205,6 +225,44 @@ argv = [
     effort,
 ]
 
+if project_root is not None and project_root != workdir_real:
+    executable_path = os.path.realpath(provider_bin)
+    package_root = None
+    cursor = os.path.dirname(executable_path)
+    while cursor and cursor != os.path.dirname(cursor):
+        if os.path.isfile(os.path.join(cursor, "package.json")):
+            package_root = cursor
+            break
+        cursor = os.path.dirname(cursor)
+    if package_root is None:
+        diag("cannot locate Pi package root for original-project history")
+        sys.exit(66)
+    session_sdk = os.path.join(package_root, "dist", "core", "session-manager.js")
+    if not os.path.isfile(session_sdk):
+        diag("Pi native session SDK is missing: %s" % session_sdk)
+        sys.exit(66)
+    sdk_program = r'''
+import { pathToFileURL } from "node:url";
+const sdk = await import(pathToFileURL(process.argv[1]).href);
+if (typeof sdk.getDefaultSessionDir !== "function") process.exit(67);
+const value = await sdk.getDefaultSessionDir(process.argv[2]);
+if (typeof value !== "string" || value.length === 0) process.exit(68);
+process.stdout.write(value);
+'''
+    try:
+        session_dir = subprocess.check_output(
+            ["node", "--input-type=module", "-e", sdk_program, session_sdk, project_root],
+            text=True,
+            stderr=subprocess.PIPE,
+        )
+    except Exception as exc:
+        diag("Pi native project-history lookup failed: %s" % exc)
+        sys.exit(66)
+    if not os.path.isabs(session_dir):
+        diag("Pi native project-history directory is not absolute")
+        sys.exit(66)
+    argv.extend(["--session-dir", session_dir])
+
 diag("cwd=%s provider=%s model=%s effort=%s timeout=%.0fs" % (workdir, provider, model, effort, timeout))
 try:
     proc = subprocess.Popen(
@@ -223,6 +281,9 @@ frames = 0
 projected = 0
 terminal_seen = False
 session_id = None
+final_text = None
+final_session_id = None
+identity_drift = False
 cause = "eof"
 deadline = time.time() + timeout
 heartbeat_interval = 15.0
@@ -289,7 +350,14 @@ for line in proc.stdout:
         continue
     kind = event.get("type")
     if kind == "session" and event.get("id"):
+        if session_id is not None and session_id != event["id"]:
+            identity_drift = True
         session_id = event["id"]
+    elif kind == "message_end" and consult_mode:
+        message = event.get("message")
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            final_text = completed_text(message) if message.get("stopReason") == "stop" else None
+            final_session_id = session_id
     elif kind == "turn_start":
         emit_stdout("turn.started")
     elif kind == "tool_execution_end":
@@ -298,6 +366,13 @@ for line in proc.stdout:
             emit_stdout(bounded_tool_result(text))
             projected += 1
     elif kind == "agent_settled":
+        if consult_mode and (
+            identity_drift or not isinstance(session_id, str) or not session_id.strip()
+            or final_session_id != session_id or not isinstance(final_text, str)
+            or not final_text.strip()
+        ):
+            cause = "missing-or-unbound-consult-final"
+            continue
         with state_lock:
             terminal_seen = True
         # Preserve the B225 review-consumption marker and its established
@@ -332,6 +407,9 @@ for line in proc.stdout:
                     "usageAbsentReason": None
                     if isinstance(event.get("usage"), dict)
                     else "pi agent_settled frame omitted usage",
+                    **({"finalText": final_text,
+                        "finalTextSha256": hashlib.sha256(final_text.encode("utf-8")).hexdigest()}
+                       if consult_mode else {}),
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -346,6 +424,9 @@ if time.time() >= deadline and not terminal_seen:
     cause = "timeout"
 if session_id:
     diag("session=%s" % session_id)
+if consult_mode and identity_drift:
+    diag("native session identity drift; no consult answer exit=74")
+    sys.exit(74)
 if terminal_seen and proc.returncode == 0:
     diag("frames=%d projected=%d terminal=yes cause=%s rc=0 exit=0" % (frames, projected, cause))
     sys.exit(0)

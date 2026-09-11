@@ -221,11 +221,16 @@ fn setup(policy_active: bool) -> Fixture {
         }),
     );
 
+    // These are two distinct Cargo integration targets. Keep their emitted
+    // running/result boundaries distinct so the oracle can attribute each
+    // signed seed instead of inferring passes from one aggregate summary.
     let red_green = r#"if [ "$(/bin/cat product.txt)" = green ]; then
-printf 'running 2 tests\ntest seed_one ... ok\ntest seed_two ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+printf 'Running tests/seed_one.rs (target/debug/deps/seed_one-0123456789abcdef)\nrunning 1 test\ntest seed_one ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+printf 'Running tests/seed_two.rs (target/debug/deps/seed_two-0123456789abcdef)\nrunning 1 test\ntest seed_two ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
 exit 0
 else
-printf 'running 2 tests\ntest seed_one ... FAILED\ntest seed_two ... FAILED\ntest result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\n'
+printf 'Running tests/seed_one.rs (target/debug/deps/seed_one-0123456789abcdef)\nrunning 1 test\ntest seed_one ... FAILED\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n'
+printf 'Running tests/seed_two.rs (target/debug/deps/seed_two-0123456789abcdef)\nrunning 1 test\ntest seed_two ... FAILED\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n'
 exit 1
 fi"#;
     let selector_log = root.join("selector-observed.log");

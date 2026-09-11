@@ -895,6 +895,17 @@ fn channel_consult_terminal_evidence_v1(
                 .and_then(serde_json::Value::as_str)
                 .filter(|text| !text.trim().is_empty())
                 .map(str::to_string),
+            crate::harness::HarnessId::Pi
+            | crate::harness::HarnessId::ZCode
+            | crate::harness::HarnessId::Dsh => {
+                let text = value.get("finalText").and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .context("managed consult terminal lacks a complete finalText")?;
+                if evidence.final_text_sha256.is_none() {
+                    bail!("managed consult terminal lacks finalTextSha256");
+                }
+                Some(text.to_string())
+            }
             crate::harness::HarnessId::Mimo => value
                 .pointer("/part/text")
                 .and_then(serde_json::Value::as_str)

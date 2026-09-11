@@ -83,7 +83,7 @@ fn action_discovery_uses_driver_ability_without_spawning() {
     assert!(consult.status.success(), "{}", String::from_utf8_lossy(&consult.stderr));
     let text = String::from_utf8(consult.stdout).unwrap();
     assert!(text.lines().any(|line| line.starts_with("alpha\tclaude\tsupported")));
-    assert!(text.lines().any(|line| line.starts_with("dsh-fixture\tdsh\tunsupported")));
+    assert!(text.lines().any(|line| line.starts_with("dsh-fixture\tdsh\tsupported")));
     let review = f.run(&["harness", "list", "--action", "review"]);
     assert!(review.status.success());
     assert!(String::from_utf8(review.stdout).unwrap().contains("dsh-fixture\tdsh\tsupported"));

@@ -6,7 +6,7 @@ OpenOrch connects installed AI harnesses to Codex Desktop and DSH Web through on
 shared skill and a bundled local runtime. Choose your own clients/models, consult
 one or several members, and let the current host synthesize their original answers.
 
-Plugin release: `v0.1.0-alpha.4` · core executable: `orch 0.1.0`.
+Plugin release: `v0.1.0-alpha.5` · core executable: `orch 0.1.0`.
 
 ## 中文
 
@@ -17,7 +17,7 @@ DSH 插件管理还使用其正常的 Node.js/pnpm 环境，并从官方包源�
 完整 Release 包已包含运行核心，使用者不需要 Rust，也不需要任何私有仓库。
 
 ```sh
-release=v0.1.0-alpha.4
+release=v0.1.0-alpha.5
 bundle=openorch-$release-darwin-arm64
 base=https://github.com/ianzhao001/openorch/releases/download/$release
 curl -fLO "$base/$bundle.tar.gz"
@@ -62,7 +62,7 @@ Codex 安装后打开新任务使用 OpenOrch。DSH Web 新会话选择包含 Sk
 | --- | --- |
 | 插件宿主 | Codex Desktop、DSH Web |
 | Consult 目标 | Codex、Claude、OpenCode、Cursor、MiMo、CodeBuddy、SmartClaw；以本机实际发现结果为准 |
-| 当前不支持的 Consult 目标 | DSH、Pi、AGY、ZCode |
+| 当前不支持的 Consult 目标 | AGY |
 | 命令面 | 默认6个叶命令；可选 selfhost 30个；既有 `orch-ui` 保留 |
 
 DSH 作为宿主可调用其它受支持通道；宿主集成与目标通道能力分开判断。
@@ -118,7 +118,7 @@ cargo build --release -p orch-cli --no-default-features \
 
 ### Install and use
 
-Use the complete [Release](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.4)
+Use the complete [Release](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.5)
 archive on Apple Silicon macOS. Python3.9+, Git and the native Codex/DSH client are
 required. DSH uses its normal Node.js/pnpm environment and fetches the declared
 filesystem-skill dependency. The bundle includes the runtime; Rust and the private
@@ -144,9 +144,9 @@ about …”. The host reads complete member outcomes and synthesizes conclusion
 disagreements, failures and original-answer links. Aliases can share a backend;
 member count does not prove model diversity. Native client usage costs still apply.
 
-Current Consult targets are Codex, Claude, OpenCode, Cursor, MiMo, CodeBuddy and
-SmartClaw, subject to runtime discovery. DSH, Pi, AGY and ZCode are unsupported
-Consult targets in this core. DSH Web can still host the plugin and invoke supported
+Current Consult targets are Codex, Claude, OpenCode, Cursor, MiMo, CodeBuddy,
+SmartClaw, DSH, Pi and ZCode, subject to runtime discovery. AGY is an unsupported
+Consult target in this core. DSH Web can host the plugin and invoke supported
 targets. Execution/review capabilities and the default6/selfhost30/UI boundaries
 are unchanged. There is no added daemon, scheduler, automatic takeover or retry.
 
