@@ -1481,16 +1481,38 @@ pending_verdict_barrier() {
                         current_attempt[task] = ""
                 }
             } else if (kind == "ReportCollectCompleted") {
-                if (actor == "runtime:orch" && task != "" &&
-                    direct_string("payload", "attemptId") &&
-                    direct_string("payload", "branchSha") &&
-                    full_sha(payload_string["branchSha"])) {
-                    target = task "|" payload_string["attemptId"]
-                    if (collect_head[target] != "" &&
-                        collect_head[target] != payload_string["branchSha"])
-                        return reject("ReportCollectCompleted carries conflicting branchSha")
-                    collect_head[target] = payload_string["branchSha"]
-                }
+                # Project each completed action, rather than incorrectly making
+                # the whole attempt immutable before root has fixed authority.
+                # Receipt/CAS authenticity remains a Rust gate; malformed input
+                # must nevertheless never be mistaken for an absent collect.
+                if (actor != "runtime:orch" || !runtime_attempt(task) ||
+                    !positive_integer(payload_number["attemptNo"]) || payload_count != 17 ||
+                    !direct_string("payload", "actionId") || !full_digest(payload_string["actionId"]) ||
+                    !direct_string("payload", "branchSha") || !full_sha(payload_string["branchSha"]) ||
+                    !direct_string("payload", "baseSha") || !full_sha(payload_string["baseSha"]) ||
+                    !direct_string("payload", "agent") || !safe_id(payload_string["agent"]) ||
+                    !direct_string("payload", "controlEpoch") || !safe_id(payload_string["controlEpoch"]) ||
+                    !direct_string("payload", "goPath") || !canonical_nonblank(payload_string["goPath"]) ||
+                    !direct_string("payload", "evidencePath") || !canonical_nonblank(payload_string["evidencePath"]) ||
+                    payload_type["evidenceLen"] != "number" || !positive_integer(payload_number["evidenceLen"]) ||
+                    !direct_string("payload", "evidenceSha256") || !full_digest(payload_string["evidenceSha256"]) ||
+                    !direct_string("payload", "gateReceipt") || !safe_id(payload_string["gateReceipt"]) ||
+                    !direct_string("payload", "gateReceiptDigest") || !full_digest(payload_string["gateReceiptDigest"]) ||
+                    !direct_string("payload", "owner") || !safe_id(payload_string["owner"]) ||
+                    !direct_string("payload", "leaseGeneration") || !safe_id(payload_string["leaseGeneration"]) ||
+                    payload_type["receiptAttestationLen"] != "number" || !positive_integer(payload_number["receiptAttestationLen"]) ||
+                    !direct_string("payload", "receiptAttestationSha256") || !full_digest(payload_string["receiptAttestationSha256"]) ||
+                    payload_string["gateReceiptDigest"] != payload_string["receiptAttestationSha256"])
+                    return reject("ReportCollectCompleted payload/identity is not canonical")
+                source = task "|" payload_string["actionId"]
+                if (completed_collect_action[source])
+                    return reject("ReportCollectCompleted repeats completed actionId")
+                target = task "|" payload_string["attemptId"]
+                if (collect_pass_seen[target])
+                    return reject("ReportCollectCompleted follows root PASS for its attempt")
+                completed_collect_action[source] = 1
+                collect_head[target] = payload_string["branchSha"]
+                collect_event[target] = top_string["eventId"]
             } else if (kind == "WakeIssued") {
                 if (!direct_string("payload", "wakeId") ||
                     !safe_id(payload_string["wakeId"]))
@@ -1614,6 +1636,14 @@ pending_verdict_barrier() {
                 verdict = payload_string["verdict"]
                 attempt_verdict[task "|" payload_string["attemptId"]] = 1
                 if (verdict == "PASS") {
+                    target = task "|" payload_string["attemptId"]
+                    # Sparse historical PASS fixtures retain the original
+                    # barrier. An actual collect must bind both dimensions.
+                    if (collect_event[target] != "" &&
+                        (collect_event[target] != payload_string["collectCompletedEventId"] ||
+                         collect_head[target] != payload_string["headSha"]))
+                        return reject("root PASS does not bind latest collect eventId and HEAD")
+                    collect_pass_seen[target] = 1
                     if (pending_task != "") return reject("multiple unresolved root PASS verdicts")
                     pending_task = task
                     pending_attempt = payload_string["attemptId"]

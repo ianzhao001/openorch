@@ -2365,6 +2365,469 @@ fn maintenance_quiet(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+// A bounded observation of a native Git monitor, never a lifecycle/release receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeMonitor {
+    pid: u32,
+    process: String,
+    worktree: PathBuf,
+    admin: PathBuf,
+    ipc: PathBuf,
+    identities: Vec<(u64, u64)>,
+    proof_mode: String,
+}
+
+fn monitor_identity(path: &Path) -> Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    for p in path.ancestors() {
+        if fs::symlink_metadata(p)?.file_type().is_symlink() { bail!("monitor path contains symlink: {}", p.display()); }
+    }
+    let m = fs::metadata(path)?;
+    Ok((m.dev(), m.ino()))
+}
+
+fn monitor_pids(output: &std::process::Output) -> Result<std::collections::BTreeSet<u32>> {
+    if !matches!(output.status.code(), Some(0 | 1)) || !output.stderr.is_empty() {
+        bail!("uncertain monitor opener observation");
+    }
+    let text = std::str::from_utf8(&output.stdout)?;
+    let mut pids = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        if line.is_empty() || !line.bytes().all(|b| b.is_ascii_digit()) { bail!("invalid opener PID"); }
+        let pid: u32 = line.parse()?;
+        if pid == 0 { bail!("invalid zero PID"); }
+        pids.insert(pid);
+    }
+    if pids.is_empty() && output.status.code() != Some(1) { bail!("ambiguous empty opener result"); }
+    Ok(pids)
+}
+
+// Keep direct IPC attribution separate from the relative-listener fallback proof.
+fn monitor_endpoint_owner(output: &std::process::Output, boundary_pids: &BTreeSet<u32>) -> Result<bool> {
+    let endpoint_pids = monitor_pids(output)?;
+    if !endpoint_pids.is_empty() && endpoint_pids != *boundary_pids {
+        bail!("conflicting native IPC owner");
+    }
+    Ok(output.status.code() == Some(0) && endpoint_pids == *boundary_pids)
+}
+
+fn native_monitor_command(worktree: &Path, verb: &str) -> Result<std::process::Output> {
+    Ok(Command::new("git").args(["--no-optional-locks", "fsmonitor--daemon", verb])
+        .current_dir(worktree).env("LC_ALL", "C").env("GIT_OPTIONAL_LOCKS", "0").output()?)
+}
+
+fn monitor_status(worktree: &Path, watching: bool) -> Result<()> {
+    let o = native_monitor_command(worktree, "status")?;
+    let expected = format!("fsmonitor-daemon is {}watching '{}'", if watching { "" } else { "not " }, worktree.display());
+    if o.status.code() != Some(if watching { 0 } else { 1 }) || !o.stderr.is_empty()
+        || std::str::from_utf8(&o.stdout)?.trim() != expected { bail!("native monitor status does not bind exact worktree"); }
+    Ok(())
+}
+
+fn monitor_fields(bytes: &[u8]) -> Result<Vec<std::collections::BTreeMap<char, String>>> {
+    let mut records = Vec::new();
+    let mut record = std::collections::BTreeMap::new();
+    for field in std::str::from_utf8(bytes)?.split('\0') {
+        let field = field.trim_start_matches('\n');
+        if field.is_empty() { continue; }
+        let key = field.chars().next().unwrap();
+        if matches!(key, 'p' | 'f') && !record.is_empty() { records.push(record); record = std::collections::BTreeMap::new(); }
+        if record.insert(key, field[1..].to_owned()).is_some() { bail!("duplicate monitor field"); }
+    }
+    if !record.is_empty() { records.push(record); }
+    Ok(records)
+}
+
+fn prove_native_monitor(worktree: &Path, target: &Path) -> Result<NativeMonitor> {
+    use std::os::unix::fs::FileTypeExt;
+    if !cfg!(target_os = "macos") { bail!("native monitor proof unsupported on this platform"); }
+    let lsof = "/usr/sbin/lsof";
+    let mut boundary_pids = std::collections::BTreeSet::new();
+    for p in crate::reclaim::boundary_union(&[worktree.to_path_buf(), target.to_path_buf()]) {
+        if p.exists() { boundary_pids.extend(monitor_pids(&Command::new(lsof).args(["-nP", "-t", "+D"]).arg(p).output()?)?); }
+    }
+    if boundary_pids.len() != 1 { bail!("monitor is not the unique boundary opener"); }
+    let pid = *boundary_pids.iter().next().unwrap();
+    let direct = Command::new(lsof).args(["-nP", "-t", "--"]).arg(worktree).output()?;
+    if direct.status.code() != Some(0) || monitor_pids(&direct)? != boundary_pids { bail!("monitor does not own exact worktree directory"); }
+    let path_from_git = |args: &[&str]| -> Result<PathBuf> {
+        let raw = String::from_utf8(maintenance_git(worktree, args)?)?;
+        let p = PathBuf::from(raw.trim());
+        let p = if p.is_absolute() { p } else { worktree.join(p) };
+        // Git may return common-dir with '..'; resolve it before validating each ancestor.
+        monitor_identity(&p)?;
+        let p = fs::canonicalize(p)?; monitor_identity(&p)?; Ok(p)
+    };
+    let admin = path_from_git(&["rev-parse", "--absolute-git-dir"])?;
+    let common = path_from_git(&["rev-parse", "--git-common-dir"])?;
+    if admin.parent() != Some(common.join("worktrees").as_path()) || admin == common { bail!("monitor admin is not a private linked-worktree directory"); }
+    let ipc = admin.join("fsmonitor--daemon.ipc");
+    let ipc_id = monitor_identity(&ipc)?;
+    if !fs::symlink_metadata(&ipc)?.file_type().is_socket() { bail!("native IPC is not a socket"); }
+    let endpoint = Command::new(lsof).args(["-nP", "-t", "--"]).arg(&ipc).output()?;
+    let direct_endpoint = monitor_endpoint_owner(&endpoint, &boundary_pids)?;
+    let process_out = Command::new("/bin/ps").args(["-p", &pid.to_string(), "-o", "uid=", "-o", "lstart=", "-o", "command="]).env("LC_ALL", "C").output()?;
+    if !process_out.status.success() || !process_out.stderr.is_empty() { bail!("monitor process identity unavailable"); }
+    let process = String::from_utf8(process_out.stdout)?.trim().to_owned();
+    let words: Vec<_> = process.split_whitespace().collect();
+    let uid = Command::new("/usr/bin/id").arg("-u").output()?;
+    if !uid.status.success() || !uid.stderr.is_empty() || words.len() < 10
+        || words[0] != std::str::from_utf8(&uid.stdout)?.trim()
+        || Path::new(words[6]).file_name().and_then(|s|s.to_str()) != Some("git")
+        || words[7..9] != ["fsmonitor--daemon", "run"]
+        || !words[9..].contains(&"--detach")
+        || words[9..].iter().any(|w| *w != "--detach" && !w.strip_prefix("--ipc-threads=").is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))) {
+        bail!("process is not the current user's native Git monitor run");
+    }
+    let exec = PathBuf::from(String::from_utf8(maintenance_git(worktree, &["--exec-path"])?)?.trim());
+    let git_image = exec.join("git");
+    let dispatcher = exec.parent().and_then(Path::parent).context("invalid Git exec path")?.join("bin/git");
+    let images = [monitor_identity(&fs::canonicalize(&git_image)?)?, monitor_identity(&fs::canonicalize(&dispatcher)?)?];
+    let mut dirs = std::collections::BTreeSet::new();
+    for p in [worktree, admin.as_path()] {
+        dirs.extend(p.ancestors().map(Path::to_path_buf));
+        let physical = PathBuf::from(format!("/System/Volumes/Data{}", p.display()));
+        if monitor_identity(&physical).ok() == monitor_identity(p).ok() {
+            dirs.extend(physical.ancestors().map(Path::to_path_buf));
+        }
+    }
+    let output = Command::new(lsof).args(["-nP", "-a", "-p", &pid.to_string(), "-F0pcuftDin"]).output()?;
+    if !output.status.success() || !output.stderr.is_empty() { bail!("complete monitor descriptors unavailable"); }
+    validate_monitor_descriptors(&output.stdout, pid, words[0], worktree, &admin, &ipc, &images, &dirs, direct_endpoint)?;
+    monitor_status(worktree, true)?;
+    Ok(NativeMonitor { pid, process, worktree: worktree.to_path_buf(), admin: admin.clone(), ipc,
+        identities: vec![monitor_identity(worktree)?, monitor_identity(&admin)?, ipc_id, images[0], images[1]],
+        proof_mode: if direct_endpoint { "direct-ipc-owner" } else { "relative-listener-native-admin-conjunction" }.into() })
+}
+
+fn validate_monitor_descriptors(
+    bytes: &[u8], pid: u32, uid: &str, worktree: &Path, admin: &Path, ipc: &Path,
+    images: &[(u64, u64)], dirs: &BTreeSet<PathBuf>, direct_endpoint: bool,
+) -> Result<()> {
+    let records = monitor_fields(bytes)?;
+    let header = records.first().context("missing monitor header")?;
+    if header.get(&'p') != Some(&pid.to_string()) || header.get(&'u').map(String::as_str) != Some(uid) { bail!("descriptor process identity mismatch"); }
+    let wt_id = monitor_identity(worktree)?; let admin_id = monitor_identity(&admin)?;
+    let mut have_wt = false; let mut have_admin = false; let mut have_image = false; let mut listeners = 0;
+    let mut relative_listener = false;
+    for r in records.iter().skip(1) {
+        let fd = r.get(&'f').context("missing descriptor")?;
+        let ty = r.get(&'t').context("missing descriptor type")?;
+        let name = r.get(&'n').map(String::as_str).unwrap_or("");
+        match ty.as_str() {
+            "DIR" => {
+                let p = Path::new(name);
+                if !dirs.contains(p) { bail!("foreign monitor directory {name}"); }
+                let id = monitor_identity(p)?;
+                let device = r.get(&'D').and_then(|s|s.strip_prefix("0x")).context("directory device missing")?;
+                let inode: u64 = r.get(&'i').context("directory inode missing")?.parse()?;
+                if (u64::from_str_radix(device,16)?, inode) != id { bail!("monitor directory identity changed"); }
+                have_wt |= id == wt_id; have_admin |= id == admin_id;
+            }
+            "REG" if fd == "txt" => {
+                let id = monitor_identity(Path::new(name))?;
+                let device = r.get(&'D').and_then(|s| s.strip_prefix("0x")).context("image device missing")?;
+                let inode: u64 = r.get(&'i').context("image inode missing")?.parse()?;
+                if (u64::from_str_radix(device, 16)?, inode) != id { bail!("mapped monitor image changed"); }
+                if images.contains(&id) { have_image = true; }
+                else if name != "/usr/lib/dyld" { bail!("foreign monitor executable image"); }
+            }
+            "CHR" if matches!(fd.as_str(), "0" | "1" | "2") && name == "/dev/null" => {}
+            "KQUEUE" => {}
+            "unix" if name.starts_with("->0x") && name[4..].bytes().all(|b|b.is_ascii_hexdigit()) => {}
+            "unix" => {
+                if name == ipc.to_string_lossy() { listeners += 1; }
+                else if name == "fsmonitor--daemon.ipc" { listeners += 1; relative_listener = true; }
+                else { bail!("foreign named monitor listener"); }
+            }
+            _ => bail!("unexpected monitor descriptor {fd}/{ty}/{name}"),
+        }
+    }
+    if !have_wt || !have_admin || !have_image || listeners != 1 || (!direct_endpoint && !relative_listener) {
+        bail!("incomplete dedicated monitor identity bundle");
+    }
+    Ok(())
+}
+
+
+#[cfg(all(test, target_os = "macos"))]
+mod native_monitor_tests {
+    use super::*;
+    fn g(root: &Path, args: &[&str]) -> String {
+        let o=Command::new("git").args(["--no-optional-locks","-c","core.fsmonitor=false","-c","user.name=fixture","-c","user.email=fixture@example.invalid"]).args(args).current_dir(root).output().unwrap();
+        assert!(o.status.success(),"{}",String::from_utf8_lossy(&o.stderr)); String::from_utf8(o.stdout).unwrap().trim().into()
+    }
+    fn write_maintenance_events(root: &Path, round: &str, es: &[EventRecord]) {
+        let bytes=es.iter().map(|e|serde_json::to_string(e).unwrap()+"\n").collect::<String>();
+        for rel in [format!("coordination/rounds/{round}/events.jsonl"),format!("coordination/runtime/ledger-wal/{round}.jsonl")] {
+            let p=root.join(rel);fs::create_dir_all(p.parent().unwrap()).unwrap();fs::write(p,&bytes).unwrap();
+        }
+    }
+    struct Owned(PathBuf);
+    impl Owned { fn start(wt: PathBuf)->Self { let o=Command::new("git").args(["--no-optional-locks","-c","core.fsmonitor=true","fsmonitor--daemon","start"]).current_dir(&wt).output().unwrap();assert!(o.status.success());Self(wt) } }
+    impl Drop for Owned { fn drop(&mut self) { if self.0.exists() {let _=native_monitor_command(&self.0,"stop");} } }
+    fn fixture(tag: &str) -> (PathBuf, crate::sites::Site, Vec<EventRecord>) {
+        use sha2::Digest;
+        let root = crate::util::test_scratch_dir(tag);
+        g(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("tracked.txt"), b"source\n").unwrap();
+        fs::write(
+            root.join(".gitignore"),
+            ".worktrees/\norch/target/\ncoordination/\n",
+        )
+        .unwrap();
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "-qm", "fixture"]);
+        let head = g(&root, &["rev-parse", "HEAD"]);
+        let site = crate::sites::Site {
+            site_id: "M1-review-probe-g01".into(),
+            generation: 1,
+            task_id: "M1".into(),
+            attempt_id: "M1-A0001".into(),
+            role: crate::sites::SiteRole::Review,
+            agent: "probe".into(),
+            reviewed_head: head.clone(),
+            worktree: ".worktrees/review-M1-A0001-review-probe-g01".into(),
+            target: "orch/target/review-M1-A0001-review-probe-g01".into(),
+            wake_id: Some("wake-M1".into()),
+        };
+        fs::create_dir_all(root.join(".worktrees")).unwrap();
+        g(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                root.join(&site.worktree).to_str().unwrap(),
+                &head,
+            ],
+        );
+        fs::create_dir_all(root.join(&site.target)).unwrap();
+        fs::write(root.join(&site.target).join("cache"), b"owned-cache").unwrap();
+        let evidence = root.join("coordination/runtime/review-inbox/rMaint/M1.md");
+        fs::create_dir_all(evidence.parent().unwrap()).unwrap();
+        fs::write(&evidence, b"preserved native answer").unwrap();
+        let event = |kind: &str, payload| {
+            crate::ledger::event(kind, "runtime:orch", Some("M1"), Some("rMaint"), payload)
+        };
+        let lease = event(
+            "WorkspaceLeased",
+            serde_json::json!({"siteId":site.site_id,"generation":1,
+            "attemptId":site.attempt_id,"role":"review","agent":"probe","reviewedHead":head,
+            "wakeId":"wake-M1","paths":{"worktree":site.worktree,"target":site.target}}),
+        );
+        let terminal = event(
+            "ManagedWakeTerminated",
+            serde_json::json!({"wakeId":"wake-M1","agent":"probe",
+            "managedScopeTerminated":true,"turnEnded":true,"state":"answered","mechanicalTerminalAbsent":false,
+            "channelBinding":{"fixedHead":head},"outputPath":evidence,
+            "outputSha256":hex::encode(sha2::Sha256::digest(b"preserved native answer"))}),
+        );
+        let release = event(
+            "WorkspaceReleased",
+            serde_json::json!({"siteId":site.site_id,"generation":1,
+            "attemptId":site.attempt_id,"role":"review","agent":"probe","wakeId":"wake-M1",
+            "completionReceipt":crate::sites::MANAGED_COMPLETION_RECEIPT,"terminationEventId":terminal.event_id}),
+        );
+        let closed = crate::ledger::event(
+            "RoundClosed",
+            "runtime:orch",
+            None,
+            Some("rMaint"),
+            serde_json::json!({"forced":false}),
+        );
+        let events = vec![lease, terminal, release, closed];
+        write_maintenance_events(&root, "rMaint", &events);
+        (root, site, events)
+    }
+
+
+    #[test]
+    fn monitor_stop_failure_and_later_refusal_preserve_effect_and_source() {
+        use std::cell::Cell;
+        for after_stop in [false,true] {
+            let (root,site,events)=fixture("b345-stop-failure");let wt=root.join(&site.worktree);let _m=Owned::start(wt.clone());let calls=Cell::new(0);
+            let guard=|| {calls.set(calls.get()+1);if after_stop && calls.get()==2 {bail!("injected fresh evidence refusal");}Ok(())};
+            let stop=|p:&Path| {if after_stop {native_monitor_command(p,"stop")}else{Ok(Command::new("/usr/bin/false").output()?)}};
+            let result=maintain_one_site_guarded(&root,"rMaint",&events,&site,false,&guard,&stop);
+            assert_eq!(result.disposition,"failed","{result:#?}");assert_eq!(result.removed_logical_bytes,0);assert!(wt.exists());
+            assert!(result.reason.contains(if after_stop {"stopped; IPC absent"}else{"stop attempted"}),"{result:#?}");
+            monitor_status(&wt,!after_stop).unwrap();
+            if after_stop {let retry=maintain_one_site(&root,"rMaint",&events,&site,false);assert_eq!(retry.disposition,"removed","{retry:#?}");}
+        }
+    }
+    #[test]
+    fn monitor_fresh_guard_and_changed_process_precede_stop() {
+        use std::cell::Cell;
+        for replace in [false,true] {
+            let (root,site,events)=fixture("b345-before-stop");let wt=root.join(&site.worktree);let _m=Owned::start(wt.clone());let called=Cell::new(0);let replacement=std::cell::RefCell::new(None);
+            let guard=|| {if replace {native_monitor_command(&wt,"stop")?;*replacement.borrow_mut()=Some(Owned::start(wt.clone()));Ok(())}else{bail!("new all-owner refusal")}};
+            let stop=|p:&Path| {called.set(called.get()+1);native_monitor_command(p,"stop")};
+            let result=maintain_one_site_guarded(&root,"rMaint",&events,&site,false,&guard,&stop);
+            assert_eq!(called.get(),0,"stop preceded fresh proof: {result:#?}");assert!(wt.exists());assert_eq!(result.removed_logical_bytes,0);monitor_status(&wt,true).unwrap();
+        }
+    }
+    #[test]
+    fn monitor_descriptor_bundle_rejects_missing_admin_extra_listener_and_foreign_identity() {
+        let (root,site,_)=fixture("b345-descriptors");let wt=root.join(&site.worktree);let _m=Owned::start(wt.clone());
+        let proof=prove_native_monitor(&wt,&root.join(&site.target)).unwrap();
+        let raw=Command::new("/usr/sbin/lsof").args(["-nP","-a","-p",&proof.pid.to_string(),"-F0pcuftDin"]).output().unwrap().stdout;
+        let text=String::from_utf8(raw.clone()).unwrap();let uid=proof.process.split_whitespace().next().unwrap();let images=&proof.identities[3..];let mut dirs=BTreeSet::new();
+        for p in [&wt,&proof.admin] {dirs.extend(p.ancestors().map(Path::to_path_buf));let physical=PathBuf::from(format!("/System/Volumes/Data{}",p.display()));if monitor_identity(&physical).ok()==monitor_identity(p).ok(){dirs.extend(physical.ancestors().map(Path::to_path_buf));}}
+        let check=|b:&[u8]| validate_monitor_descriptors(b,proof.pid,uid,&wt,&proof.admin,&proof.ipc,images,&dirs,false);
+        check(&raw).unwrap();
+        let without_admin=text.split_inclusive('\n').filter(|line| !line.contains(&format!("n{}\0",proof.admin.display()))).collect::<String>();
+        let variants=vec![
+            without_admin,
+            text.replacen(&format!("u{uid}\0"),"u0\0",1),
+            text.replacen(&format!("p{}\0",proof.pid),"p0\0",1),
+            text.replace(&format!("n{}\0",proof.admin.display()),&format!("n{}\0",root.display())),
+            format!("{text}f999\0tunix\0nfsmonitor--daemon.ipc\0\n"),
+            text.replace("nfsmonitor--daemon.ipc\0","nforeign.ipc\0"),
+            format!("{text}f998\0tREG\0n{}\0\n",root.join("tracked.txt").display()),
+            text.replace("/Library/Developer/CommandLineTools/usr/bin/git","/usr/lib/dyld"),
+        ];
+        for (n,v) in variants.iter().enumerate(){assert!(check(v.as_bytes()).is_err(),"accepted invalid proof {n}");}
+    }
+    #[test]
+    fn monitor_pending_target_sweep_keeps_cache_until_quiet() {
+        let (root,site,events)=fixture("b345-ttl");let wt=root.join(&site.worktree);let _m=Owned::start(wt.clone());
+        fs::write(root.join("coordination/runtime/CURRENT-ROUND"),"rMaint\n").unwrap();
+        let preview=maintain_one_site(&root,"rMaint",&events,&site,true);assert!(preview.eligible,"{preview:#?}");
+        let report=crate::buildcache::sweep_targets_for_round(&root,std::time::Duration::ZERO).unwrap();
+        assert!(root.join(&site.target).exists(),"pending target swept: {report:#?}");monitor_status(&wt,true).unwrap();
+        assert!(native_monitor_command(&wt,"stop").unwrap().status.success());
+        let report=crate::buildcache::sweep_targets_for_round(&root,std::time::Duration::ZERO).unwrap();
+        assert!(!root.join(&site.target).exists(),"quiet target not swept: {report:#?}");
+    }
+    #[test]
+    fn monitor_unknown_native_evidence_never_stops() {
+        let (root,site,mut events)=fixture("b345-native-unknown");let wt=root.join(&site.worktree);let _m=Owned::start(wt.clone());
+        events.retain(|e|e.kind!="ManagedWakeTerminated");write_maintenance_events(&root,"rMaint",&events);
+        let result=maintain_one_site(&root,"rMaint",&events,&site,false);assert!(!result.eligible);assert!(wt.exists());monitor_status(&wt,true).unwrap();
+    }
+    #[test]
+    fn monitor_status_must_confirm_native_stop_not_only_command_exit() {
+        let (root,site,events)=fixture("b345-stop-status");let wt=root.join(&site.worktree);let _m=Owned::start(wt.clone());
+        assert!(monitor_status(&wt,false).is_err());
+        let result=maintain_one_site_guarded(&root,"rMaint",&events,&site,false,&||Ok(()),&|_|Ok(Command::new("/usr/bin/true").output()?));
+        assert_eq!(result.disposition,"failed");assert!(wt.exists());assert_eq!(result.removed_logical_bytes,0);monitor_status(&wt,true).unwrap();
+    }
+    #[test]
+    fn monitor_direct_ipc_owner_conflict_is_refused_before_relative_fallback() {
+        use std::os::unix::process::ExitStatusExt;
+        let output=|rc,out:&str|std::process::Output {status:std::process::ExitStatus::from_raw(rc<<8),stdout:out.as_bytes().to_vec(),stderr:vec![]};
+        let boundary=BTreeSet::from([123]);
+        assert!(monitor_endpoint_owner(&output(0,"123\n"),&boundary).unwrap());
+        assert!(!monitor_endpoint_owner(&output(1,""),&boundary).unwrap());
+        for observation in [output(0,"456\n"),output(1,"456\n"),output(0,"123\n456\n")] {
+            let error=monitor_endpoint_owner(&observation,&boundary).unwrap_err();
+            assert!(error.to_string().contains("conflicting native IPC owner"));
+        }
+        assert!(monitor_endpoint_owner(&output(0,""),&boundary).is_err());
+    }
+
+    #[test]
+    fn monitor_pid_parser_rejects_garbage_and_ambiguous_empty() {
+        use std::os::unix::process::ExitStatusExt;
+        let output=|rc,out:&str,err:&str|std::process::Output{status:std::process::ExitStatus::from_raw(rc<<8),stdout:out.as_bytes().to_vec(),stderr:err.as_bytes().to_vec()};
+        assert_eq!(monitor_pids(&output(1,"123\n","")).unwrap(),BTreeSet::from([123]));
+        for o in [output(0,"",""),output(1,"0\n",""),output(1,"123 garbage\n",""),output(1,"123\n","warning"),output(2,"123\n","")] {assert!(monitor_pids(&o).is_err());}
+        assert!(monitor_fields(b"p1\0p2\0u3\0").is_ok()); // Caller verifies exactly one process header and only descriptor records thereafter.
+    }
+}
+
+// Preserve all per-owner receipts and physical identities across the all-member preflight.
+// This is an observation, never a new lifecycle fact or authority to replay complete journals.
+type GroupSnapshot = Vec<(PathBuf, Option<(u64, u64, bool, Vec<u8>)>)>;
+
+fn equivalent_group_snapshot(root: &Path, round: &str, members: &[Site]) -> Result<GroupSnapshot> {
+    use std::os::unix::fs::MetadataExt;
+    let first = members.first().context("empty implementation group")?;
+    let mut paths = vec![(no_symlink_ancestors(root, &first.worktree)?, false),
+        (no_symlink_ancestors(root, &first.target)?, false)];
+    for member in members {
+        if member.role != SiteRole::Implement || member.identity() != first.identity()
+            || member.worktree != first.worktree || member.target != first.target
+            || !member.has_production_path_contract() {
+            bail!("implementation group is not exact-equivalent");
+        }
+        let path = no_symlink_ancestors(root, &format!("coordination/runtime/site-cleanup/{round}/{}.json", member.site_id))?;
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > 16 * 1024 * 1024 {
+                bail!("unsafe equivalent-group journal");
+            }
+        }
+        if let Some(journal) = read_journal(root, round, member)? {
+            if journal.phase == "complete" && (root.join(&member.worktree).exists() || root.join(&member.target).exists()) {
+                bail!("complete journal with reappeared equivalent group remains held");
+            }
+            if Some(member.generation) != members.iter().map(|s| s.generation).max() {
+                bail!("nonrepresentative journal remains an independent incomplete cleanup");
+            }
+        }
+        paths.push((path, true));
+    }
+    let mut snapshot = Vec::new();
+    for (path, file) in paths {
+        let value = match fs::symlink_metadata(&path) {
+            Ok(m) => {
+                if m.file_type().is_symlink() || (file && (!m.is_file() || m.len() > 16 * 1024 * 1024))
+                    || (!file && !m.is_dir()) {
+                    bail!("unsafe equivalent-group observation: {}", path.display());
+                }
+                Some((m.dev(), m.ino(), file, if file { fs::read(&path)? } else { Vec::new() }))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        snapshot.push((path, value));
+    }
+    Ok(snapshot)
+}
+
+// All members use the same physical paths but retain independent lease/evidence/journal checks.
+// The callback re-reads the unfiltered cross-round claim domain while the caller holds its lock.
+pub(crate) fn maintain_equivalent_implementations(
+    root: &Path, round: &str, events: &[EventRecord], members: &[Site], dry_run: bool,
+    inventory_unchanged: &dyn Fn() -> bool,
+) -> Vec<crate::reclaim::MaintenanceItem> {
+    let representative = members.iter().max_by_key(|s| s.generation).expect("nonempty group");
+    let held = |reason: String| members.iter().map(|s| crate::reclaim::MaintenanceItem::held(
+        format!("{round}/{}", s.site_id), "site", vec![root.join(&s.worktree), root.join(&s.target)],
+        reason.clone())).collect::<Vec<_>>();
+    let before = match equivalent_group_snapshot(root, round, members) {
+        Ok(snapshot) => snapshot,
+        Err(e) => return held(format!("{e:#}")),
+    };
+    let group_guard = || -> Result<()> {
+        if !inventory_unchanged() { bail!("original all-round ownership changed before group effect"); }
+        for member in members {
+            let preview = maintain_one_site(root, round, events, member, true);
+            if !preview.eligible { bail!("group owner {}: {}", member.site_id, preview.reason); }
+        }
+        if equivalent_group_snapshot(root, round, members)? != before || !inventory_unchanged() {
+            bail!("equivalent-group identity, receipt or ownership changed during preflight");
+        }
+        Ok(())
+    };
+    if let Err(e) = group_guard() { return held(format!("{e:#}")); }
+    let mut result = maintain_one_site_guarded(root, round, events, representative, dry_run, &group_guard, &|wt| native_monitor_command(wt, "stop"));
+    result.criterion("all-round-ownership", Some(true), "unfiltered all-round claims joined to every exact-equivalent owner".into());
+    result.criterion("fresh-ledger-critical-section", if dry_run { None } else { Some(true) },
+        "all-owner preflight and effect-boundary identity/receipt/claim recheck; no historical writes".into());
+    let reason = format!("zero-deletion alias of {round}/{}; representative outcome={}: {}",
+        representative.site_id, result.disposition, result.reason);
+    let mut items = vec![result];
+    for member in members.iter().filter(|s| s.site_id != representative.site_id) {
+        let mut alias = crate::reclaim::MaintenanceItem::held(format!("{round}/{}", member.site_id),
+            "site", vec![root.join(&member.worktree), root.join(&member.target)], reason.clone());
+        alias.removed_logical_bytes = 0;
+        items.push(alias);
+    }
+    items
+}
+
 /// Use the existing physical reaper only after the same read-only preview prerequisites pass.
 /// Caller holds the global ledger lock for apply; this function never appends lifecycle events.
 pub(crate) fn maintain_one_site(
@@ -2374,6 +2837,14 @@ pub(crate) fn maintain_one_site(
     site: &Site,
     dry_run: bool,
 ) -> crate::reclaim::MaintenanceItem {
+    maintain_one_site_guarded(root, round, events, site, dry_run, &|| Ok(()), &|wt| native_monitor_command(wt, "stop"))
+}
+
+fn maintain_one_site_guarded(
+    root: &Path, round: &str, events: &[EventRecord], site: &Site, dry_run: bool,
+    before_effect: &dyn Fn() -> Result<()>,
+    stop: &dyn Fn(&Path) -> Result<std::process::Output>,
+) -> crate::reclaim::MaintenanceItem {
     use std::os::unix::fs::MetadataExt;
     let mut item = crate::reclaim::MaintenanceItem::held(
         format!("{round}/{}", site.site_id),
@@ -2381,6 +2852,8 @@ pub(crate) fn maintain_one_site(
         vec![root.join(&site.worktree), root.join(&site.target)],
         "not eligible".into(),
     );
+    let original_inventory = crate::reclaim::storage_inventory(root);
+    let mut pending_monitor = None;
     let observation = (|| -> Result<(PathBuf, PathBuf, PathBuf, Vec<(PathBuf, u64, u64)>)> {
         if !site.has_production_path_contract() {
             bail!("site paths are not canonical; no adoption");
@@ -2502,12 +2975,16 @@ pub(crate) fn maintain_one_site(
             Some(true),
             "existing complete-journal ABA and exact prune guards retained".into(),
         );
-        maintenance_quiet(&[worktree.clone(), target.clone()])?;
-        item.criterion(
-            "last-user-absent",
-            Some(true),
-            "released producer plus no open worktree/cache files; no signals".into(),
-        );
+        match maintenance_quiet(&[worktree.clone(), target.clone()]) {
+            Ok(()) => item.criterion("last-user-absent", Some(true), "released producer and strict quiet".into()),
+            Err(quiet) => {
+                let monitor = prove_native_monitor(&worktree, &target)
+                    .with_context(|| format!("{quiet:#}; dedicated monitor proof refused"))?;
+                item.criterion("last-user-absent", None, "pending native monitor stop; dry-run has no effects".into());
+                item.criterion("native-fsmonitor-release", None, format!("proved PID {} via {}; stop deferred to apply", monitor.pid, monitor.proof_mode));
+                pending_monitor = Some(monitor);
+            }
+        }
         let quarantine = no_symlink_ancestors(
             root,
             &format!(
@@ -2543,7 +3020,7 @@ pub(crate) fn maintain_one_site(
         }
     };
     item.eligible = true;
-    item.reason = "eligible snapshot; apply rechecks under the ledger lock".into();
+    item.reason = if pending_monitor.is_some() { "eligible pending native monitor stop; no deletion promised" } else { "eligible snapshot; apply rechecks under the ledger lock" }.into();
     item.criterion(
         "apply-lock-and-directory-recheck",
         if dry_run { None } else { Some(true) },
@@ -2554,6 +3031,8 @@ pub(crate) fn maintain_one_site(
     }
     let before =
         crate::reclaim::measure_boundaries(&[worktree.clone(), target.clone(), quarantine.clone()]);
+    let mut entered_reaper = false;
+    let mut stop_effect: Option<String> = None;
     let result = (|| -> Result<ReapOne> {
         let _ = before.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
         for (path, device, inode) in &identities {
@@ -2562,9 +3041,45 @@ pub(crate) fn maintain_one_site(
                 bail!("directory replaced since maintenance observation");
             }
         }
+        if maintenance_quiet(&[worktree.clone(), target.clone()]).is_err() {
+            // All raw owners and the complete old static preview precede ANY stop.
+            if !crate::reclaim::maintenance_inventory_unchanged(root, &original_inventory) {
+                bail!("ownership changed before native stop");
+            }
+            before_effect()?;
+            let fresh = maintain_one_site(root, round, events, site, true);
+            if !fresh.eligible { bail!("site no longer eligible before native stop: {}", fresh.reason); }
+            let monitor = prove_native_monitor(&worktree, &target)?;
+            if pending_monitor.as_ref() != Some(&monitor) { bail!("native monitor identity changed before stop"); }
+            if !crate::reclaim::maintenance_inventory_unchanged(root, &original_inventory) { bail!("ownership changed during native proof"); }
+            for (path, device, inode) in &identities {
+                if monitor_identity(path)? != (*device, *inode) { bail!("directory changed during native proof"); }
+            }
+            stop_effect = Some(format!("native monitor PID {} stop attempted via {}", monitor.pid, monitor.proof_mode));
+            let stopped = stop(&worktree)?;
+            if !stopped.status.success() || !stopped.stderr.is_empty() { bail!("native stop failed; outcome must be re-observed"); }
+            stop_effect = Some(format!("native monitor PID {} stop command succeeded", monitor.pid));
+            monitor_status(&worktree, false)?;
+            match fs::symlink_metadata(&monitor.ipc) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                _ => bail!("native stop left IPC endpoint or uncertain absence"),
+            }
+            maintenance_quiet(&[worktree.clone(), target.clone()])?;
+            stop_effect = Some(format!("native monitor PID {} stopped; IPC absent and strict quiet confirmed", monitor.pid));
+            item.criterion("native-fsmonitor-release", Some(true), stop_effect.clone().unwrap());
+            item.criterion("last-user-absent", Some(true), "strict quiet after native stop".into());
+            if !crate::reclaim::maintenance_inventory_unchanged(root, &original_inventory) { bail!("ownership changed after native stop"); }
+            let fresh = maintain_one_site(root, round, events, site, true);
+            if !fresh.eligible { bail!("post-stop evidence refused: {}", fresh.reason); }
+            for (path, device, inode) in &identities {
+                if monitor_identity(path)? != (*device, *inode) { bail!("post-stop directory changed"); }
+            }
+        }
         maintenance_quiet(&[worktree.clone(), target.clone()])?;
+        before_effect()?;
         let mut outcome = ReapOutcome::default();
         let mut ignored_legacy_delta = 0;
+        entered_reaper = true;
         reap_one(
             root,
             round,
@@ -2576,9 +3091,11 @@ pub(crate) fn maintain_one_site(
         )
     })();
     let after = crate::reclaim::measure_boundaries(&[worktree, target, quarantine]);
-    if let (Ok(before), Ok(after)) = (before, after) {
-        item.removed_logical_bytes = before.saturating_sub(after);
-    }
+    if entered_reaper {
+        if let (Ok(before), Ok(after)) = (before, after) {
+            item.removed_logical_bytes = before.saturating_sub(after);
+        }
+    } // A refused preflight did not delete external/concurrently replaced bytes.
     item.logical_bytes = crate::reclaim::measure_boundaries(&item.paths).ok();
     match result {
         Ok(ReapOne::Removed | ReapOne::AlreadyComplete) => {
@@ -2599,6 +3116,12 @@ pub(crate) fn maintain_one_site(
             item.reason = format!("{error:#}");
             item.disposition = "failed".into();
         }
+    }
+    if let Some(effect) = stop_effect {
+        if !item.criteria.iter().any(|c| c.name == "native-fsmonitor-release" && c.passed == Some(true)) {
+            item.criterion("native-fsmonitor-release", Some(false), effect.clone());
+        }
+        item.reason = format!("{effect}; {}", item.reason);
     }
     item
 }

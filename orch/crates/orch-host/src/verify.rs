@@ -5570,6 +5570,126 @@ fn validate_record_gate_relaxed(
     Ok(())
 }
 
+fn fixed_merge_recovery_suffix<'a>(
+    events: &'a [EventRecord],
+    round: &str,
+    task_id: &str,
+    merge_position: usize,
+    required: &[String],
+    merge_tree: &str,
+    active_final_tree: bool,
+) -> Result<Vec<&'a EventRecord>> {
+    if active_final_tree {
+        bail!("advanced-main fixed recovery with active final-tree policy remains unsupported");
+    }
+    if required.is_empty() || required.iter().collect::<BTreeSet<_>>().len() != required.len() {
+        bail!("fixed merge recovery requires a nonempty unique gate list");
+    }
+    let mut boundary = merge_position;
+    for (position, event) in events.iter().enumerate().skip(merge_position + 1) {
+        if event.task_id.as_deref() == Some(task_id)
+            && event.round.as_deref() == Some(round)
+            && event.kind == "EscalationRaised"
+            && event_payload_str(event, "stage") == Some("post-merge-gate")
+        {
+            if event.actor != "reviewer:orch-runtime" {
+                bail!("fixed merge recovery failure boundary has invalid authority");
+            }
+            boundary = position;
+        }
+    }
+    let mut observations = Vec::new();
+    for event in events.iter().skip(boundary + 1) {
+        if event.task_id.as_deref() != Some(task_id)
+            || event.round.as_deref() != Some(round) || event.kind != GATE_EXECUTED_SCHEMA.0 {
+            continue;
+        }
+        let payload = canonical_gate_executed_payload(event, round)
+            .context("fixed merge recovery gate is not canonical")?;
+        if payload.get("phase").and_then(serde_json::Value::as_str) == Some("recovery") {
+            observations.push(event);
+        }
+    }
+    let first = observations.iter().rposition(|event|
+        event_payload_str(event, "commandRef") == Some(required[0].as_str()))
+        .context("fixed merge recovery has no fresh first gate")?;
+    let selected = &observations[first..];
+    if selected.len() != required.len() {
+        bail!("fixed merge recovery requires a complete latest ordered gate suffix");
+    }
+    let mut event_ids = BTreeSet::new();
+    let mut run_ids = BTreeSet::new();
+    let fingerprint = (event_payload_str(selected[0], "toolchainDigest"),
+        event_payload_str(selected[0], "environmentDigest"));
+    for (event, name) in selected.iter().zip(required) {
+        if event_payload_str(event, "commandRef") != Some(name.as_str())
+            || event_payload_str(event, "subjectTreeSha") != Some(merge_tree)
+            || event.payload.as_ref().and_then(|p| p.get("exitCode")).and_then(serde_json::Value::as_i64) != Some(0)
+            || !event_ids.insert(event.event_id.as_str())
+            || !run_ids.insert(event_payload_str(event, "gateRunId"))
+            || (event_payload_str(event, "toolchainDigest"), event_payload_str(event, "environmentDigest")) != fingerprint
+        {
+            bail!("fixed merge recovery gate order, identity, source, fingerprint or green result mismatch");
+        }
+    }
+    Ok(selected.to_vec())
+}
+
+/// Admit only an exact, logged fixed-merge recovery after main advanced.
+/// The new branch requires the complete ordered recovery suffix after the last
+/// failure; it never grants at-tip relaxation or changes historical replay.
+/// Advanced-main final-tree policy recovery remains closed in this narrow path.
+pub(crate) fn validate_schema3_fixed_merge_recovery_gates(
+    root: &Path,
+    round: &str,
+    task_id: &str,
+    attempt_id: &str,
+    merge_sha: &str,
+    current_main: &str,
+    events: &[EventRecord],
+) -> Result<()> {
+    if crate::gitx::rev_parse(root, "main")? != current_main
+        || !crate::gitx::is_ancestor(root, merge_sha, current_main)? {
+        bail!("fixed merge recovery main changed or no longer contains merge");
+    }
+    let active_final_tree = crate::close::resolve_final_tree_policy(
+        root, round, events, task_id, attempt_id)?.is_some();
+    let merges = events.iter().enumerate().filter(|(_, event)|
+        event.kind == "MergeExecuted" && event.task_id.as_deref() == Some(task_id)
+            && event.round.as_deref() == Some(round)).collect::<Vec<_>>();
+    let [(merge_position, merge_event)] = merges.as_slice() else {
+        bail!("fixed merge recovery requires one canonical merge anchor");
+    };
+    let merged: MergeExecutedPayload = serde_json::from_value(
+        merge_event.payload.clone().context("fixed merge recovery merge payload missing")?)?;
+    if merge_event.actor != "reviewer:orch-runtime" || merged.policy != "no-ff" || merged.merge_sha != merge_sha {
+        bail!("fixed merge recovery merge identity mismatch");
+    }
+    let rel = format!("coordination/rounds/{round}/tasks/{task_id}.md");
+    let bytes = committed_regular_blob_bytes(root, merge_sha, &rel, "fixed merge recovery card")?;
+    let card = crate::card::parse(&rel, task_id, std::str::from_utf8(&bytes)?)?;
+    let tree = crate::gitx::rev_parse(root, &format!("{merge_sha}^{{tree}}"))?;
+    let selected = fixed_merge_recovery_suffix(events, round, task_id, *merge_position,
+        &card.meta.gates.fast, &tree, active_final_tree)?;
+    for event in selected {
+        let payload = canonical_gate_executed_payload(event, round).context("fixed recovery payload changed")?;
+        let name = event_payload_str(event, "commandRef").context("fixed recovery gate missing name")?;
+        let run = event_payload_str(event, "gateRunId").context("fixed recovery gate missing run")?;
+        let tag = gate::phase_scoped_log_tag(round, task_id, attempt_id, gate::GatePhase::Recovery, run);
+        let path = root.join("coordination/runtime/logs").join(format!("{tag}-gate-{name}.log"));
+        let log = regular_file_bytes(root, &path, "fixed merge recovery gate log")?;
+        let (sha, len) = sha_binding(&log);
+        if Some(sha.as_str()) != event_payload_str(event, "logSha256")
+            || Some(len) != payload.get("logBytes").and_then(serde_json::Value::as_u64) {
+            bail!("fixed merge recovery raw log digest or length mismatch");
+        }
+    }
+    if crate::gitx::rev_parse(root, "main")? != current_main {
+        bail!("fixed merge recovery main changed while validating evidence");
+    }
+    Ok(())
+}
+
 fn validate_schema3_record_relaxation_point(
     current_main: Option<&str>,
     merge_sha: &str,
@@ -5760,11 +5880,19 @@ fn validate_canonical_recorded_batches(
                     .map_err(anyhow::Error::from)
                 })
                 .transpose()?;
+            if current_main.as_deref().is_some_and(|current| current != merged.merge_sha)
+                && recorded_relaxation.is_none()
+            {
+                validate_schema3_fixed_merge_recovery_gates(root, round, task_id,
+                    &root_payload.attempt_id, &merged.merge_sha,
+                    current_main.as_deref().context("fixed recovery missing current main")?, &history)?;
+            } else {
             validate_schema3_record_relaxation_point(
                 current_main.as_deref(),
                 &merged.merge_sha,
                 relaxation_payload.as_ref().map(|payload| payload.tip_sha.as_str()),
             )?;
+            }
             if let (Some(relaxed), Some(payload)) = (recorded_relaxation, relaxation_payload) {
                 validate_record_gate_relaxed(
                     root,
@@ -11401,6 +11529,16 @@ fn validate_existing_verdict_gates(
     Ok(())
 }
 
+fn prepare_root_gate_source(
+    root: &Path,
+    worktree: &Path,
+    permit: &crate::storage::StoragePermit,
+) -> Result<(std::path::PathBuf, Option<collect::CollectSourceSnapshot>)> {
+    let head = crate::gitx::rev_parse(worktree, "HEAD")?;
+    let source = collect::CollectSourceSnapshot::new(root, &head, permit)?;
+    Ok((source.path().to_path_buf(), Some(source)))
+}
+
 fn run_verdict_gates(
     root: &Path,
     round: &str,
@@ -11422,8 +11560,15 @@ fn run_verdict_gates(
     if names.is_empty() {
         bail!("root verdict gate 集合为空");
     }
-    let wt = root.join(".worktrees").join(task_id);
+    let original_wt = root.join(".worktrees").join(task_id);
     let log_dir = root.join("coordination/runtime/logs");
+    let (wt, mut source) = if committed_binding.oracle.dialect == "cargo" {
+        collect::reject_collect_source_redirects()?;
+        let permit = crate::storage::guard_gate_operation(root, round,
+            ledger::GateAuditIdentity::Attempt { task_id, attempt_id },
+            &[root.join(".cowork-temp"), log_dir.clone()])?;
+        prepare_root_gate_source(root, &original_wt, &permit)?
+    } else { (original_wt, None) };
     let subject_tree_sha = gate::capture_gate_subject_tree(root, &wt)?;
     let mut results = Vec::with_capacity(names.len());
     let mut bindings = Vec::with_capacity(names.len());
@@ -11480,6 +11625,9 @@ fn run_verdict_gates(
             reused_event_id: None,
         });
         results.push(result);
+    }
+    if results.iter().all(|result| result.exit_code == 0) {
+        if let Some(source) = source.as_mut() { source.close()?; }
     }
     Ok((results, bindings))
 }
@@ -15617,5 +15765,108 @@ git: {pushPolicy: forbidden, mergePolicy: ff-only-else-no-ff}
         .unwrap_err()
         .to_string();
         assert!(error.contains("不是 regular file"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod root_gate_fixed_source_tests {
+    use super::*;
+    fn git(root: &Path, args: &[&str]) -> String {
+        let o = std::process::Command::new("git").arg("-C").arg(root).args(args).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap().trim().to_string()
+    }
+    fn commit(root: &Path, value: &str) -> String {
+        fs::write(root.join("subject.txt"), value).unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", value]);
+        git(root, &["rev-parse", "HEAD"])
+    }
+    #[test]
+    fn root_gate_snapshot_pins_nested_clone_to_candidate() {
+        let root = crate::util::test_scratch_dir("root-gate-fixed-source");
+        git(&root, &["init", "-b", "main"]);
+        fs::write(root.join(".gitignore"), ".cowork-temp/\n.worktrees/\n").unwrap();
+        let candidate = commit(&root, "candidate");
+        let main = commit(&root, "later-main");
+        let worktree = root.join(".worktrees/B900");
+        crate::gitx::worktree_add_detached(&root, &worktree, &candidate).unwrap();
+        let permit = crate::storage::fixture_gate_permit(&root, &[root.clone()]);
+        let (source_path, mut source) = prepare_root_gate_source(&root, &worktree, &permit).unwrap();
+        let nested = root.join(".cowork-temp/nested");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        git(&root, &["clone", "-q", source_path.to_str().unwrap(), nested.to_str().unwrap()]);
+        git(&nested, &["checkout", "-q", "-B", "main", "origin/main"]);
+        assert_eq!(git(&nested, &["rev-parse", "HEAD"]), candidate, "root gate must compile and clone the same source");
+        assert_eq!(fs::read_to_string(nested.join("subject.txt")).unwrap(), "candidate");
+        if let Some(source) = source.as_mut() { source.close().unwrap(); }
+        assert_eq!(git(&root, &["rev-parse", "main"]), main);
+        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), candidate);
+    }
+}
+
+#[cfg(test)]
+mod fixed_merge_record_proof_tests {
+    use super::*;
+    const TREE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    fn gate(name: &str) -> EventRecord {
+        crate::ledger::event("GateExecuted", "runtime:orch", Some("BT"), Some("r900"),
+            serde_json::json!({"commandRef":name,"phase":"recovery",
+                "gateRunId":ulid::Ulid::new().to_string(),"exitCode":0,"durationMs":1,
+                "subjectTreeSha":TREE,"logSha256":"1".repeat(64),"logBytes":1,
+                "toolchainDigest":"2".repeat(64),"environmentDigest":"3".repeat(64)}))
+    }
+    fn base() -> Vec<EventRecord> {
+        vec![crate::ledger::event("MergeExecuted", "reviewer:orch-runtime", Some("BT"), Some("r900"),
+            serde_json::json!({"mergeSha":"c".repeat(40),"policy":"no-ff"})), gate("one"), gate("two")]
+    }
+    fn failure() -> EventRecord {
+        crate::ledger::event("EscalationRaised", "reviewer:orch-runtime", Some("BT"), Some("r900"),
+            serde_json::json!({"stage":"post-merge-gate","exit":101,"gate":"one",
+                "hint":"retain","mergeSha":"c".repeat(40),"reason":"failed"}))
+    }
+    fn check(events: &[EventRecord], anchor: usize) -> Result<Vec<&EventRecord>> {
+        fixed_merge_recovery_suffix(events, "r900", "BT", anchor,
+            &["one".to_string(), "two".to_string()], TREE, false)
+    }
+    #[test]
+    fn fixed_record_requires_complete_ordered_fresh_green_suffix() {
+        assert_eq!(check(&base(), 0).unwrap().len(), 2);
+        assert!(fixed_merge_recovery_suffix(&base(), "r900", "BT", 0,
+            &["one".to_string(), "two".to_string()], TREE, true).is_err(),
+            "complete ordinary evidence cannot admit an active final-tree policy");
+        let mut missing = base(); missing.pop(); assert!(check(&missing, 0).is_err());
+        let mut reordered = base(); reordered.swap(1,2); assert!(check(&reordered,0).is_err());
+        let mut partial = base(); partial.push(gate("one")); assert!(check(&partial,0).is_err());
+        let mut unknown = base(); unknown.push(gate("unknown")); assert!(check(&unknown,0).is_err());
+        let mut failed = base(); failed.push(failure()); assert!(check(&failed,0).is_err());
+        failed.push(gate("one")); assert!(check(&failed,0).is_err(), "old two cannot fill the new run");
+        failed.push(gate("two")); assert!(check(&failed,0).is_ok());
+        let before = vec![gate("one"),gate("two"),base().remove(0)];
+        assert!(check(&before,2).is_err());
+    }
+    #[test]
+    fn fixed_record_rejects_wrong_gate_source_shape_identity_and_fingerprint() {
+        for (key,value) in [
+            ("exitCode",serde_json::json!(101)),
+            ("subjectTreeSha",serde_json::json!("b".repeat(40))),
+            ("phase",serde_json::json!("postmerge")),
+            ("toolchainDigest",serde_json::json!("4".repeat(64))),
+            ("environmentDigest",serde_json::json!("5".repeat(64))),
+            ("logSha256",serde_json::json!("invalid")),
+            ("logBytes",serde_json::json!(-1)),
+            ("gateRunId",serde_json::json!("invalid")),
+            ("unexpected",serde_json::json!(true)),
+        ] {
+            let mut events=base(); events[2].payload.as_mut().unwrap()[key]=value;
+            assert!(check(&events,0).is_err(), "invalid {key} admitted");
+        }
+        let mut task=base(); task[2].task_id=Some("OTHER".into()); assert!(check(&task,0).is_err());
+        let mut round=base(); round[2].round=Some("other".into()); assert!(check(&round,0).is_err());
+        let mut actor=base(); actor[2].actor="other".into(); assert!(check(&actor,0).is_err());
+        let mut duplicate=base(); duplicate[2].event_id=duplicate[1].event_id.clone();
+        assert!(check(&duplicate,0).is_err());
+        let mut duplicate=base(); let run=duplicate[1].payload.as_ref().unwrap()["gateRunId"].clone();
+        duplicate[2].payload.as_mut().unwrap()["gateRunId"]=run; assert!(check(&duplicate,0).is_err());
     }
 }

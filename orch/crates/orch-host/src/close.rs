@@ -2108,7 +2108,8 @@ fn final_tree_input_identity_v1(
     Ok(hex::encode(digest.finalize()))
 }
 
-fn resolve_final_tree_policy(
+/// Resolve active final-tree policy at the immutable attempt base, preserving missing-policy compatibility.
+pub(crate) fn resolve_final_tree_policy(
     root: &Path,
     round: &str,
     events: &[EventRecord],
@@ -4220,6 +4221,16 @@ pub fn run_record_at_tip(root: &Path, task_id: &str) -> Result<RecordOutcome> {
     Ok(outcome)
 }
 
+fn prepare_record_gate_source(
+    root: &Path,
+    worktree: &Path,
+    permit: &crate::storage::StoragePermit,
+) -> Result<(std::path::PathBuf, Option<crate::collect::CollectSourceSnapshot>)> {
+    let head = gitx::rev_parse(worktree, "HEAD")?;
+    let source = crate::collect::CollectSourceSnapshot::new(root, &head, permit)?;
+    Ok((source.path().to_path_buf(), Some(source)))
+}
+
 fn run_record_locked(
     root: &Path,
     task_id: &str,
@@ -4338,6 +4349,17 @@ fn run_record_locked(
             let card = card::load(&gate_wt, &round, task_id)?;
             (card.meta.gates.fast, binding::load(&gate_wt)?)
         };
+        let (gate_wt, mut source) = if b.oracle.dialect == "cargo" {
+            crate::collect::reject_collect_source_redirects()?;
+            let permit = crate::storage::guard_gate_operation(
+                root, &round,
+                ledger::GateAuditIdentity::Attempt {
+                    task_id, attempt_id: &authorization.attempt_id,
+                },
+                &[root.join(".cowork-temp"), log_dir.clone()],
+            )?;
+            prepare_record_gate_source(root, &gate_wt, &permit)?
+        } else { (gate_wt.clone(), None) };
         let subject_tree_sha = gate::capture_gate_subject_tree(root, &gate_wt)?;
         let mut gates = Vec::new();
         for gref in &gate_refs {
@@ -4397,6 +4419,9 @@ fn run_record_locked(
                 bail!("record gate {gref} 改变 detached HEAD/worktree");
             }
             gates.push(result);
+        }
+        if gates.iter().all(|gate| gate.exit_code == 0) {
+            if let Some(source) = source.as_mut() { source.close()?; }
         }
         Ok(gates)
     })();
@@ -6478,6 +6503,77 @@ requiredEvidence: [merge-boundary]\n\
     }
 
     #[test]
+    fn record_recovery_keeps_fixed_merge_source_after_main_advances() {
+        let fixture = merge_fixture_with_gate("record-fixed-merge-source", false,
+            r#"set -- $(git rev-list --parents -n 1 HEAD); if [ "$#" -eq 3 ]; then test "$(git rev-parse main)" = "$(git rev-parse HEAD)"; fi"#);
+        fixture.arm_dangling_barrier();
+        let merge_sha = fixture.merge_task_without_accounting();
+        fixture.append_merge_executed_only(&merge_sha);
+        fs::write(fixture.root.join("later-main.txt"), "later root repair\n").unwrap();
+        let later = commit_all(&fixture.root, "later root repair");
+        assert_ne!(later, merge_sha);
+        run_seal(&fixture.root, TASK, "BT-A0001", &fixture.task_head).unwrap();
+        assert_complete_seal_chain(&fixture);
+        assert_eq!(git_output(&fixture.root, &["rev-parse", "main"]), later);
+        let events = fixture.events();
+        assert!(!events.iter().any(is_record_gate_relaxed));
+        let tree = git_output(&fixture.root, &["rev-parse", &format!("{merge_sha}^{{tree}}")]);
+        assert!(events.iter().any(|event| event.kind == GATE_EXECUTED_SCHEMA.0
+            && payload(event, "phase").and_then(|v| v.as_str()) == Some("recovery")
+            && payload(event, "subjectTreeSha").and_then(|v| v.as_str()) == Some(tree.as_str())
+            && payload(event, "exitCode").and_then(|v| v.as_i64()) == Some(0)));
+        let recorded = events.iter().position(|e| e.kind == "TaskRecorded").unwrap();
+        let end = recorded + 1 + events[recorded + 1..].iter()
+            .take_while(|e| e.kind == "SiteRetired").count();
+        let prior = &events[..recorded];
+        let batch = &events[recorded..end];
+        crate::verify::validate_frozen_contract_supersession_append(
+            &fixture.root, ROUND, prior, batch).unwrap();
+        let gate_position = prior.iter().rposition(|e| e.kind == GATE_EXECUTED_SCHEMA.0
+            && payload(e, "phase").and_then(|v| v.as_str()) == Some("recovery")).unwrap();
+        let mut missing = prior.to_vec(); missing.remove(gate_position);
+        assert!(crate::verify::validate_frozen_contract_supersession_append(
+            &fixture.root, ROUND, &missing, batch).is_err());
+        for (key, value) in [
+            ("exitCode", serde_json::json!(101)),
+            ("subjectTreeSha", serde_json::json!("b".repeat(40))),
+            ("phase", serde_json::json!("collect")),
+            ("logSha256", serde_json::json!("0".repeat(64))),
+            ("logBytes", serde_json::json!(999999)),
+            ("gateRunId", serde_json::json!(ulid::Ulid::new().to_string())),
+        ] {
+            let mut changed = prior.to_vec();
+            changed[gate_position].payload.as_mut().unwrap()[key] = value;
+            assert!(crate::verify::validate_frozen_contract_supersession_append(
+                &fixture.root, ROUND, &changed, batch).is_err(), "invalid {key} admitted");
+        }
+        let mut failed = prior.to_vec();
+        failed.push(post_merge_gate_failed_event(TASK, ROUND, &merge_sha, "testFast", 101));
+        assert!(crate::verify::validate_frozen_contract_supersession_append(
+            &fixture.root, ROUND, &failed, batch).is_err(), "old greens before failure admitted");
+        assert!(crate::verify::validate_schema3_fixed_merge_recovery_gates(
+            &fixture.root, ROUND, TASK, "BT-A0001", &merge_sha, &merge_sha, prior).is_err(),
+            "stale captured main must be rejected");
+        let unrelated = git_output(&fixture.root, &["-c", "user.name=fixture",
+            "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false",
+            "commit-tree", &tree, "-m", "unrelated history"]);
+        assert!(!gitx::is_ancestor(&fixture.root, &unrelated, &later).unwrap());
+        let mut outside = prior.to_vec();
+        let merge_position = outside.iter().position(|e| e.kind == "MergeExecuted").unwrap();
+        outside[merge_position].payload.as_mut().unwrap()["mergeSha"] = serde_json::json!(&unrelated);
+        assert!(crate::verify::validate_schema3_fixed_merge_recovery_gates(
+            &fixture.root, ROUND, TASK, "BT-A0001", &unrelated, &later, &outside).is_err(),
+            "complete greens cannot admit a merge outside current main history");
+        fs::write(fixture.root.join("later-main.txt"), "further root change\n").unwrap();
+        commit_all(&fixture.root, "further main for historical replay");
+        let ledger_path = fixture.root.join(format!("coordination/rounds/{ROUND}/events.jsonl"));
+        let before = fs::read(&ledger_path).unwrap();
+        let replay = run_seal(&fixture.root, TASK, "BT-A0001", &fixture.task_head).unwrap();
+        assert!(replay.replayed_complete);
+        assert_eq!(fs::read(&ledger_path).unwrap(), before, "durable replay must append no events");
+    }
+
+    #[test]
     fn seal_recovers_crash_after_merge_executed_before_record() {
         let fixture = merge_fixture("b204-seal-recover-record", false);
         fixture.arm_dangling_barrier();
@@ -7499,5 +7595,46 @@ requiredEvidence: [merge-boundary]\n\
             report.slot_usage[0].logical_bytes_before,
             report.slot_usage[0].logical_bytes_after
         );
+    }
+}
+
+#[cfg(test)]
+mod record_gate_fixed_source_tests {
+    use super::*;
+    fn git(root: &Path, args: &[&str]) -> String {
+        let o = std::process::Command::new("git").arg("-C").arg(root).args(args).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap().trim().to_string()
+    }
+    fn commit(root: &Path, value: &str) -> String {
+        fs::write(root.join("subject.txt"), value).unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", value]);
+        git(root, &["rev-parse", "HEAD"])
+    }
+    #[test]
+    fn record_gate_snapshot_pins_nested_clone_to_candidate() {
+        let root = crate::util::test_scratch_dir("record-gate-fixed-source");
+        git(&root, &["init", "-b", "main"]);
+        fs::write(root.join(".gitignore"), ".cowork-temp/\n.worktrees/\nscratch/\n").unwrap();
+        let candidate = commit(&root, "candidate");
+        let main = commit(&root, "later-main");
+        let worktree = root.join(".worktrees/B900");
+        crate::gitx::worktree_add_detached(&root, &worktree, &candidate).unwrap();
+        let permit = crate::storage::fixture_gate_permit(&root, &[root.clone()]);
+        let (source_path, mut source) = prepare_record_gate_source(&root, &worktree, &permit).unwrap();
+        let nongit = source_path.join("scratch/nongit");
+        fs::create_dir_all(&nongit).unwrap();
+        assert_eq!(git(&nongit, &["rev-parse", "main"]), candidate,
+            "nongit fixture must inherit fixed recovery source, not current primary main");
+        let nested = root.join(".cowork-temp/nested");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        git(&root, &["clone", "-q", source_path.to_str().unwrap(), nested.to_str().unwrap()]);
+        git(&nested, &["checkout", "-q", "-B", "main", "origin/main"]);
+        assert_eq!(git(&nested, &["rev-parse", "HEAD"]), candidate, "record gate must compile and clone the same source");
+        assert_eq!(fs::read_to_string(nested.join("subject.txt")).unwrap(), "candidate");
+        if let Some(source) = source.as_mut() { source.close().unwrap(); }
+        assert_eq!(git(&root, &["rev-parse", "main"]), main);
+        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), candidate);
     }
 }

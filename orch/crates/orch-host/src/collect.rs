@@ -25,6 +25,296 @@ const GATE_EXECUTED_SCHEMA: (&str, &[&str]) = (
     ],
 );
 
+// Only collect owns this independent repository. Tests that clone source_root
+// and select origin/main must see the same tree that their binary was built from.
+pub(crate) struct CollectSourceSnapshot {
+    root: PathBuf,
+    path: PathBuf,
+    parent_identity: (u64, u64),
+    identity: (u64, u64),
+    git_identity: (u64, u64),
+    pinned_main: String,
+    closed: bool,
+}
+
+fn collect_directory_identity(path: &Path) -> Result<(u64, u64)> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!(
+            "collect snapshot requires a regular directory: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    bail!("collect snapshot directory identity is unavailable on this platform")
+}
+
+fn collect_snapshot_git(root: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["-c", "core.fsmonitor=false"])
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_NAMESPACE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .output()
+        .context("collect snapshot Git command failed to start")?;
+    if !output.status.success() {
+        bail!(
+            "collect snapshot Git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+impl CollectSourceSnapshot {
+    pub(crate) fn new(
+        root: &Path,
+        head: &str,
+        _permit: &crate::storage::StoragePermit,
+    ) -> Result<Self> {
+        if head.len() != 40
+            || !head
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            bail!("collect snapshot requires a fixed full commit SHA");
+        }
+        let root = fs::canonicalize(root)?;
+        if collect_snapshot_git(&root, &["rev-parse", &format!("{head}^{{commit}}")])? != head {
+            bail!("collect snapshot candidate is not an exact commit");
+        }
+        let parent = root.join(".cowork-temp");
+        fs::create_dir_all(&parent)?;
+        let parent_identity = collect_directory_identity(&parent)?;
+        let path = parent.join(crate::util::unique_scratch_name("collect-source"));
+        if fs::symlink_metadata(&path).is_ok() {
+            bail!("collect snapshot refuses to reuse {}", path.display());
+        }
+        // The caller already holds its collect storage permit. Refs, objects and
+        // the default Cargo target belong to this clone, without shared alternates.
+        collect_snapshot_git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                "--no-local",
+                "--no-checkout",
+                "-c",
+                "gc.auto=0",
+                "-c",
+                "maintenance.auto=false",
+                "-c",
+                "core.fsmonitor=false",
+                root.to_str().context("root path is not UTF-8")?,
+                path.to_str().context("snapshot path is not UTF-8")?,
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "partial collect snapshot, if present, retained at {}",
+                path.display()
+            )
+        })?;
+        let identity = collect_directory_identity(&path)?;
+        let git_identity = collect_directory_identity(&path.join(".git"))?;
+        let pinned_main = collect_snapshot_git(&path, &["rev-parse", "refs/heads/main^{commit}"])?;
+        collect_snapshot_git(&path, &["checkout", "--quiet", "--detach", &pinned_main])?;
+        let mut source = Self {
+            root,
+            path,
+            parent_identity,
+            identity,
+            git_identity,
+            pinned_main,
+            closed: false,
+        };
+        source.select(head)?;
+        Ok(source)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn validate_identity(&self) -> Result<()> {
+        if self.closed
+            || self.path.parent() != Some(self.root.join(".cowork-temp").as_path())
+            || collect_directory_identity(self.path.parent().context("snapshot parent missing")?)?
+                != self.parent_identity
+            || collect_directory_identity(&self.path)? != self.identity
+            || collect_directory_identity(&self.path.join(".git"))? != self.git_identity
+        {
+            bail!("collect snapshot identity changed; preserve replacement");
+        }
+        for relative in [".git/objects", ".git/refs", ".git/refs/heads"] {
+            collect_directory_identity(&self.path.join(relative))?;
+        }
+        if fs::symlink_metadata(self.path.join(".git/objects/info/alternates")).is_ok() {
+            bail!("collect snapshot must not borrow external object storage");
+        }
+        for relative in [".git/HEAD", ".git/packed-refs", ".git/refs/heads/main"] {
+            match fs::symlink_metadata(self.path.join(relative)) {
+                Ok(m) if !m.is_file() || m.file_type().is_symlink() => {
+                    bail!("collect snapshot ref file is not regular")
+                }
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
+        let common = PathBuf::from(collect_snapshot_git(
+            &self.path,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?);
+        let root_common = PathBuf::from(collect_snapshot_git(
+            &self.root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?);
+        if fs::canonicalize(&common)? != fs::canonicalize(self.path.join(".git"))?
+            || fs::canonicalize(common)? == fs::canonicalize(root_common)?
+        {
+            bail!("collect snapshot must own independent Git refs");
+        }
+        Ok(())
+    }
+
+    fn select(&mut self, head: &str) -> Result<()> {
+        self.validate_identity()?;
+        if head.len() != 40
+            || !head
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || collect_snapshot_git(&self.path, &["rev-parse", &format!("{head}^{{commit}}")])?
+                != head
+        {
+            bail!("collect snapshot phase requires a fixed full commit SHA");
+        }
+        let root_main = collect_snapshot_git(&self.root, &["rev-parse", "refs/heads/main"])?;
+        let root_head = collect_snapshot_git(&self.root, &["rev-parse", "HEAD"])?;
+        let current = collect_snapshot_git(&self.path, &["rev-parse", "HEAD"])?;
+        if fs::read_to_string(self.path.join(".git/HEAD"))?.trim() != current {
+            bail!("collect snapshot HEAD must stay detached");
+        }
+        if collect_snapshot_git(&self.path, &["rev-parse", "refs/heads/main"])? != self.pinned_main
+            || (current != self.pinned_main && current != head)
+        {
+            bail!("collect snapshot private references drifted");
+        }
+        // The oracle already restores detached HEAD to the candidate. That is
+        // the only permitted HEAD/main mismatch at this phase boundary.
+        collect_snapshot_git(
+            &self.path,
+            &["update-ref", "refs/heads/main", head, &self.pinned_main],
+        )?;
+        self.pinned_main = head.to_string();
+        collect_snapshot_git(&self.path, &["checkout", "--quiet", "--detach", head])?;
+        self.validate_identity()?;
+        if collect_snapshot_git(&self.path, &["rev-parse", "HEAD"])? != head
+            || collect_snapshot_git(&self.path, &["rev-parse", "refs/heads/main"])? != head
+            || collect_snapshot_git(&self.root, &["rev-parse", "refs/heads/main"])? != root_main
+            || collect_snapshot_git(&self.root, &["rev-parse", "HEAD"])? != root_head
+            || !collect_snapshot_git(
+                &self.path,
+                &["status", "--porcelain=v1", "--untracked-files=all"],
+            )?
+            .is_empty()
+        {
+            bail!("collect snapshot phase failed its fixed-ref postcondition");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn close(&mut self) -> Result<()> {
+        self.validate_identity()?;
+        if collect_snapshot_git(&self.path, &["rev-parse", "HEAD"])? != self.pinned_main
+            || collect_snapshot_git(&self.path, &["rev-parse", "refs/heads/main"])?
+                != self.pinned_main
+            || !collect_snapshot_git(
+                &self.path,
+                &["status", "--porcelain=v1", "--untracked-files=all"],
+            )?
+            .is_empty()
+        {
+            bail!(
+                "collect snapshot source or refs changed; retained {}",
+                self.path.display()
+            );
+        }
+        let lsof = ["/usr/sbin/lsof", "/usr/bin/lsof"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())
+            .context("lsof unavailable; collect snapshot retained")?;
+        let output = Command::new(lsof)
+            .args(["-nP", "-t", "+D"])
+            .arg(&self.path)
+            .output()?;
+        if output.status.code() != Some(1) || !output.stdout.is_empty() || !output.stderr.is_empty()
+        {
+            bail!(
+                "collect snapshot has open files or uncertain use; retained {}",
+                self.path.display()
+            );
+        }
+        self.validate_identity()?;
+        crate::util::remove_dir_all_with_enotempty_retry(&self.path)?;
+        self.closed = true;
+        Ok(())
+    }
+}
+
+impl Drop for CollectSourceSnapshot {
+    fn drop(&mut self) {
+        if !self.closed {
+            eprintln!(
+                "collect snapshot retained for incomplete/failed collection at {}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+fn finish_collect_red_phase(
+    source: &mut CollectSourceSnapshot,
+    candidate: &str,
+    replay: Result<()>,
+) -> Result<()> {
+    // Oracle may already have restored detached HEAD even on an error. Preserve
+    // that fact; an error never authorizes another phase or source deletion.
+    replay?;
+    source.select(candidate)
+}
+
+pub(crate) fn reject_collect_source_redirects() -> Result<()> {
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "CARGO_TARGET_DIR",
+    ] {
+        if std::env::var_os(key).is_some_and(|value| !value.is_empty()) {
+            bail!(
+                "collect requires default Git/Cargo source context; ambient {key} is unsupported"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Mechanically checked collect result returned to the durable receipt layer.
 pub struct CollectOutcome {
     /// Human-readable machine-check notes emitted before any gate runs.
@@ -354,8 +644,8 @@ fn final_tree_policy_active(
 ) -> Result<bool> {
     let binding_bytes =
         gitx::show_bytes(root, policy_base_sha, "coordination/PROJECT-BINDING.yaml")?;
-    let binding_yaml: serde_yaml::Value =
-        serde_yaml::from_slice(&binding_bytes).context("final-tree policy-base binding 非 canonical")?;
+    let binding_yaml: serde_yaml::Value = serde_yaml::from_slice(&binding_bytes)
+        .context("final-tree policy-base binding 非 canonical")?;
     let declared = binding_yaml
         .get("runtimePolicies")
         .and_then(|value| value.get("policies"))
@@ -503,8 +793,8 @@ pub(crate) fn resolve_collect_lane_plan(
                     continue;
                 }
                 for seed in &card.meta.seeds {
-                    let (package, test) = integration_selector(&seed.target)
-                        .map_err(anyhow::Error::msg)?;
+                    let (package, test) =
+                        integration_selector(&seed.target).map_err(anyhow::Error::msg)?;
                     commands.push(derived_test_command(
                         &committed,
                         "seedTargets",
@@ -659,7 +949,8 @@ pub(crate) fn resolve_collect_lane_plan(
             }
         };
         let source_reader_digests =
-            legacy::archived_source_reader_digests_v1(root, round, policy_base_sha, candidate_sha).ok();
+            legacy::archived_source_reader_digests_v1(root, round, policy_base_sha, candidate_sha)
+                .ok();
         return Ok(CollectLanePlan {
             commands,
             trial_refs,
@@ -1587,6 +1878,12 @@ fn run_trial_merge_if_needed(
 ///
 /// The caller must already have recorded `ReportObserved`. Every spawned gate receives a fresh
 /// phase-scoped run identity and persists the same-shaped environment-bound observation.
+/// Red and candidate tests use an independent Git snapshot whose private main matches the
+/// fixed phase commit. Ambient Git routing and CARGO_TARGET_DIR overrides are rejected so
+/// historical nested clones and the default target cannot silently select another source.
+/// A red error preserves the snapshot without entering the candidate phase; the existing
+/// oracle may already have restored detached HEAD. Successful collection also requires
+/// explicit clean, identity-stable, quiescent snapshot removal. Unknown cleanup is an error.
 pub fn check_and_gate(
     root: &Path,
     round: &str,
@@ -1596,6 +1893,7 @@ pub fn check_and_gate(
     expected_base: Option<&str>,
     worktree: &Path,
 ) -> Result<CollectOutcome> {
+    reject_collect_source_redirects()?;
     let requested_task_id = c.meta.task_id.clone();
     let ledger_path = root.join(format!("coordination/rounds/{round}/events.jsonl"));
     let ledger_read = orch_core::read_ledger(&ledger_path)
@@ -1687,6 +1985,26 @@ pub fn check_and_gate(
     }
     println!("④ 机检通过: {}", m.notes.join("；"));
 
+    // Keep the caller's immutable worktree for evidence; compile tests only
+    // from a private ref namespace represented by an independent repository.
+    let candidate_source = gitx::rev_parse(root, branch)?;
+    let red_root_main = gitx::rev_parse(root, "main")?;
+    let mut source_snapshot =
+        CollectSourceSnapshot::new(root, &candidate_source, &_storage_permit)?;
+    let source_path = source_snapshot.path.clone();
+    let worktree = source_path.as_path();
+    if !c.meta.seeds.is_empty() {
+        let seed_source = gitx::commits_after(
+            root,
+            &gitx::merge_base(root, &red_root_main, branch)?,
+            branch,
+        )?
+        .into_iter()
+        .next()
+        .context("collect source lacks first seed commit")?;
+        source_snapshot.select(&seed_source)?;
+    }
+
     // ④½ 机检级先红复跑（M2/E12 零模型兜底）：seed commit 处复跑测试门核对红计数
     // 复跑命令经 red_replay_gate 卡驱动解析（B32）
     let replay_gate =
@@ -1700,7 +2018,7 @@ pub fn check_and_gate(
         gate::GatePhase::RedReplay,
         &replay_run_id,
     );
-    if let Err(e) = with_collect_orphan_watch(
+    let replay_result = with_collect_orphan_watch(
         root,
         Some((round, &c.meta.task_id)),
         &log_dir,
@@ -1719,7 +2037,17 @@ pub fn check_and_gate(
                 &replay_tag,
             )
         },
-    ) {
+    );
+    let replay_result = if gitx::rev_parse(root, "main")? != red_root_main {
+        Err(anyhow::anyhow!(
+            "root main changed during fixed seed replay; snapshot retained"
+        ))
+    } else {
+        replay_result
+    };
+    let replay_result =
+        finish_collect_red_phase(&mut source_snapshot, &candidate_source, replay_result);
+    if let Err(e) = replay_result {
         let msg = e.to_string();
         let stage = if msg.contains("报数造假") || msg.contains("claim") {
             "red-replay-claim"
@@ -1889,6 +2217,7 @@ pub fn check_and_gate(
             }
         }
     }
+    source_snapshot.close()?;
     Ok(CollectOutcome {
         mech_notes: m.notes,
         gates,
@@ -2001,6 +2330,265 @@ mod tests {
                 root.join(".cowork-temp"),
             ],
         )
+    }
+
+    fn snapshot_test_history(tag: &str) -> (PathBuf, String, String, String, Vec<u8>) {
+        let (root, _) = init_repo(tag);
+        let hook = fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(3)
+                .unwrap()
+                .join(".githooks/reference-transaction"),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(".githooks")).unwrap();
+        fs::write(root.join(".githooks/reference-transaction"), &hook).unwrap();
+        fs::write(root.join("subject.txt"), "seed\n").unwrap();
+        let seed = commit_all(&root, "immutable seed source");
+        fs::write(root.join("subject.txt"), "candidate\n").unwrap();
+        let candidate = commit_all(&root, "candidate source");
+        let mut newer = hook.clone();
+        newer.extend_from_slice(b"\n# later main version\n");
+        fs::write(root.join(".githooks/reference-transaction"), newer).unwrap();
+        let main = commit_all(&root, "main moved independently");
+        (root, seed, candidate, main, hook)
+    }
+
+    fn assert_snapshot_nested_source(root: &Path, snapshot: &Path, expected: &str, hook: &[u8]) {
+        let nested = root
+            .join(".cowork-temp")
+            .join(crate::util::unique_scratch_name("nested-fixture"));
+        git(
+            root,
+            &[
+                "clone",
+                "-q",
+                "-c",
+                "gc.auto=0",
+                "-c",
+                "maintenance.auto=false",
+                snapshot.to_str().unwrap(),
+                nested.to_str().unwrap(),
+            ],
+        );
+        // This is the unchanged historical fixture contract that exposed the bug.
+        git(&nested, &["checkout", "-q", "-B", "main", "origin/main"]);
+        crate::hooks::ensure_main_guard(&nested)
+            .expect("fixture hook must match the code compiled from its fixed source");
+        assert_eq!(git(&nested, &["rev-parse", "HEAD"]), expected);
+        assert_eq!(
+            fs::read(nested.join(".githooks/reference-transaction")).unwrap(),
+            hook
+        );
+    }
+
+    #[test]
+    fn collect_snapshot_candidate_nested_clone_uses_fixed_source() {
+        let (root, _, candidate, main, hook) = snapshot_test_history("collect-source-candidate");
+        let before_refs = git(&root, &["show-ref", "--heads"]);
+        let permit = fixture_storage_permit(&root);
+        let mut snapshot = CollectSourceSnapshot::new(&root, &candidate, &permit).unwrap();
+        assert_snapshot_nested_source(&root, &snapshot.path, &candidate, &hook);
+        assert!(snapshot.path.join(".git").is_dir());
+        assert_ne!(
+            gitx::canonical_worktree_common_dir(&root).unwrap(),
+            gitx::canonical_worktree_common_dir(&snapshot.path).unwrap()
+        );
+        let path = snapshot.path.clone();
+        snapshot.close().unwrap();
+        drop(snapshot);
+        assert!(!path.exists());
+        assert_eq!(git(&root, &["show-ref", "--heads"]), before_refs);
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), main);
+    }
+
+    #[test]
+    fn collect_snapshot_seed_and_candidate_refs_are_private_and_restored() {
+        let (root, seed, candidate, main, hook) = snapshot_test_history("collect-source-seed");
+        let before_refs = git(&root, &["show-ref", "--heads"]);
+        let permit = fixture_storage_permit(&root);
+        let mut snapshot = CollectSourceSnapshot::new(&root, &candidate, &permit).unwrap();
+        snapshot.select(&seed).unwrap();
+        assert_snapshot_nested_source(&root, &snapshot.path, &seed, &hook);
+        // Preserve the existing oracle's own detached-HEAD restoration before
+        // restoring the private main ref and running the candidate gates.
+        gitx::checkout(&snapshot.path, &candidate).unwrap();
+        snapshot.select(&candidate).unwrap();
+        assert_snapshot_nested_source(&root, &snapshot.path, &candidate, &hook);
+        snapshot.close().unwrap();
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), main);
+        assert_eq!(git(&root, &["show-ref", "--heads"]), before_refs);
+    }
+
+    #[test]
+    fn collect_snapshot_error_keeps_oracle_transition_without_candidate_phase() {
+        let (root, seed, candidate, main, _) = snapshot_test_history("collect-source-error");
+        let permit = fixture_storage_permit(&root);
+        let mut source = CollectSourceSnapshot::new(&root, &candidate, &permit).unwrap();
+        source.select(&seed).unwrap();
+        gitx::checkout(&source.path, &candidate).unwrap();
+        let failure = finish_collect_red_phase(
+            &mut source,
+            &candidate,
+            Err(anyhow::anyhow!("cleanup unknown")),
+        );
+        assert!(failure.unwrap_err().to_string().contains("cleanup unknown"));
+        assert_eq!(git(&source.path, &["rev-parse", "main"]), seed);
+        assert_eq!(git(&source.path, &["rev-parse", "HEAD"]), candidate);
+        let path = source.path.clone();
+        drop(source);
+        assert!(path.exists(), "unknown cleanup must preserve the source");
+        assert_eq!(git(&root, &["rev-parse", "main"]), main);
+    }
+
+    #[test]
+    fn collect_snapshot_ref_and_external_object_drift_are_refused() {
+        let (root, seed, candidate, main, _) = snapshot_test_history("collect-source-drift");
+        let permit = fixture_storage_permit(&root);
+        let mut source = CollectSourceSnapshot::new(&root, &candidate, &permit).unwrap();
+        git(
+            &source.path,
+            &["update-ref", "refs/heads/main", &main, &candidate],
+        );
+        assert!(source.select(&seed).is_err());
+        assert!(source.close().is_err());
+        git(
+            &source.path,
+            &["update-ref", "refs/heads/main", &candidate, &main],
+        );
+        let alternate = source.path.join(".git/objects/info/alternates");
+        fs::create_dir_all(alternate.parent().unwrap()).unwrap();
+        fs::write(
+            &alternate,
+            format!("{}\n", root.join(".git/objects").display()),
+        )
+        .unwrap();
+        assert!(source.select(&seed).is_err());
+        assert!(source.close().is_err());
+        fs::remove_file(alternate).unwrap();
+        source.close().unwrap();
+        assert_eq!(git(&root, &["rev-parse", "main"]), main);
+    }
+
+    #[test]
+    fn collect_snapshot_replacement_is_preserved() {
+        let (root, _, candidate, main, _) = snapshot_test_history("collect-source-replacement");
+        let permit = fixture_storage_permit(&root);
+        let mut source = CollectSourceSnapshot::new(&root, &candidate, &permit).unwrap();
+        let path = source.path.clone();
+        let retained = path.with_extension("original");
+        fs::rename(&path, &retained).unwrap();
+        git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                "--no-local",
+                retained.to_str().unwrap(),
+                path.to_str().unwrap(),
+            ],
+        );
+        git(&path, &["checkout", "-q", "--detach", &candidate]);
+        assert!(source.select(&candidate).is_err());
+        assert!(source.close().is_err());
+        drop(source);
+        assert_eq!(
+            fs::read_to_string(path.join("subject.txt")).unwrap(),
+            "candidate\n"
+        );
+        assert!(retained.join(".git").exists());
+        assert_eq!(git(&root, &["rev-parse", "main"]), main);
+    }
+
+    #[test]
+    fn collect_snapshot_external_common_dir_cannot_move_root_main() {
+        let (root, seed, _, main, _) = snapshot_test_history("collect-source-common");
+        let permit = fixture_storage_permit(&root);
+        let mut source = CollectSourceSnapshot::new(&root, &main, &permit).unwrap();
+        fs::write(
+            source.path.join(".git/commondir"),
+            format!("{}\n", root.join(".git").display()),
+        )
+        .unwrap();
+        assert!(source.select(&seed).is_err());
+        assert_eq!(
+            git(&root, &["rev-parse", "main"]),
+            main,
+            "a refused phase must never change the real root"
+        );
+        assert!(source.close().is_err());
+    }
+
+    struct SnapshotTestChild(std::process::Child);
+    impl Drop for SnapshotTestChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn collect_snapshot_open_process_blocks_cleanup_without_stopping_it() {
+        let (root, _, candidate, _, _) = snapshot_test_history("collect-source-busy");
+        let permit = fixture_storage_permit(&root);
+        let mut source = CollectSourceSnapshot::new(&root, &candidate, &permit).unwrap();
+        let mut child = SnapshotTestChild(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .current_dir(&source.path)
+                .spawn()
+                .unwrap(),
+        );
+        assert!(source.close().is_err());
+        assert!(child.0.try_wait().unwrap().is_none());
+        drop(child);
+        source.close().unwrap();
+    }
+
+    #[test]
+    fn collect_snapshot_redirect_context_child() {
+        let Ok(key) = std::env::var("ORCH_SNAPSHOT_CONTEXT_CHILD") else {
+            return;
+        };
+        let error = reject_collect_source_redirects().unwrap_err().to_string();
+        assert!(error.contains(&key), "{error}");
+    }
+
+    #[test]
+    fn collect_snapshot_outer_redirects_are_rejected_in_isolated_processes() {
+        let keys = [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_NAMESPACE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "CARGO_TARGET_DIR",
+        ];
+        for key in keys {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                "collect::tests::collect_snapshot_redirect_context_child",
+                "--nocapture",
+            ]);
+            for removed in keys {
+                command.env_remove(removed);
+            }
+            let result = command
+                .env("ORCH_SNAPSHOT_CONTEXT_CHILD", key)
+                .env(key, "/unusable/redirect")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{key}: {}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
     }
 
     #[test]

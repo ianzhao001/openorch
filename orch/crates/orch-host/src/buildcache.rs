@@ -711,9 +711,10 @@ fn sweep_targets_for_round_with_policy(
         let mut protected = protected_target_paths_for_sites(&selected.events, protected_site_ids)?;
         let mut eligible = BTreeSet::new();
         for site in &selected.sites {
+            let preview = crate::sites::maintain_one_site(root, &round, &selected.events, site, true);
             if crate::reclaim::ownership_refusal(root, &inventory, &round, site).is_some()
-                || !crate::sites::maintain_one_site(root, &round, &selected.events, site, true)
-                    .eligible
+                || !preview.eligible
+                || !preview.criteria.iter().any(|c| c.name == "last-user-absent" && c.passed == Some(true))
             {
                 protected.insert(site.target.clone());
             } else {

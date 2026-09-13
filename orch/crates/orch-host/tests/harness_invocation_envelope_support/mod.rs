@@ -192,13 +192,28 @@ console.log(JSON.stringify({sessionId: "b294-zcode", response: "ok", usage: {tot
 }
 
 fn dsh_stub(root: &Path) -> PathBuf {
+    for (name, body) in [
+        ("@deepseek-ai/dsh-settings-file", "export const fixture=true;"),
+        ("yaml", "export function parseDocument(text){try{const value=text.trim()?JSON.parse(text):null;return {errors:[],warnings:[],toJS:()=>value};}catch(e){return {errors:[e],warnings:[]};}}"),
+    ] {
+        let dir = root.join("bin/node_modules").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("package.json"), r#"{"type":"module","main":"index.js"}"#).unwrap();
+        fs::write(dir.join("index.js"), body).unwrap();
+    }
     let source = format!(
         r#"#!/usr/bin/env python3
-{}
+import json
+import os
 import subprocess
 import sys
 import time
 
+# Configuration observation is not provider execution or an envelope capture.
+if "--dump-config" in sys.argv:
+    print(json.dumps([{{"id": "settings", "config": {{"path": os.path.join(os.environ["DSH_HOME"], "settings.yaml")}}}}]))
+    sys.exit(0)
+{}
 patch_path = sys.argv[sys.argv.index("--patch") + 1]
 with open(patch_path, "r", encoding="utf-8") as stream:
     patch = json.load(stream)
@@ -216,10 +231,17 @@ records = [
     {{"type": "session", "id": session_id, "cwd": cwd}},
     {{"type": "turn/start", "data": {{"turn": 1}}}},
 ]
-pin = tuple(
-    os.environ.get(key)
-    for key in ("ORCH_HARNESS_PROVIDER", "ORCH_HARNESS_MODEL", "ORCH_HARNESS_EFFORT")
-)
+settings_entry = next((entry for entry in patch if entry.get("id") == "settings"), None)
+if settings_entry is not None:
+    with open(settings_entry["config"]["path"], encoding="utf-8") as stream:
+        selected = json.load(stream)["agent-default-model"]
+    pin = tuple(selected.get(key) for key in ("provider", "model", "reasoningEffort"))
+else:
+    # Legacy/no-envelope scene intentionally has no native settings snapshot.
+    pin = tuple(
+        os.environ.get(key)
+        for key in ("ORCH_HARNESS_PROVIDER", "ORCH_HARNESS_MODEL", "ORCH_HARNESS_EFFORT")
+    )
 if all(pin):
     records.append({{
         "type": "request/header",
@@ -320,6 +342,8 @@ fn base_command(root: &Path, wrapper: &str, capture: &Path) -> Command {
         .env("B294_ZSTD", find_executable("zstd"))
         .env("ORCH_DSH_ZSTD_BIN", find_executable("zstd"))
         .env("DSH_HOME", root.join("dsh-home"))
+        .env_remove("ORCH_DSH_PRESET")
+        .env_remove("ORCH_DSH_PROFILE")
         .env("ORCH_ZCODE_CONFIG", write_zcode_config(root))
         .env("ORCH_ZCODE_ROLLOUT_DIR", root.join("rollout"));
     for key in orch_host::harness::ENVELOPE_KEYS {
@@ -556,4 +580,26 @@ pub fn wake_issued_payload(root: &Path) -> Value {
         .find(|event| event.kind == "WakeIssued")
         .and_then(|event| event.payload.clone())
         .expect("production wake must carry a payload")
+}
+
+#[test]
+fn dsh_snapshot_evidence_survives_provider_exit_for_old_envelope_role() {
+    let root = scratch_root("snapshot-evidence");
+    let envelope = valid_envelope(&root);
+    assert_eq!(envelope["ORCH_HARNESS_ROLE"], "secondary");
+    let observed = spawn_wrapper_env(&root, DSH_WRAPPER, &envelope);
+    assert_eq!(observed["ORCH_HARNESS_ROLE"], "secondary");
+    assert_eq!(stub_execution_count(&root), 1);
+    let runtime_target = Path::new(&observed["ORCH_HARNESS_ORCH_BIN"])
+        .parent().unwrap().parent().unwrap();
+    let snapshots: Vec<_> = fs::read_dir(runtime_target)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with(".orch-dsh-settings-"))
+        .collect();
+    assert_eq!(snapshots.len(), 1, "retain the one invocation settings snapshot after provider exit");
+    let settings: Value = serde_json::from_slice(&fs::read(&snapshots[0]).unwrap()).unwrap();
+    assert_eq!(settings["agent-default-model"]["model"], "fixture-model");
+    assert_eq!(fs::metadata(&snapshots[0]).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(!root.join("dsh-home/settings.yaml").exists(), "do not create user settings");
 }

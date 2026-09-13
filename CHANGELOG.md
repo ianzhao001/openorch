@@ -6,6 +6,16 @@ This file records the public OpenOrch release line. Internal selfhost rounds, ta
 
 ## 中文
 
+### [v0.1.0-alpha.6](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.6) — 2026-09-13
+
+本版继续完善全通道的原生 Consult/执行安全边界，并修复 r88 暴露的通道、回收和固定 source gate 问题。
+
+- DSH envelope 原生 model/settings 快照、Pi/ZCode/DSH 项目历史和 native terminal 事实继续纳入 action 绑定
+- 新增 DSH session uniqueness、native monitor reclaim、等价 generation 回收和固定 source ref gate 保护
+- 增加 Claude auto permission mode 的显式渲染与 native-project-history 保留
+- 强化 quarantine、reclaim、hook、verify/collect gate 的恢复路径，避免 foreign PID、旧 source 或错误回执越过边界
+- 默认6/selfhost30、插件安装边界与无后台自动编排约束保持不变；AGY 仍不是 Consult 目标
+
 ### [v0.1.0-alpha.5](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.5) — 2026-09-12
 
 本版将更多原生通道接入 Consult，并把原生设置与调用项目历史绑定纳入真实验证。
@@ -14,7 +24,6 @@ This file records the public OpenOrch release line. Internal selfhost rounds, ta
 - DSH Consult 支持原生设置快照和完整项目历史定位，Pi/ZCode 支持原生终答与项目历史分离
 - 强化 action discovery、账号环境边界、Pi legacy envelope、凭据漂移与失败/未知终态的保留语义
 - 增加 review quarantine 与 pending-receipt 类型化恢复，避免错误或晚到答卷越过裁决边界
-- 继续保留默认6/selfhost30、插件安装边界与无后台自动编排约束；AGY 仍不是 Consult 目标
 
 ### [v0.1.0-alpha.4](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.4) — 2026-09-10
 
@@ -79,15 +88,24 @@ OpenOrch 现在提供 Codex Desktop 与 DSH Web 共用的插件包。核心版�
 
 ## English
 
+### [v0.1.0-alpha.6](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.6) — 2026-09-13
+
+This release continues the native Consult/execute safety work and fixes the channel, reclaim, and fixed-source gate gaps found in r88.
+
+- Binds DSH envelope settings, Pi/ZCode/DSH project history, and native terminal facts to each action
+- Adds DSH session uniqueness, native monitor reclamation, equivalent-generation reclaim, and fixed source-ref gate protection
+- Adds explicit Claude auto-permission rendering while preserving native project history
+- Hardens quarantine, reclaim, hook, verify, and collect recovery paths against foreign PIDs, stale sources, and invalid receipts
+- Retains default6/selfhost30, plugin installation boundaries, and no background automatic orchestration; AGY remains unsupported for Consult
+
 ### [v0.1.0-alpha.5](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.5) — 2026-09-12
 
-This release expands native Consult coverage and binds native settings and original-project history to actual invocation evidence.
+This release expanded native Consult coverage and bound native settings and original-project history to actual invocation evidence.
 
-- DSH, Pi, and ZCode are now Consult targets with provider/model/effort and native-terminal facts preserved per action
-- DSH Consult uses pinned native settings and full calling-project history; Pi/ZCode retain native final answers and project-history separation
+- DSH, Pi, and ZCode became Consult targets with provider/model/effort and native-terminal facts preserved per action
+- DSH Consult used pinned native settings and full calling-project history; Pi/ZCode retained native final answers and project-history separation
 - Hardened action discovery, account-environment boundaries, the Pi legacy envelope, credential-drift handling, and failed/unknown terminal preservation
 - Added review quarantine and typed pending-receipt recovery so bad or late answers cannot cross verdict boundaries
-- Retained default6/selfhost30, plugin installation boundaries, and the absence of background automatic orchestration; AGY remains unsupported for Consult
 
 ### [v0.1.0-alpha.4](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.4) — 2026-09-10
 

@@ -230,9 +230,26 @@ fn fresh_and_held_production_closures_are_complete() {
             production_prefix(&close),
             "attempt_id: &authorization.attempt_id"
         ),
-        8,
-        "every close gate must inherit the durable root authorization attempt"
+        9,
+        "four close gates and their records plus recovery-source admission must inherit the durable root authorization attempt"
     );
+}
+
+/// Recovery source preparation creates storage before its gate loop, so it needs
+/// its own admission bound to the same durable root task/attempt authorization.
+#[test]
+fn recovery_source_preparation_has_its_own_authorized_storage_admission() {
+    let close = source("close.rs");
+    let recovery = item(&close, "fn run_record_locked(");
+    let guard = position(recovery, "let permit = crate::storage::guard_gate_operation(");
+    let prepare = position(recovery, "prepare_record_gate_source(root, &gate_wt, &permit)?");
+    assert!(guard < prepare, "admission must precede recovery source preparation");
+    let admission = &recovery[guard..prepare];
+    assert!(admission.contains("root, &round,"));
+    assert!(admission.contains("ledger::GateAuditIdentity::Attempt"));
+    assert!(admission.contains("task_id, attempt_id: &authorization.attempt_id"),
+        "source admission must use the durable root task and attempt, not a substitute identity");
+    assert!(admission.contains("root.join(\".cowork-temp\"), log_dir.clone()"));
 }
 
 #[test]

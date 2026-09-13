@@ -1322,23 +1322,26 @@ fn workspace_full_owner_is_live(owner: &WorkspaceFullOwnerV1) -> Result<bool> {
         .is_some_and(|birth| birth == owner.birth_identity))
 }
 
-fn workspace_full_group_converged(pgid: u32, expected_birth: &str) -> Result<bool> {
+fn workspace_full_group_converged_with_recovery(
+    pgid: u32,
+    expected_birth: &str,
+    dead_owner_recovery: bool,
+) -> Result<bool> {
+    let classify = if dead_owner_recovery {
+        workspace_full_recovery_observation_converged
+    } else {
+        workspace_full_observation_converged
+    };
     match crate::wake::observe_exact_gate_group_members(pgid) {
-        Ok(observation) => workspace_full_observation_converged(pgid, expected_birth, observation),
+        Ok(observation) => classify(pgid, expected_birth, observation),
         Err(mut last_error) => {
             // A disappearing leader can leave one transient opaque process-table
-            // sample. Retry only this read-only census; identity mismatches in
-            // the successful-observation path are never retried or softened.
+            // sample. Retry only this read-only census; successful observations use
+            // the selected policy. Errors never establish convergence.
             for _ in 0..9 {
                 std::thread::sleep(Duration::from_millis(5));
                 match crate::wake::observe_exact_gate_group_members(pgid) {
-                    Ok(observation) => {
-                        return workspace_full_observation_converged(
-                            pgid,
-                            expected_birth,
-                            observation,
-                        )
-                    }
+                    Ok(observation) => return classify(pgid, expected_birth, observation),
                     Err(error) => last_error = error,
                 }
             }
@@ -1393,7 +1396,67 @@ fn workspace_full_observation_converged(
     Ok(members.iter().all(|(_, _, zombie)| *zombie))
 }
 
+fn workspace_full_birth_epoch(birth: &str) -> Option<(u8, u64, u64)> {
+    fn number(raw: &str) -> Option<u64> {
+        let n = raw.parse::<u64>().ok()?;
+        (n.to_string() == raw).then_some(n)
+    }
+    let fields = birth.split(':').collect::<Vec<_>>();
+    match fields.as_slice() {
+        ["macos-sec-usec", seconds, micros] => {
+            let (seconds, micros) = (number(seconds)?, number(micros)?);
+            (seconds > 0 && micros < 1_000_000).then_some((1, seconds, micros))
+        }
+        ["linux-ticks", ticks] => {
+            let ticks = number(ticks)?;
+            (ticks > 0).then_some((2, ticks, 0))
+        }
+        _ => None,
+    }
+}
+
+fn workspace_full_distinct_birth_epochs(expected: &str, observed: &str) -> bool {
+    match (workspace_full_birth_epoch(expected), workspace_full_birth_epoch(observed)) {
+        (Some(old), Some(new)) => old.0 == new.0 && old != new,
+        _ => false,
+    }
+}
+
+// Recovery policy is separate from live-holder cleanup.
+fn workspace_full_recovery_observation_converged(
+    pgid: u32,
+    expected_birth: &str,
+    observation: Option<Vec<(u32, String, bool)>>,
+) -> Result<bool> {
+    // The observer proves stable complete membership and immutable epochs.
+    // A sole foreign leader cannot be any member of the originally bound group.
+    // This is absence of our identity, never authority to signal the new one.
+    if let Some(members) = observation.as_ref() {
+        if let [(pid, birth, _)] = members.as_slice() {
+            if pgid != 0
+                && *pid == pgid
+                && !expected_birth.is_empty()
+                && expected_birth != UNKNOWN_BIRTH_IDENTITY
+                && !birth.is_empty()
+                && birth != UNKNOWN_BIRTH_IDENTITY
+                && birth != expected_birth
+                && workspace_full_distinct_birth_epochs(expected_birth, birth)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    workspace_full_observation_converged(pgid, expected_birth, observation)
+}
+
 fn workspace_full_fixture_registry_converged(path: &Path) -> Result<bool> {
+    workspace_full_fixture_registry_converged_with_recovery(path, false)
+}
+
+fn workspace_full_fixture_registry_converged_with_recovery(
+    path: &Path,
+    dead_owner_recovery: bool,
+) -> Result<bool> {
     ensure_regular_or_missing(path, "workspace full permit fixture registry")?;
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -1433,7 +1496,11 @@ fn workspace_full_fixture_registry_converged(path: &Path) -> Result<bool> {
         if pid == 0 || pgid == 0 || birth.is_empty() || birth == UNKNOWN_BIRTH_IDENTITY {
             bail!("workspace full permit fixture registry identity 不完整");
         }
-        if !workspace_full_group_converged(pgid, birth)? {
+        if !workspace_full_group_converged_with_recovery(
+            pgid,
+            birth,
+            dead_owner_recovery && pid == pgid,
+        )? {
             return Ok(false);
         }
     }
@@ -1441,6 +1508,13 @@ fn workspace_full_fixture_registry_converged(path: &Path) -> Result<bool> {
 }
 
 fn workspace_full_child_converged(child: &WorkspaceFullChildStateV1) -> Result<bool> {
+    workspace_full_child_converged_with_recovery(child, false)
+}
+
+fn workspace_full_child_converged_with_recovery(
+    child: &WorkspaceFullChildStateV1,
+    dead_owner_recovery: bool,
+) -> Result<bool> {
     let (group_converged, fixture_registry) = match child {
         WorkspaceFullChildStateV1::Unspawned => {
             bail!("dead workspace full owner lacks child convergence proof")
@@ -1458,7 +1532,11 @@ fn workspace_full_child_converged(child: &WorkspaceFullChildStateV1) -> Result<b
             birth_identity,
             fixture_registry,
         } => (
-            workspace_full_group_converged(*pgid, birth_identity)?,
+            workspace_full_group_converged_with_recovery(
+                *pgid,
+                birth_identity,
+                dead_owner_recovery,
+            )?,
             fixture_registry.as_str(),
         ),
         WorkspaceFullChildStateV1::GoneBeforeBirth {
@@ -1473,7 +1551,11 @@ fn workspace_full_child_converged(child: &WorkspaceFullChildStateV1) -> Result<b
             fixture_registry.as_str(),
         ),
     };
-    Ok(group_converged && workspace_full_fixture_registry_converged(Path::new(fixture_registry))?)
+    Ok(group_converged
+        && workspace_full_fixture_registry_converged_with_recovery(
+            Path::new(fixture_registry),
+            dead_owner_recovery,
+        )?)
 }
 
 fn workspace_full_owner_reclaimable(owner: &WorkspaceFullOwnerV1) -> Result<bool> {
@@ -1482,7 +1564,7 @@ fn workspace_full_owner_reclaimable(owner: &WorkspaceFullOwnerV1) -> Result<bool
     }
     match &owner.child {
         WorkspaceFullChildStateV1::Unspawned => Ok(true),
-        child => workspace_full_child_converged(child),
+        child => workspace_full_child_converged_with_recovery(child, true),
     }
 }
 
@@ -3107,6 +3189,148 @@ pub fn run_gate_with_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dead_owner_recovery_accepts_only_foreign_singleton_leader() {
+        let old = "macos-sec-usec:100:1";
+        let new = "macos-sec-usec:200:2";
+        let group = Some(vec![(42, new.to_string(), false)]);
+        assert!(
+            workspace_full_recovery_observation_converged(42, old, group.clone()).unwrap(),
+            "complete stable foreign singleton proves original group has no remaining member"
+        );
+        assert!(
+            workspace_full_observation_converged(42, old, group).is_err(),
+            "live-holder cleanup must retain strict birth matching"
+        );
+    }
+
+    #[test]
+    fn dead_owner_recovery_rechecks_live_owner_and_registry_without_signals() {
+        let dir = crate::util::test_scratch_dir("r88-dead-owner-foreign-singleton");
+        let registry = dir.join("fixtures");
+        let mut fixture = Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = fixture.id();
+        let _cleanup = ProcessGroupCleanup(pgid);
+        let actual = crate::wake::managed_process_birth_identity(pgid)
+            .unwrap()
+            .unwrap();
+        let old = if actual.starts_with("macos-sec-usec:") { "macos-sec-usec:1:0" } else { "linux-ticks:1" }.to_string();
+        assert_ne!(actual, old);
+        fs::write(&registry, format!("{pgid}\t{pgid}\t{old}\n")).unwrap();
+        let mut owner = WorkspaceFullOwnerV1 {
+            schema_version: 1,
+            repo_identity_sha256: "a".repeat(64),
+            gate_run_id: "test".into(),
+            pid: std::process::id(),
+            birth_identity: crate::wake::managed_process_birth_identity(std::process::id())
+                .unwrap()
+                .unwrap(),
+            action: "test".into(),
+            token: "test".into(),
+            child: WorkspaceFullChildStateV1::Running {
+                pgid,
+                birth_identity: old.clone(),
+                fixture_registry: registry.to_str().unwrap().into(),
+            },
+        };
+        assert!(
+            !workspace_full_owner_reclaimable(&owner).unwrap(),
+            "live owner always retained"
+        );
+        owner.birth_identity = old.clone();
+        let bytes = fs::read(&registry).unwrap();
+        assert!(
+            workspace_full_owner_reclaimable(&owner).unwrap(),
+            "production recovery follows foreign singleton policy"
+        );
+        assert!(
+            workspace_full_child_converged(&owner.child).is_err(),
+            "normal release remains strict"
+        );
+        assert_eq!(
+            fs::read(&registry).unwrap(),
+            bytes,
+            "recovery observation cannot rewrite evidence"
+        );
+        assert!(
+            fixture.try_wait().unwrap().is_none(),
+            "foreign identity receives no signal"
+        );
+        fs::write(&registry, format!("{}\t{pgid}\t{old}\n", pgid + 1)).unwrap();
+        assert!(
+            workspace_full_owner_reclaimable(&owner).is_err(),
+            "nonleader registry anchor cannot prove reuse"
+        );
+        fs::write(&registry, format!("{pgid}\t{pgid}\t{old}")).unwrap();
+        assert!(
+            workspace_full_owner_reclaimable(&owner).is_err(),
+            "torn registry stays held"
+        );
+        fs::write(&registry, format!("{pgid}\t{pgid}\t{actual}\n")).unwrap();
+        assert!(
+            !workspace_full_owner_reclaimable(&owner).unwrap(),
+            "actual live fixture remains held"
+        );
+        owner.child = WorkspaceFullChildStateV1::GoneBeforeBirth {
+            pgid,
+            fixture_registry: registry.to_str().unwrap().into(),
+        };
+        assert!(
+            workspace_full_owner_reclaimable(&owner).is_err(),
+            "unanchored reappearance stays held"
+        );
+        fixture.kill().unwrap();
+        fixture.wait().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dead_owner_recovery_rejects_noncanonical_or_cross_domain_epochs() {
+        let valid = "macos-sec-usec:200:2";
+        for bad in ["forged-stale-birth", "macos-sec-usec:1:1000000",
+            "macos-sec-usec:01:0", "macos-sec-usec:0:0", "macos-sec-usec:1:0:extra",
+            "macos-sec-usec:-1:0", "linux-ticks:0", "linux-ticks:001", "linux-ticks:1"] {
+            assert!(workspace_full_recovery_observation_converged(42, bad,
+                Some(vec![(42, valid.into(), false)])).is_err(), "invalid old epoch {bad}");
+            assert!(workspace_full_recovery_observation_converged(42, valid,
+                Some(vec![(42, bad.into(), false)])).is_err(), "invalid observed epoch {bad}");
+        }
+    }
+
+    #[test]
+    fn dead_owner_recovery_preserves_ambiguous_and_live_groups() {
+        let old = "macos-sec-usec:100:1";
+        let new = "macos-sec-usec:200:2";
+        for members in [
+            vec![],
+            vec![(0, new.into(), false)],
+            vec![(42, String::new(), false)],
+            vec![(42, UNKNOWN_BIRTH_IDENTITY.into(), false)],
+            vec![(42, new.into(), false), (43, old.into(), false)],
+        ] {
+            assert!(workspace_full_recovery_observation_converged(42, old, Some(members)).is_err());
+        }
+        for members in [vec![(42, old.into(), false)], vec![(43, new.into(), false)]] {
+            assert!(
+                !workspace_full_recovery_observation_converged(42, old, Some(members)).unwrap()
+            );
+        }
+        assert!(workspace_full_recovery_observation_converged(42, old, None).unwrap());
+        assert!(workspace_full_recovery_observation_converged(
+            42,
+            old,
+            Some(vec![(42, old.into(), true)])
+        )
+        .unwrap());
+    }
 
     #[test]
     fn workspace_full_epoch_keeps_authenticated_birth_after_leader_exit() {

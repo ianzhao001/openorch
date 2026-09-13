@@ -562,9 +562,18 @@ pub(crate) fn code_owned_wrapper_identity_digest_v1(path: &Path) -> Result<Strin
 
 /// Render one driver-owned command without reading legacy registries, adapters, or presets.
 ///
+/// Claude explicit mode `auto` uses `--permission-mode auto` without
+/// `--dangerously-skip-permissions`; an unset mode preserves that legacy flag.
+/// Other Claude modes and provider overrides remain rejected before execution.
+///
 /// Pi keeps tool execution in the selected worktree while receiving the original
 /// project separately so its native project history can be opened there. CodeBuddy
 /// likewise keeps native session persistence enabled instead of discarding history.
+///
+/// DSH preserves nonempty `DSH_HOME` for every selected action. Its wrapper pins
+/// native model settings in a private per-invocation snapshot with watching disabled.
+/// Only Consult replaces permission settings with readonly policy; other actions
+/// preserve permission values and legacy preset plumbing without proving preset selection.
 pub fn render_invocation_v1(
     prepared: PreparedInvocation,
     context: InvocationContextV1,
@@ -1327,14 +1336,11 @@ fn render_wrapper_environment(
                     path_text(prepared.project_root(), "Pi project root")?,
                 );
             } else if prepared.driver() == HarnessId::Dsh {
-                // Consult alone opts into the native account-directory override;
-                // previous Review/Execute environment behavior stays unchanged.
-                if prepared.requested().action == InvocationAction::Consult {
-                    if let Some(value) = std::env::var_os("DSH_HOME") {
-                        let value = value.to_str().context("DSH_HOME is not UTF-8")?;
-                        if !value.trim().is_empty() {
-                            env.insert("DSH_HOME".to_string(), value.to_string());
-                        }
+                // All selected DSH actions snapshot the same native account settings.
+                if let Some(value) = std::env::var_os("DSH_HOME") {
+                    let value = value.to_str().context("DSH_HOME is not UTF-8")?;
+                    if !value.trim().is_empty() {
+                        env.insert("DSH_HOME".to_string(), value.to_string());
                     }
                 }
                 match prepared.effective().mode.as_deref() {
@@ -1430,7 +1436,9 @@ fn render_direct_arguments(prepared: &PreparedInvocation, context: &InvocationCo
             Ok(args)
         }
         HarnessId::Claude => {
-            if tuple.provider.is_some() || tuple.mode.is_some() {
+            if tuple.provider.is_some()
+                || !matches!(tuple.mode.as_deref(), None | Some("auto"))
+            {
                 bail!("claude provider/mode pin 未建模；不得静默忽略");
             }
             let mut args = Vec::new();
@@ -1446,8 +1454,12 @@ fn render_direct_arguments(prepared: &PreparedInvocation, context: &InvocationCo
                 "--output-format".to_string(),
                 "stream-json".to_string(),
                 "--verbose".to_string(),
-                "--dangerously-skip-permissions".to_string(),
             ]);
+            if tuple.mode.as_deref() == Some("auto") {
+                args.extend(["--permission-mode".to_string(), "auto".to_string()]);
+            } else {
+                args.push("--dangerously-skip-permissions".to_string());
+            }
             Ok(args)
         }
         HarnessId::Cursor => {

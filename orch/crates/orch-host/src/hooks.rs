@@ -560,6 +560,309 @@ mod tests {
         assert_eq!(violation_records(&root).len(), 1);
     }
 
+    // Synthetic projection records: runtime receipt authenticity remains a Rust gate.
+    fn collect_projection_line(event_id: &str, action: char, head: &str) -> String {
+        event_line(
+            event_id,
+            "runtime:orch",
+            "ReportCollectCompleted",
+            Some("B900"),
+            "r900",
+            serde_json::json!({
+                "actionId": action.to_string().repeat(64),
+                "agent": "executor-desktop", "attemptId": "B900-A0001", "attemptNo": 1,
+                "baseSha": "b".repeat(40), "branchSha": head,
+                "controlEpoch": "01TESTCONTROL00000000000000", "evidenceLen": 100,
+                "evidencePath": "/fixture/reports/B900-REPORT.md",
+                "evidenceSha256": action.to_string().repeat(64), "gateReceipt": format!("01TESTGATE{action}0000000000000000"),
+                "gateReceiptDigest": action.to_string().repeat(64),
+                "goPath": "coordination/rounds/r900/dispatch/local/GO-B900-A0001.md",
+                "leaseGeneration": "01TESTGEN000000000000000000", "owner": "01TESTOWNER0000000000000000",
+                "receiptAttestationLen": 100, "receiptAttestationSha256": action.to_string().repeat(64),
+            }),
+        )
+    }
+
+    fn collect_projection_bind(line: &str, collect_id: &str) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+        value["payload"]["collectCompletedEventId"] = collect_id.into();
+        format!("{}\n", serde_json::to_string(&value).unwrap())
+    }
+
+    #[test]
+    fn collect_projection_distinct_actions_can_append_before_root_pass() {
+        for same_head in [false, true] {
+            let root = temp_root("collect-projection-before-pass");
+            init_repo(&root);
+            let before = commit_round_fixture_before_guard(&root, "r900", "");
+            ensure_main_guard(&root).unwrap();
+            let first =
+                collect_projection_line("01TESTCOLLECTA0000000000000", 'a', &"a".repeat(40));
+            let second_head = if same_head {
+                "a".repeat(40)
+            } else {
+                "b".repeat(40)
+            };
+            let second = collect_projection_line("01TESTCOLLECTB0000000000000", 'b', &second_head);
+            write_active_round(&root, "r900", &format!("{first}{second}"));
+            git(&root, &["add", "coordination/rounds/r900/events.jsonl"]);
+            let after = commit_file(&root, "next\n", "preserve distinct successful collects");
+            assert_ne!(before, after);
+            assert_eq!(
+                git_output(
+                    &root,
+                    &["show", "HEAD:coordination/rounds/r900/events.jsonl"]
+                )
+                .stdout,
+                format!("{first}{second}").into_bytes(),
+            );
+            assert!(violation_records(&root).is_empty());
+        }
+    }
+
+    #[test]
+    fn collect_projection_latest_binding_controls_real_authorized_merge() {
+        // Each negative uses the actual two-parent shape authorized by its
+        // PASS, so a generic ordinary-commit barrier cannot hide a stale bind.
+        for scenario in [
+            "latest",
+            "stale-head",
+            "stale-head-latest-event",
+            "stale-event-same-head",
+            "after-pass",
+            "duplicate-action",
+            "duplicate-action-identical",
+        ] {
+            let root = temp_root(&format!("collect-projection-{scenario}"));
+            init_repo(&root);
+            let main_head = commit_file(&root, "base\n", "base");
+            git(&root, &["checkout", "--quiet", "-b", "task/B900"]);
+            let first_head = commit_file(&root, "first\n", "first candidate");
+            git(&root, &["branch", "task/B900-old", &first_head]);
+            let latest_head = commit_file(&root, "latest\n", "latest candidate");
+            git(&root, &["checkout", "--quiet", "main"]);
+            ensure_main_guard(&root).unwrap();
+            let first_id = "01TESTCOLLECTA0000000000000";
+            let latest_id = "01TESTCOLLECTB0000000000000";
+            let first = collect_projection_line(
+                first_id,
+                'a',
+                if scenario == "stale-event-same-head" || scenario == "duplicate-action-identical" {
+                    &latest_head
+                } else {
+                    &first_head
+                },
+            );
+            let second = collect_projection_line(
+                latest_id,
+                if scenario == "duplicate-action" || scenario == "duplicate-action-identical" {
+                    'a'
+                } else {
+                    'b'
+                },
+                &latest_head,
+            );
+            let stale_head = scenario == "stale-head"
+                || scenario == "stale-head-latest-event"
+                || scenario == "after-pass";
+            let stale_event = (stale_head && scenario != "stale-head-latest-event")
+                || scenario == "stale-event-same-head";
+            let reviewed_head = if stale_head {
+                &first_head
+            } else {
+                &latest_head
+            };
+            let reviewed_collect = if stale_event { first_id } else { latest_id };
+            let verdict_id = "01TESTVERDICT00000000000000";
+            let verdict = collect_projection_bind(
+                &root_pass_line(
+                    verdict_id,
+                    "B900",
+                    "B900-A0001",
+                    1,
+                    "r900",
+                    reviewed_head,
+                    &main_head,
+                ),
+                reviewed_collect,
+            );
+            let started = collect_projection_bind(
+                &merge_started_line(
+                    "01TESTSTARTED00000000000000",
+                    verdict_id,
+                    "B900",
+                    "B900-A0001",
+                    1,
+                    "r900",
+                    reviewed_head,
+                    &main_head,
+                ),
+                reviewed_collect,
+            );
+            let ledger = if scenario == "after-pass" {
+                format!("{first}{verdict}{second}{started}")
+            } else {
+                format!("{first}{second}{verdict}{started}")
+            };
+            if scenario == "latest" {
+                write_active_round(&root, "r900", &format!("{first}{second}{verdict}"));
+                let ordinary =
+                    blocked_commit(&root, "ordinary\n", "latest collect does not bypass PASS");
+                let stderr = String::from_utf8_lossy(&ordinary.stderr);
+                assert!(
+                    stderr.contains("B900-A0001") && !stderr.contains("cannot determine"),
+                    "{stderr}"
+                );
+                fs::write(root.join("tracked.txt"), "base\n").unwrap();
+                git(&root, &["add", "tracked.txt"]);
+            }
+            write_active_round(&root, "r900", &ledger);
+            let branch = if stale_head {
+                "task/B900-old"
+            } else {
+                "task/B900"
+            };
+            let merged = Command::new("git")
+                .args([
+                    "merge",
+                    "--no-ff",
+                    "--no-verify",
+                    branch,
+                    "-m",
+                    "exact authorized shape",
+                ])
+                .current_dir(&root)
+                .env_remove("ORCH_MAIN_GUARD_BYPASS")
+                .env("ORCH_MAIN_GUARD_CONTEXT", "authorized-no-ff-merge")
+                .output()
+                .unwrap();
+            assert_eq!(
+                merged.status.success(),
+                scenario == "latest",
+                "{scenario}: {}",
+                String::from_utf8_lossy(&merged.stderr)
+            );
+            if scenario == "latest" {
+                let parents = git(&root, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+                let fields: Vec<_> = parents.split_whitespace().collect();
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[1], main_head);
+                assert_eq!(fields[2], latest_head);
+            } else {
+                assert_eq!(git(&root, &["rev-parse", "HEAD"]), main_head);
+                let stderr = String::from_utf8_lossy(&merged.stderr);
+                let expected = if scenario.starts_with("duplicate-action") {
+                    "repeats completed actionId"
+                } else if scenario == "after-pass" {
+                    "follows root PASS"
+                } else {
+                    "latest collect"
+                };
+                assert!(stderr.contains(expected), "{scenario}: {stderr}");
+                assert!(!violation_records(&root).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn collect_projection_pass_freeze_survives_terminal_without_blocking_successor() {
+        for successor in [false, true] {
+            let root = temp_root("collect-projection-terminal");
+            init_repo(&root);
+            let main_head = commit_round_fixture_before_guard(&root, "r900", "");
+            ensure_main_guard(&root).unwrap();
+            let head = "a".repeat(40);
+            let first_id = "01TESTCOLLECTA0000000000000";
+            let first = collect_projection_line(first_id, 'a', &head);
+            let verdict = collect_projection_bind(
+                &root_pass_line(
+                    "01TESTVERDICT00000000000000",
+                    "B900",
+                    "B900-A0001",
+                    1,
+                    "r900",
+                    &head,
+                    &main_head,
+                ),
+                first_id,
+            );
+            let terminal = event_line(
+                "01TESTBLOCKED00000000000000",
+                "runtime:orch",
+                "AttemptBlocked",
+                Some("B900"),
+                "r900",
+                serde_json::json!({
+                    "agent": "executor-desktop", "attemptId": "B900-A0001", "attemptNo": 1,
+                    "blockedPath": "/fixture/reports/B900-BLOCKED.md", "evidenceLen": 100,
+                }),
+            );
+            let mut next: serde_json::Value = serde_json::from_str(&collect_projection_line(
+                "01TESTCOLLECTB0000000000000",
+                'b',
+                &head,
+            ))
+            .unwrap();
+            if successor {
+                next["payload"]["attemptId"] = "B900-A0002".into();
+                next["payload"]["attemptNo"] = 2.into();
+                next["payload"]["controlEpoch"] = "01TESTCONTROL20000000000000".into();
+                next["payload"]["goPath"] =
+                    "coordination/rounds/r900/dispatch/local/GO-B900-A0002.md".into();
+            }
+            write_active_round(
+                &root,
+                "r900",
+                &format!("{first}{verdict}{terminal}{next}\n"),
+            );
+            git(&root, &["add", "coordination/rounds/r900/events.jsonl"]);
+            let output = git_output(
+                &root,
+                &["commit", "--quiet", "-m", "scope-local collect freeze"],
+            );
+            assert_eq!(
+                output.status.success(),
+                successor,
+                "successor={successor}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if !successor {
+                assert_eq!(git(&root, &["rev-parse", "HEAD"]), main_head);
+            }
+        }
+    }
+
+    #[test]
+    fn collect_projection_malformed_record_cannot_be_treated_as_absent() {
+        for (field, value) in [
+            ("actionId", serde_json::json!(7)),
+            ("branchSha", serde_json::json!("short")),
+            ("attemptNo", serde_json::json!(2)),
+            ("evidenceSha256", serde_json::json!(false)),
+            ("gateReceiptDigest", serde_json::json!("short")),
+        ] {
+            let root = temp_root("collect-projection-malformed");
+            init_repo(&root);
+            let before = commit_round_fixture_before_guard(&root, "r900", "");
+            ensure_main_guard(&root).unwrap();
+            let mut event: serde_json::Value = serde_json::from_str(&collect_projection_line(
+                "01TESTCOLLECTA0000000000000",
+                'a',
+                &"a".repeat(40),
+            ))
+            .unwrap();
+            event["payload"][field] = value;
+            write_active_round(&root, "r900", &format!("{event}\n"));
+            git(&root, &["add", "coordination/rounds/r900/events.jsonl"]);
+            let output = git_output(
+                &root,
+                &["commit", "--quiet", "-m", "malformed collect must block"],
+            );
+            assert!(!output.status.success(), "malformed {field} was accepted");
+            assert_eq!(git(&root, &["rev-parse", "HEAD"]), before);
+        }
+    }
+
     #[test]
     fn pending_root_pass_blocks_real_commit_but_exact_orch_merge_succeeds() {
         let root = temp_root("verdict-barrier");

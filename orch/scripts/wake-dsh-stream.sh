@@ -1,8 +1,8 @@
 #!/bin/sh
 # wake-dsh-stream.sh <message> -- DeepSeek Harness managed native projection.
-# Authenticated Consult additionally uses a private settings snapshot, native
-# final-message validation and exact native-history publication in the calling
-# project. The legacy wake projection/capability-floor notes below describe
+# Complete managed envelopes use private model-settings snapshots. Authenticated
+# Consult additionally validates the native final message and publishes exact
+# native history in the calling project. The legacy wake projection/capability-floor notes below describe
 # the retained non-Consult route; they do not substitute for Consult evidence.
 #
 # Reserved wrapper outcomes. Provider-native non-zero codes are preserved as
@@ -303,27 +303,61 @@ function fileBytes(file) {
  }finally{fs.closeSync(fd);}
 }
 function syncDir(dir) {const fd=fs.openSync(dir,'r');try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
+function privateInventory(root, source) {
+ noLinks(root);
+ const inventory=[];
+ const identity=st=>[st.dev,st.ino,st.mode].map(String);
+ for(const project of fs.readdirSync(root,{withFileTypes:true}).sort((a,b)=>a.name.localeCompare(b.name))) {
+  requireValue(!project.isSymbolicLink(),'private project entry is a symlink');
+  if(!project.isDirectory())continue;
+  const projectPath=path.join(root,project.name);
+  for(const entry of fs.readdirSync(projectPath,{withFileTypes:true}).sort((a,b)=>a.name.localeCompare(b.name))) {
+   if(!entry.name.startsWith('session-'))continue;
+   const dir=path.join(projectPath,entry.name), ds=fs.lstatSync(dir,{bigint:true});
+   requireValue(ds.isDirectory()&&!ds.isSymbolicLink(),'private session entry is not a plain directory');
+   const file=path.join(dir,'session.jsonl.zstd'), st=fs.lstatSync(file,{bigint:true});
+   requireValue(st.isFile()&&!st.isSymbolicLink(),'private canonical log is unresolved or not regular');
+   inventory.push({dir,file,directory:identity(ds),log:[...identity(st),String(st.size),String(st.mtimeNs)]});
+  }
+ }
+ requireValue(inventory.length===1&&inventory[0].file===source,'private session set is not uniquely selected');
+ return JSON.stringify(inventory);
+}
+async function validatePrivateSet(store, info, source) {
+ const before=privateInventory(info.privateRoot,source);
+ const listed=await store.list();
+ requireValue(listed.length===1&&listed[0].id===info.id&&listed[0].cwd===info.cwd,'native private session metadata is not uniquely selected');
+ const after=privateInventory(info.privateRoot,source);
+ requireValue(before===after,'private session identity/stat changed during native observation');
+ return after;
+}
 if(action==='prepare') {
  const yaml=await import(pathToFileURL(createRequire(req.resolve('@deepseek-ai/dsh-settings-file')).resolve('yaml')).href);
  const profile=yaml.parseDocument(utf8(fileBytes(info.profile)),{customTags:[{tag:'tag:yaml.org,2002:js',resolve:value=>({nativeExpression:value})}]});
  requireValue(!profile.errors.length&&!profile.warnings?.length,'native profile cannot be parsed');
  const tree=profile.toJS();requireValue(Array.isArray(tree),'native profile must be a flat composition');
  function entry(id) {const rows=tree.filter(x=>x.id===id);requireValue(rows.length===1&&!rows[0].disabled,'native profile entry unavailable: '+id);return rows[0].config??{};}
- const storage=entry('session-persistence-jsonl'), settingConfig=entry('settings');
- requireValue(!storage.compression||storage.compression==='zstd','native history requires zstd storage');
- let nativeRoot=storage.root;
- if(nativeRoot?.nativeExpression==="dshHomePath('sessions')"||nativeRoot?.nativeExpression==='dshHomePath("sessions")')nativeRoot=path.join(info.home,'sessions');
- requireValue(typeof nativeRoot==='string'&&path.isAbsolute(nativeRoot),'unsupported native session-root expression');
- nativeRoot=path.resolve(nativeRoot);
- requireValue(nativeRoot!==info.cwd&&!nativeRoot.startsWith(info.cwd+path.sep),'native history root cannot be inside consultation workspace');
+ const settingConfig=entry('settings');
+ let nativeRoot=null;
+ if(info.consult!==false) {
+  const storage=entry('session-persistence-jsonl');
+  requireValue(!storage.compression||storage.compression==='zstd','native history requires zstd storage');
+  nativeRoot=storage.root;
+  if(nativeRoot?.nativeExpression==="dshHomePath('sessions')"||nativeRoot?.nativeExpression==='dshHomePath("sessions")')nativeRoot=path.join(info.home,'sessions');
+  requireValue(typeof nativeRoot==='string'&&path.isAbsolute(nativeRoot),'unsupported native session-root expression');
+  nativeRoot=path.resolve(nativeRoot);
+  requireValue(nativeRoot!==info.cwd&&!nativeRoot.startsWith(info.cwd+path.sep),'native history root cannot be inside consultation workspace');
+ }
  requireValue(!settingConfig.dshHome,'custom settings dshHome is not modeled');
  requireValue(settingConfig.path===undefined||typeof settingConfig.path==='string','unsupported native settings-path expression');
  const source=settingConfig.path===undefined?path.join(info.home,'settings.yaml'):path.resolve(info.cwd,settingConfig.path);
- const original=fs.existsSync(source)?fileBytes(source):Buffer.from('{}');
+ const sourceExists=(()=>{try{fs.lstatSync(source);return true;}catch(error){if(error.code==='ENOENT')return false;throw error;}})();
+ const original=sourceExists?fileBytes(source):Buffer.from('{}');
  const doc=yaml.parseDocument(utf8(original));requireValue(!doc.errors.length&&!doc.warnings?.length,'native settings cannot be parsed');
  const settings=doc.toJS()??{};requireValue(typeof settings==='object'&&!Array.isArray(settings),'native settings must be a map');
- settings['agent-default-model']=info.pins;
- settings.permission={defaultPreset:'read-only'};
+ const previous=settings['agent-default-model'];
+ settings['agent-default-model']=info.consult===false&&previous&&typeof previous==='object'&&!Array.isArray(previous)?{...previous,...info.pins}:info.pins;
+ if(info.consult!==false)settings.permission={defaultPreset:'read-only'};
  const fd=fs.openSync(info.settings,fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);
  try{fs.writeFileSync(fd,JSON.stringify(settings)+'\n');fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
  console.log(JSON.stringify({nativeRoot,settingsPath:info.settings,originalSettingsPath:source,originalSettingsSha256:sha(original)}));
@@ -332,9 +366,17 @@ if(action==='prepare') {
  const {SessionStore}=await nativeImport('@deepseek-ai/dsh-session');
  const {JsonlSessionPersistence}=await nativeImport('@deepseek-ai/dsh-session-persistence-jsonl');
  const ctx=new Context();new SessionStore(ctx);const contexts=[ctx];
+ let publishStage='private-read', linked='not-attempted', destination=null;
+ const effectDiagnostic=()=>console.error('publish-stage='+publishStage+' selected='+info.id+' destination='+String(destination)+' linked='+linked+'; retained evidence');
+ async function disposeContexts() {
+  let failure;
+  while(contexts.length){try{await contexts.pop().fiber.dispose();}catch(error){failure??=error;}}
+  if(failure)throw failure;
+ }
  try {
   const privateStore=new JsonlSessionPersistence(ctx,{root:info.privateRoot,compression:'zstd'});
   const source=privateStore.locate({id:info.id,cwd:info.cwd}).path;
+  const privateSet=privateInventory(info.privateRoot,source);
   const bytes=fileBytes(source), loaded=await privateStore.loadStored(info.id);
   requireValue(loaded&&!loaded.tornMarker,'native history is absent or torn');
   requireValue(loaded.meta.id===info.id&&loaded.meta.cwd===info.cwd,'native history identity drift');
@@ -356,25 +398,38 @@ if(action==='prepare') {
   const text=last.content.filter(x=>x.type==='text').map(x=>{requireValue(typeof x.text==='string','invalid native text');return x.text;}).join('');
   requireValue(text.trim().length>0&&Buffer.byteLength(text)<=60*1024,'native final is empty or oversized');
   const raw=await privateStore.readRaw(info.id);requireValue(raw&&fileBytes(source).equals(bytes),'private native evidence changed');
+  publishStage='pre-mutation';
+  requireValue(await validatePrivateSet(privateStore,info,source)===privateSet,'private identity/stat changed during initial native reads');
   noLinks(info.nativeRoot,true);
   const nativeContext=new Context();new SessionStore(nativeContext);contexts.push(nativeContext);
   const nativeStore=new JsonlSessionPersistence(nativeContext,{root:info.nativeRoot,compression:'zstd'});
   requireValue(!(await nativeStore.loadStored(info.id)),'native publication ID collision');
   requireValue(!(await nativeStore.list()).some(x=>x.id===info.id),'native publication ID collision');
   for(const project of fs.readdirSync(info.nativeRoot,{withFileTypes:true}))if(project.isDirectory())requireValue(!fs.existsSync(path.join(info.nativeRoot,project.name,info.id)),'existing native session directory');
-  const destination=nativeStore.locate(loaded.meta).path;
+  destination=nativeStore.locate(loaded.meta).path;
   requireValue(destination.startsWith(info.nativeRoot+path.sep),'native locator escaped root');
   const dir=path.dirname(destination);noLinks(path.dirname(dir),true);fs.mkdirSync(dir,{mode:0o700});syncDir(path.dirname(dir));
   const temporary=path.join(dir,'.orch-publish-'+randomBytes(12).toString('hex'));
+  publishStage='pre-link';
   const fd=fs.openSync(temporary,fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);
-  try{fs.writeFileSync(fd,bytes);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
-  try{fs.linkSync(temporary,destination);syncDir(dir);}finally{fs.unlinkSync(temporary);}
+  const ownedTemp=fs.fstatSync(fd,{bigint:true});
+  try {
+   try{fs.writeFileSync(fd,bytes);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
+   requireValue(await validatePrivateSet(privateStore,info,source)===privateSet,'private set changed before link');
+   linked='unknown';fs.linkSync(temporary,destination);linked='yes';publishStage='post-link';syncDir(dir);
+  } finally {
+   const current=fs.lstatSync(temporary,{bigint:true});
+   requireValue(current.isFile()&&!current.isSymbolicLink()&&current.dev===ownedTemp.dev&&current.ino===ownedTemp.ino,'owned staging identity changed; retained');
+   fs.unlinkSync(temporary);
+  }
   const discovered=(await nativeStore.list()).filter(x=>x.id===info.id&&x.cwd===info.cwd);
   const opened=await nativeStore.loadStored(info.id), reopenedRaw=await nativeStore.readRaw(info.id);
   requireValue(discovered.length===1&&opened&&!opened.tornMarker&&opened.meta.cwd===info.cwd&&reopenedRaw?.content===raw.content,'published native history failed lookup/open');
   requireValue(fileBytes(destination).equals(bytes)&&fileBytes(source).equals(bytes),'published native bytes differ');
+  requireValue(await validatePrivateSet(privateStore,info,source)===privateSet,'private set changed after link');
+  await disposeContexts();
   console.log(JSON.stringify({finalText:text,finalTextSha256:sha(Buffer.from(text)),nativeHistoryPath:destination,nativeHistorySha256:sha(bytes)}));
- }finally{for(const context of contexts.reverse())await context.fiber.dispose();}
+ }catch(error){effectDiagnostic();throw error;}finally{try{await disposeContexts();}catch(error){effectDiagnostic();throw error;}}
 }else{throw Error('unknown native consultation operation');}
 """
 
@@ -513,8 +568,8 @@ patch_entries = [
 preset = os.environ.get("ORCH_DSH_PRESET") or "minimal"
 profile = os.environ.get("ORCH_DSH_PROFILE") or "headless"
 consult_prepared = None
-if consult_mode:
-    if os.environ.get("ORCH_DSH_PRESET"):
+if envelope_mode:
+    if consult_mode and os.environ.get("ORCH_DSH_PRESET"):
         diag("DSH consult does not model the minimal preset; select headless")
         sys.exit(66)
     profile_path = os.path.join(runtime_target, ".orch-dsh-profile-" + launch_nonce + ".yaml")
@@ -533,17 +588,21 @@ if consult_mode:
             "bin": dsh_bin, "home": dsh_home, "cwd": workdir, "profile": profile_path,
             "settings": os.path.join(runtime_target, ".orch-dsh-settings-" + launch_nonce + ".json"),
             "pins": {"provider": pin_provider, "model": pin_model, "reasoningEffort": pin_effort},
+            "consult": consult_mode,
         })
-        patch_entries.extend([
-            {"id": "settings", "config": {"path": consult_prepared["settingsPath"], "watch": False}},
-            {"id": "permission", "config": {"presets": {"read-only": {"sandbox": "read-only", "approval": "ask"}}, "defaultPreset": "read-only"}},
-            {"id": "tool-subagent", "disabled": True},
-            {"id": "tool-subagent-fork", "disabled": True},
-            {"id": "tool-ralph", "disabled": True},
-            {"id": "tool-workflow", "disabled": True},
-        ])
+        patch_entries.append(
+            {"id": "settings", "config": {"path": consult_prepared["settingsPath"], "watch": False}}
+        )
+        if consult_mode:
+            patch_entries.extend([
+                {"id": "permission", "config": {"presets": {"read-only": {"sandbox": "read-only", "approval": "ask"}}, "defaultPreset": "read-only"}},
+                {"id": "tool-subagent", "disabled": True},
+                {"id": "tool-subagent-fork", "disabled": True},
+                {"id": "tool-ralph", "disabled": True},
+                {"id": "tool-workflow", "disabled": True},
+            ])
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
-        diag("consult preparation failed: %s" % exc)
+        diag(("consult" if consult_mode else "envelope") + " preparation failed: %s" % exc)
         sys.exit(74)
 if envelope_mode:
     patch_entries.extend(
@@ -616,6 +675,7 @@ except Exception as exc:
 
 selected_dir = None
 selected_id = None
+seen_candidate_dirs = set()
 seen_records = 0
 record_frames = 0
 projected = 0
@@ -802,7 +862,72 @@ def project_record(record, ordinal):
             emit_projection(frame)
 
 
+def candidate_snapshot():
+    """Observe this invocation's current-slug candidates without choosing a winner."""
+    paths = new_candidates()
+    seen_candidate_dirs.update(paths)
+    valid = []
+    unresolved = []
+    fingerprints = []
+    for directory in paths:
+        identity = None
+        records = []
+        try:
+            directory_stat = os.lstat(directory)
+            log_stat = os.lstat(os.path.join(directory, "session.jsonl.zstd"))
+            plain = stat.S_ISDIR(directory_stat.st_mode) and not stat.S_ISLNK(directory_stat.st_mode)
+            plain = plain and stat.S_ISREG(log_stat.st_mode) and not stat.S_ISLNK(log_stat.st_mode)
+            fingerprint = (directory, directory_stat.st_dev, directory_stat.st_ino,
+                           directory_stat.st_mode, log_stat.st_dev, log_stat.st_ino,
+                           log_stat.st_mode, log_stat.st_size, log_stat.st_mtime_ns)
+            if plain:
+                records = decode_records(directory)
+                identity = valid_identity(directory, records)
+        except OSError as exc:
+            fingerprint = (directory, "unresolved", exc.errno)
+        fingerprints.append((fingerprint, identity))
+        if identity is None:
+            unresolved.append(directory)
+        else:
+            valid.append((directory, identity, records))
+    return {"paths": paths, "valid": valid, "unresolved": unresolved,
+            "fingerprint": fingerprints}
+
+
+def validate_bound_candidates(snapshot):
+    if len(snapshot["valid"]) > 1:
+        raise RuntimeError("multiple valid invocation sessions; refusing recency selection: %s"
+                           % ",".join(item[1] for item in snapshot["valid"]))
+    if selected_dir is not None and not any(
+        directory == selected_dir and identity == selected_id
+        for directory, identity, _ in snapshot["valid"]
+    ):
+        raise RuntimeError("bound session disappeared or its id/cwd became unverifiable")
+
+
+def final_candidate_set_error():
+    """A bounded dirty-set observation, separate from confirmed identity errors."""
+    before = candidate_snapshot()
+    validate_bound_candidates(before)
+    after = candidate_snapshot()
+    validate_bound_candidates(after)
+    if before["fingerprint"] != after["fingerprint"] or before["paths"] != after["paths"]:
+        return "final candidate identity/stat changed during observation"
+    if seen_candidate_dirs != set(after["paths"]):
+        return "an observed candidate disappeared; final set is unresolved"
+    if selected_dir is None:
+        return "final candidates lack a selected identity" if after["paths"] else None
+    if after["paths"] != [selected_dir] or after["unresolved"]:
+        return "final set contains additional or unresolved candidates: %s" % after["paths"]
+    return None
+
+
 def capture_last_complete_pending_write():
+    global final_set_error
+    final_set_error = final_candidate_set_error()
+    if final_set_error is not None:
+        diag("pending write suppressed: " + final_set_error)
+        return False
     if (
         not envelope_mode
         or selected_id is None
@@ -830,26 +955,15 @@ def capture_last_complete_pending_write():
 def scan_selected_session():
     global selected_dir, selected_id, seen_records, record_frames, last_provider_frame
 
+    snapshot = candidate_snapshot()
+    validate_bound_candidates(snapshot)
     if selected_dir is None:
-        valid = []
-        for candidate in new_candidates():
-            records = decode_records(candidate)
-            identity = valid_identity(candidate, records)
-            if identity is not None:
-                valid.append((candidate, identity, records))
-        if len(valid) > 1:
-            raise RuntimeError(
-                "同一 cwd-slug 同时出现多个新会话，拒绝按时间猜身份: %s"
-                % ",".join(item[1] for item in valid)
-            )
-        if len(valid) == 1:
-            selected_dir, selected_id, records = valid[0]
-        else:
+        if not snapshot["valid"]:
             return 0
+        selected_dir, selected_id, records = snapshot["valid"][0]
     else:
-        records = decode_records(selected_dir)
-        if valid_identity(selected_dir, records) != selected_id:
-            raise RuntimeError("已绑定会话的 session id/cwd 身份漂移")
+        records = next(records for directory, identity, records in snapshot["valid"]
+                       if directory == selected_dir and identity == selected_id)
 
     if len(records) < seen_records:
         raise RuntimeError("已绑定会话记录前缀缩短，拒绝重放或换档")
@@ -906,13 +1020,22 @@ if process.poll() is None:
     process.wait()
 provider_rc = process.returncode
 
+final_set_error = None
+if selection_error is None:
+    try:
+        final_set_error = final_candidate_set_error()
+    except RuntimeError as exc:
+        selection_error = str(exc)
+if final_set_error is not None:
+    diag("final candidate set dirty; success/capture withheld: " + final_set_error)
+
 captured_pending_write = False
 if selection_error is None and envelope_mode and selected_id is not None and not pin_verified:
     selection_error = (
         "selected DSH session ended without an exact request/header pin; "
         "request/context alone is insufficient"
     )
-if selection_error is None and (provider_rc != 0 or not terminal_seen):
+if selection_error is None and final_set_error is None and (provider_rc != 0 or not terminal_seen):
     try:
         captured_pending_write = capture_last_complete_pending_write()
     except (OSError, RuntimeError) as exc:
@@ -944,6 +1067,10 @@ if not terminal_seen:
         % (record_frames, projected, code, "yes" if captured_pending_write else "no")
     )
     sys.exit(code)
+
+if final_set_error is not None:
+    diag("terminal=no cause=unresolved-final-set rc=0 exit=74 detail=" + final_set_error)
+    sys.exit(74)
 
 usage = terminal_record.get("usage") if isinstance(terminal_record, dict) else None
 consult_final = {}

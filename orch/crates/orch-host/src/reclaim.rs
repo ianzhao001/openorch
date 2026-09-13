@@ -1170,19 +1170,42 @@ pub(crate) fn ownership_refusal(
     round: &str,
     site: &crate::sites::Site,
 ) -> Option<String> {
+    ownership_refusal_for_members(root, inventory, round, std::slice::from_ref(site))
+}
+
+fn ownership_refusal_for_members(
+    root: &Path,
+    inventory: &MaintenanceInventory,
+    round: &str,
+    members: &[crate::sites::Site],
+) -> Option<String> {
     if let Some(reason) = &inventory.global_hold {
         return Some(reason.clone());
     }
-    let owner = format!("{round}/{}", site.site_id);
+    let site = &members[0];
+    let owners = members.iter().map(|s| format!("{round}/{}", s.site_id)).collect::<BTreeSet<_>>();
     for path in [&site.worktree, &site.target] {
         let absolute = root.join(path);
         if let Some((other, claim)) = inventory.claims.iter().find(|(other, claim)| {
-            other != &owner && (absolute.starts_with(claim) || claim.starts_with(&absolute))
+            !owners.contains(other) && (absolute.starts_with(claim) || claim.starts_with(&absolute))
         }) {
             return Some(format!("overlapping owner {other}: {}", claim.display()));
         }
     }
     None
+}
+
+// Re-read the original claim domain at the effect boundary, including newly added rounds.
+pub(crate) fn maintenance_inventory_unchanged(root: &Path, before: &MaintenanceInventory) -> bool {
+    let after = storage_inventory(root);
+    after.global_hold == before.global_hold
+        && after.claims == before.claims
+        && after.rounds.len() == before.rounds.len()
+        && after.errors.len() == before.errors.len()
+        && after.rounds.iter().zip(&before.rounds).all(|(a, b)| {
+            a.round == b.round && a.path == b.path && a.bytes == b.bytes
+                && a.error == b.error && a.watched == b.watched
+        })
 }
 
 fn bounded_storage_read(path: &Path, maximum: u64) -> Result<Vec<u8>> {
@@ -1289,7 +1312,40 @@ fn inspect_legacy(root: &Path, selected: Option<&str>, dry_run: bool) -> Vec<Mai
             item.disposition = "failed".into();
             items.push(item);
         }
+        let mut visited = BTreeSet::new();
         for site in &round.sites {
+            if !visited.insert(site.site_id.clone()) {
+                continue;
+            }
+            let members = round.sites.iter().filter(|peer| {
+                site.role == crate::sites::SiteRole::Implement
+                    && peer.identity() == site.identity()
+                    && peer.worktree == site.worktree && peer.target == site.target
+            }).cloned().collect::<Vec<_>>();
+            if members.len() > 1 {
+                visited.extend(members.iter().map(|s| s.site_id.clone()));
+                // Claims remain in the original inventory even when all physical paths are gone.
+                let absent = [&site.worktree, &site.target].iter().all(|p| {
+                    matches!(fs::symlink_metadata(root.join(p)), Err(e) if e.kind() == io::ErrorKind::NotFound)
+                });
+                if absent && registered.as_ref().is_some_and(|p| !p.contains(&root.join(&site.worktree))) {
+                    continue;
+                }
+                let refusal = round.error.clone().or_else(|| {
+                    ownership_refusal_for_members(root, &inventory, &round.round, &members)
+                });
+                if let Some(reason) = refusal {
+                    for member in &members {
+                        items.push(MaintenanceItem::held(format!("{}/{}", round.round, member.site_id),
+                            "site", vec![root.join(&member.worktree), root.join(&member.target)], reason.clone()));
+                    }
+                } else {
+                    let unchanged = || maintenance_inventory_unchanged(root, &inventory);
+                    items.extend(crate::sites::maintain_equivalent_implementations(
+                        root, &round.round, &round.events, &members, dry_run, &unchanged));
+                }
+                continue;
+            }
             // Keep every historical claim in the conflict map, but do not re-audit
             // already-absent physical sites on every fresh round opening.
             let absent = [&site.worktree, &site.target].iter().all(|p| {
@@ -1468,8 +1524,11 @@ pub fn maintenance_summary(report: &MaintenanceReport) -> Vec<String> {
             .filter(|i| i.disposition == state)
             .count()
     };
-    let mut lines = vec![format!("storage maintenance: removed={} held={} failed={} logicalDeletedBytes={} measuredRemainingBytes={} unmeasuredBoundaries={}",
-        count("removed"), count("held"), count("failed"), report.removed_logical_bytes, report.measured_logical_bytes, report.unmeasured_boundaries),
+    let eligible_not_reclaimed = if report.dry_run { 0 } else {
+        report.items.iter().filter(|i| i.eligible && i.disposition != "removed").count()
+    };
+    let mut lines = vec![format!("storage maintenance: dryRun={} removed={} held={} failed={} eligibleNotReclaimed={} logicalDeletedBytes={} measuredRemainingBytes={} unmeasuredBoundaries={}",
+        report.dry_run, count("removed"), count("held"), count("failed"), eligible_not_reclaimed, report.removed_logical_bytes, report.measured_logical_bytes, report.unmeasured_boundaries),
         format!("filesystem available before={:?} after={:?}", report.filesystems_before, report.filesystems_after)];
     for item in &report.items {
         if item.disposition == "failed"
@@ -1478,9 +1537,10 @@ pub fn maintenance_summary(report: &MaintenanceReport) -> Vec<String> {
             || item.logical_bytes.is_some_and(|n| n >= 64 * 1024 * 1024)
         {
             lines.push(format!(
-                "{} {} logicalBytes={:?} logicalDeletedBytes={}: {}",
+                "{} {} eligible={} logicalBytes={:?} logicalDeletedBytes={}: {}",
                 item.disposition,
                 item.id,
+                item.eligible,
                 item.logical_bytes,
                 item.removed_logical_bytes,
                 item.reason
@@ -1677,6 +1737,12 @@ fn finish_maintenance_report(
 }
 
 /// Maintain registered caches and released sites across rounds, including after a round has closed.
+/// Same-round equivalent implementation generations share one physical removal only after every
+/// owner passes the existing release, evidence, identity and quiet-use checks. Other overlapping
+/// claims and reappeared complete journals remain held; aliases never claim deletion or write journals.
+/// A proved dedicated Git fsmonitor may be stopped through native IPC during apply only.
+/// A dry-run reports pending stop, never quiet or deletion; uncertain/shared monitors remain held.
+/// Native-stop effects survive later failures; fresh all-owner checks precede stop and removal.
 /// Dry-run is strictly read-only; apply uses fresh ownership under locks and never writes a ledger.
 pub fn maintain_storage(root: &Path, dry_run: bool) -> Result<MaintenanceReport> {
     maintain_storage_for_round(root, None, dry_run)
@@ -1855,6 +1921,112 @@ mod tests {
         let events = vec![lease, terminal, release, closed];
         write_maintenance_events(&root, "rMaint", &events);
         (root, site, events)
+    }
+
+    fn retired_group_fixture() -> (PathBuf, Vec<crate::sites::Site>, Vec<EventRecord>) {
+        let (root, review, _) = maintenance_fixture("equivalent-group-recovery");
+        git_test(&root, &["worktree", "remove", "--force", &review.worktree]);
+        let report = "coordination/rounds/rMaint/reports/M1-REPORT.md";
+        fs::create_dir_all(root.join(report).parent().unwrap()).unwrap();
+        fs::write(root.join(report), b"preserved implementation report").unwrap();
+        git_test(&root, &["add", "-f", report]);
+        git_test(&root, &["commit", "-qm", "fixed report"]);
+        let head = git_test(&root, &["rev-parse", "HEAD"]);
+        git_test(&root, &["worktree", "add", "--detach", ".worktrees/M1", &head]);
+        fs::create_dir_all(root.join(".worktrees/M1/orch/target")).unwrap();
+        fs::write(root.join(".worktrees/M1/orch/target/cache"), b"reclaim once").unwrap();
+        let mut members = Vec::new();
+        let mut events = Vec::new();
+        for generation in 1..=2 {
+            let site = crate::sites::Site { site_id: format!("M1-implement-local-g{generation:02}"),
+                generation, task_id: "M1".into(), attempt_id: format!("M1-A{generation:04}"),
+                role: crate::sites::SiteRole::Implement, agent: "local".into(), reviewed_head: head.clone(),
+                worktree: ".worktrees/M1".into(), target: ".worktrees/M1/orch/target".into(), wake_id: None };
+            events.push(crate::ledger::event("WorkspaceLeased", "runtime:orch", Some("M1"), Some("rMaint"),
+                serde_json::json!({"siteId":site.site_id,"generation":generation,"attemptId":site.attempt_id,
+                "role":"implement","agent":"local","reviewedHead":head,"paths":{"worktree":site.worktree,"target":site.target}})));
+            members.push(site);
+        }
+        events.push(crate::ledger::event("MergeStarted", "runtime:orch", Some("M1"), Some("rMaint"), serde_json::json!({"headSha":head})));
+        let recorded = crate::ledger::event("TaskRecorded", "runtime:orch", Some("M1"), Some("rMaint"), serde_json::json!({"postMergeGates":"all-green"}));
+        let retirements = crate::sites::retire_task_sites(&events, "M1", &recorded.event_id);
+        events.push(recorded);
+        events.extend(retirements);
+        events.push(crate::ledger::event("RoundClosed", "runtime:orch", None, Some("rMaint"), serde_json::json!({"forced":false})));
+        write_maintenance_events(&root, "rMaint", &events);
+        (root, members, events)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_monitor_group_aba_holds_before_any_stop() {
+        struct Stop(PathBuf);impl Drop for Stop {fn drop(&mut self){let _=Command::new("git").args(["fsmonitor--daemon","stop"]).current_dir(&self.0).output();}}
+        let (root,members,events)=retired_group_fixture();let wt=root.join(&members[0].worktree);let _stop=Stop(wt.clone());
+        assert!(Command::new("git").args(["-c","core.fsmonitor=true","fsmonitor--daemon","start"]).current_dir(&wt).output().unwrap().status.success());
+        let p=root.join(format!("coordination/runtime/site-cleanup/rMaint/{}.json",members[0].site_id));fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p,serde_json::to_vec(&serde_json::json!({"version":1,"round":"rMaint","site":members[0],"phase":"complete","quarantine":null,"note":null})).unwrap()).unwrap();
+        let result=crate::sites::maintain_equivalent_implementations(&root,"rMaint",&events,&members,false,&||true);
+        assert!(result.iter().all(|i|!i.eligible));assert!(wt.exists());
+        assert!(Command::new("git").args(["fsmonitor--daemon","status"]).current_dir(&wt).output().unwrap().status.success());
+    }
+
+    #[test]
+    fn equivalent_group_resumes_only_representative_journal_and_counts_failure_honestly() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, members, events) = retired_group_fixture();
+        let representative = &members[1];
+        let parent = root.join("coordination/runtime/site-cleanup/rMaint");
+        fs::create_dir_all(&parent).unwrap();
+        let journal = parent.join(format!("{}.json", representative.site_id));
+        fs::write(&journal, serde_json::to_vec(&serde_json::json!({"version":1,"round":"rMaint",
+            "site":representative,"phase":"worktree-removed","quarantine":null,"note":null})).unwrap()).unwrap();
+        let initial = fs::read(&journal).unwrap();
+        let expected = measure_boundaries(&[root.join(&representative.worktree)]).unwrap();
+        // A real journal persistence failure must not turn into an alias success or deletion claim.
+        // Root can override DAC; that environment still exercises the interrupted-journal replay below.
+        let uid = Command::new("id").arg("-u").output().unwrap();
+        if String::from_utf8_lossy(&uid.stdout).trim() != "0" {
+            let permissions = fs::metadata(&parent).unwrap().permissions();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+            let failed = maintain_storage(&root, false);
+            fs::set_permissions(&parent, permissions).unwrap();
+            let failed = failed.unwrap();
+            assert!(failed.items.iter().any(|i| i.id.ends_with(&representative.site_id) && i.disposition == "failed"));
+            assert_eq!(failed.removed_logical_bytes, 0);
+            assert!(root.join(&representative.worktree).exists());
+            assert_eq!(fs::read(&journal).unwrap(), initial);
+        }
+        let applied = maintain_storage(&root, false).unwrap();
+        assert_eq!(applied.removed_logical_bytes, expected, "{:#?}", applied.items);
+        assert!(!root.join(&representative.worktree).exists());
+        assert!(!parent.join(format!("{}.json", members[0].site_id)).exists());
+        let ledger = fs::read(root.join("coordination/rounds/rMaint/events.jsonl")).unwrap();
+        assert_eq!(ledger, events.iter().map(|e| serde_json::to_string(e).unwrap()+"\n").collect::<String>().as_bytes());
+        assert_eq!(maintain_storage(&root, false).unwrap().removed_logical_bytes, 0);
+    }
+
+    #[test]
+    fn equivalent_group_effect_recheck_refuses_changed_identity_and_new_claim_domain() {
+        use std::cell::Cell;
+        let (root, members, events) = retired_group_fixture();
+        let count = Cell::new(0);
+        let changed = || {
+            count.set(count.get()+1);
+            if count.get() == 3 {
+                let target = root.join(&members[0].target);
+                fs::rename(&target, root.join("preserved-cache")).unwrap();
+                fs::create_dir(&target).unwrap();
+                fs::write(target.join("new-owner"), b"replacement").unwrap();
+            }
+            true
+        };
+        let result = crate::sites::maintain_equivalent_implementations(&root, "rMaint", &events, &members, false, &changed);
+        assert!(result.iter().all(|i| i.disposition != "removed" && i.removed_logical_bytes == 0), "{result:#?}");
+        assert!(root.join(&members[0].worktree).exists());
+        assert!(root.join("preserved-cache/cache").exists());
+        let inventory = storage_inventory(&root);
+        fs::create_dir(root.join("coordination/rounds/rNewOwner")).unwrap();
+        assert!(!maintenance_inventory_unchanged(&root, &inventory));
     }
 
     fn write_maintenance_events(root: &Path, round: &str, events: &[EventRecord]) {

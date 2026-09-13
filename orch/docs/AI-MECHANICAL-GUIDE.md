@@ -145,6 +145,7 @@ serviceUnavailable、authentication、permission、timeout、protocol、unknown�
 spawn 继续 `env_clear`：通用环境只保留固定 PATH 与 HOME/TMPDIR/locale/TERM 等非敏感运行身份；
 `USER` 只传给 Claude driver，它是 macOS Claude Code 读取已登录订阅所需的最小键。API key、OAuth
 token、SSH socket 与其它 ambient env 对所有 driver 一律不透传。
+Claude 的显式 mode=auto 在 consult/review/execute 统一渲染为 `--permission-mode auto`，不同时传 `--dangerously-skip-permissions`；mode 缺省保留旧 skip-permissions 行为。其它 mode/provider pin 仍拒绝，模型/effort、prompt 参数边界、action cwd 与最小 USER 环境规则不变。此参数通路不等于已完成某模型的原生资格或原项目历史验收。
 旧 `run_dispatch*` 与 automatic-successor host 入口也在任何 storage/GO/worktree/provider 效果前核对
 current/open/schema3；schema1/2、closed 或坏账本直接拒绝，不能以 ActionRejected 改写旧账本。
 approved-reattempt 的同一检查位于外层 protocol lease 之前。v3 使用明确的 local/harness API；
@@ -230,10 +231,22 @@ Pi 需要同一会话的 assistant stop 与 agent_settled；ZCode 需要唯一�
 工具输出与原始转录不能补成终答。既有 review/execute 的投影与模式保持，Native 回执能力也不改变；
 同步咨询未产生可信 acceptance receipt 时诚实显示 unknown，不制造回执。原项目目录中的原生历史仍由客户端保存和查询。
 
-DSH 的 `consult` 同样显式绑定调用项目根；受控环境仅为 DSH Consult 保留非空 DSH_HOME 原生数据目录覆盖，模型不从环境取值。仅 CONSULT/CONSULT-A0000 的 Consult 可把受核验的 Cargo runtime target 放在调用目录内；原有 /tmp/TMPDIR、profile、CACHEDIR.TAG、符号链接与可写性检查仍保留。Consult 只使用原生 headless 通路，不把 minimal preset 名称当作只读保障。
+<!-- orch-guide-review:dsh-envelope-settings -->
+DSH 完整 envelope（含 Review、Execute 和既有旧 role）使用原生解析的单次模型 settings 快照，保留非空 DSH_HOME；无 envelope 的 legacy 路径不变。
+私有快照以0600、独占创建和 fsync 保全，固定 provider/model/reasoningEffort，并设 watch:false；原生用户 settings 不由 wrapper 改写。
+只有 Consult 覆盖 permission 为只读并禁用委托工具；Review/Execute 保留 permission 值及缺省状态，不验证未使用的全局历史目标。
+有效缺失/空 settings 按空 map 处理；非法 map、符号链接和未建模的来源表达式拒绝。配置 dump 可重建原生组合文件，不承诺全局零写入。
+快照创建后全局设置的外部变更不覆盖当前选择，也不作为事后失败条件；不得回滚外部写入。私有证据沿正常生命周期保留，不提前删除。
+非 Consult 保留既有 minimal/default preset patch；这不证明 stock headless 实际选择了该 preset，本次不新增插件或拒绝既有 preset 用法。
+
+DSH 的 `consult` 同样显式绑定调用项目根；受控环境为 DSH 各 action 保留非空 DSH_HOME 原生数据目录覆盖，模型不从环境取值。仅 CONSULT/CONSULT-A0000 的 Consult 可把受核验的 Cargo runtime target 放在调用目录内；原有 /tmp/TMPDIR、profile、CACHEDIR.TAG、符号链接与可写性检查仍保留。Consult 只使用原生 headless 通路，不把 minimal preset 名称当作只读保障。
 调用前用所选 DSH 安装自带的 YAML 解析器读取配置，生成0600单次 settings 快照，固定实际 provider/model/effort、read-only 权限及 watch:false；全局设置不改。只识别默认或明确字面量的 settings 路径，以及默认 dshHomePath('sessions') 或绝对字面量的 zstd 会话根；不执行 !!js，未建模的自定义配置明确失败。
 完成后用同一安装的原生 persistence API 检查唯一 completed turn、完整 final、request/header pins、无 tornMarker 与未完成工具，再把原生压缩日志逐字节独立复制到 native locate 给出的项目目录。独占发布不覆盖任何已有会话；原生 list/loadStored/readRaw 必须能找到并打开完整对话。只有成功且验真的咨询发布历史；失败/未知记录留在私有证据目录，不冒充项目原生历史或有效票。
 空答、超长正文、身份/模型漂移、写入/委派工具、残留工具或历史发布失败返回 failed；复用 exit74 并记录具体失败阶段。若发布后复验失败，保留已发生的文件效果与证据，不宣称零效果。已有 review/execute 行为及回执能力不改变，同步 Consult 不补造 acceptance receipt。
+
+DSH 每次扫描都重新枚举本次调用在当前 cwd-slug 新建的候选目录；绑定后也不按时间选取或换绑。第二个有效会话、已绑定身份丢失或漂移仍返回74。其它未完成候选在运行中继续观察；结束时以两次有界观察比较完整候选集合、身份和规范日志的 inode/大小/mtime，曾出现后消失的候选也不能当作不存在。最终集合不确定时禁止 pending-write 捕获和成功；已独立成立的超时72、provider 非零或 eof70/71保持原退出优先级。`dsh.session` 只表示身份回执，不能代替成功终态。
+
+Consult 发布还核对整个单次私有会话根：原始目录检查包围原生 list 读取，所有 session 前缀条目必须可解释且仅有选定 id/cwd 的普通完整会话。额外会话、空/临时目录、不可读、身份不符、符号链接及观察间变化均拒绝；选定目录内不构成会话的其它文件不影响唯一性。分别在目标根首次改动前、暂存文件写入并 fsync 后且链接前、原生重开与字节复验后检查。链接前失败清理仍归本次所有的暂存文件，不产生最终历史日志，但已建目录可能保留；链接后失败保留已链接历史与私有证据，以阶段、选定 id、目标路径及 linked=yes/unknown 说明已发生或不确定的效果，不输出成功答卷。这些有界检查不承诺排除观察之后任意外部写入。
 
 schema 3 的 `consult` 在 PlanSignedOff 前后均可调用，形状为一个或多个重复 `--harness <ALIAS>` 与
 可重复 `--attach`。timeout 只来自显式 CLI 覆盖或 code-owned 默认；所有成员共享一次捕获的 config 与
@@ -266,7 +279,22 @@ RoundOpened
 
 - 一个 task 可以有多个单调递增 attempt；新 attempt 不得冒充旧 attempt 的事实。
 - `ReportObserved` 只证明 immutable REPORT 已被收取，不证明 collect 门已经成功。
+- collect 的 red/candidate 测试在独立 Git source snapshot 中运行，私有 main 与阶段固定提交一致；
+  历史测试嵌套 clone 后读取 origin/main 也只见同一阶段源码。原 seed、任务提交与真实 root refs 不改。
+  保留默认 Cargo target、原门集合、身份与完整日志；外层 Git 路由或 CARGO_TARGET_DIR 重定向会明确拒绝。
+  红门异常时不进入 candidate，保留快照和原错误；既有 oracle 可能已恢复 detached HEAD，不能把此动作当作进程结束证明。
+  正常完成须通过独立身份、干净源码与无打开者检查后显式清理；清理失败不得写成成功收取。
+- Cargo 根裁决门复用同一固定源码快照，门集合、门身份和证据绑定保持；全部门通过后才显式清理，失败现场保留。非 Cargo 裁决执行目录保持原规则。
+- Cargo 合后恢复门同样使用独立源码快照，使嵌套 clone 和无 Git 夹具继承的 main 都固定于所选 gate SHA；默认仍是原 MergeCommit。保留原树、日志与门身份，全部门通过且物理核验通过才清理快照，失败保留。非 Cargo 恢复目录及既有门集合不变。
+- schema3 无 relaxation 的固定 merge 补记，在 main 已前进但仍含 merge 时，live 入场须重核最后失败之后的最新完整有序 recovery 门集、同一合并树、门/运行身份、环境指纹及真实日志字节。原 at-tip 与历史回放规则不变；新增 advanced-main 分支对 active final-tree 策略仍保留，不推断复用门证据。
 - `VerdictIssued(PASS)` 必须绑定当前 attempt、latest collect、固定 HEAD、签核 IR、审查和证据。
+- 同 attempt 在 root PASS 前可留下不同 action 的真实成功收取记录；同 action 重放不追加第二条
+  `ReportCollectCompleted`。main guard 对有效收取投影 latest eventId 与 HEAD，PASS 同时绑定二者；
+  该 attempt 出现 PASS 后不再接受新 collect，既有 MergeStarted 和精确两父节点守卫保持。
+  这只解释账本投影，不赋予多 HEAD 审查或票权：当前 schema3 review 仍拒绝同 attempt 的多收取 HEAD
+  和同 harness 重复请求。已审后必须修改候选时，保全旧 REPORT/审查/提交，在主仓证据区另存副本，
+  退役当前 canonical REPORT 并提交真实同任务 BLOCKED，正常收取落为 AttemptBlocked 后派 successor。
+  新 attempt 重新收取和审查；不得删除旧成功事件、改写原回执或复用旧 HEAD 审查作为新候选授权。
 - 正常收口与其中断重放使用 `seal`；旧 merge/record CLI 已退役，历史库级恢复审计不授权恢复旧入口。
 - `TaskRecorded` 可与该任务现场的 `SiteRetired` 在同一 checked batch 落账；post-merge
   授权只接纳 runtime actor、round/task、唯一 `TaskRecorded` 锚点、既有 `WorkspaceLeased`
@@ -682,7 +710,12 @@ gateRunId/action 内重入。owner 在 child spawn 后还绑定 gate child PGID/
 registry；spawn 前先 durable 标记 `spawning`，所以任何 post-spawn bind/cleanup 失败都不会被
 `unspawned` 误删。full wrapper 只在调用线程的显式 capability scope 内把 child 绑定到 owner；同进程
 candidate/direct runner 没有该 scope，仍保持窄门独立。父进程死亡本身不授权回收，只有 exact child group 和全部 registry group 均已收敛才可
-替换 owner。live child、birth 漂移、torn/malformed registry 都 fail closed，cleanup 失败保留 owner
+替换 owner。唯一窄例外只用于原 owner 身份已结束后的 acquire 恢复：现有完整稳定枚举证明
+组内唯一成员是 leader 且 birth 为同域规范 macos-sec-usec/linux-ticks、与原登记不同，
+才认原身份已无成员；registry 还须 pid==pgid。未知格式继续保留，不凭任意字符串差异放行。
+这不授权向复用 PID 的进程发信号；锁内仍重核 owner CAS 与全部组。活 owner、普通 cleanup、
+多成员 birth 漂移、缺 leader 的活成员、unknown/torn/malformed registry 及 gone-before-birth
+重现都保持原 fail-closed 规则，cleanup 失败保留 owner
 证据；环境变量字符串不构成所有权。acquire/release 的文件锁只覆盖短临界区，Cargo
 子进程运行期间不持 ledger lock；candidate 窄门不取 full permit，可与另一条 candidate 窄门并行。
 每个 gate child spawn 前还会把 SIGINT/SIGHUP/SIGTERM disposition 恢复为默认值，避免后台父进程
@@ -808,6 +841,41 @@ orphan-control；不得把它类比成可自动接管的 collect `Executing`。
 无需新建轮次。run 的原有结果附 maintenance 报告；sweep 输出统一报告，有 failed 项或报告保存失败返回4，held 不是删除成功。
 这些数字是逻辑字节，不冒充 APFS 物理释放；共享主 debug 与未登记旧现场不由本入口接管。
 需要默认 target 的 CLI/CAS 根推导验证继续使用既有受管任务/门现场，不把隔离 target 当作默认路径的证明。
+
+### 同任务已退役实现代次的共同现场
+
+统一维护只把同轮、同任务/Implement/agent 身份且 worktree 与 target 均逐字相同的 canonical
+实现代次视为一个候选组。原始跨轮 claims、WAL、未知/损坏归属仍全部参与检查；跨轮、其它身份或
+前缀重叠继续 HOLD，不从全组挑出几个合格成员绕过仍活跃的 owner。每个 owner 均须通过既有退役、
+非 BLOCKED、固定候选与 REPORT 保全、源码洁净且已合入、registry、嵌套诊断、残留上限和无人使用检查。
+在原有锁内重读归属及各代 journal/目录身份后，仅最高 generation 代表执行一次现有物理回收。
+其它代次只输出 held、eligible=false 的 zero-deletion alias，指向代表结果，不写 alias journal、不重复
+计删除量。任一代完整 journal 所指现场重新出现时整组保留；不放宽 COMPLETE_JOURNAL_ABA_CONTRACT_V1。
+合法未完成的代表 journal 仍按现有身份与物理判据重试；其它代次仍有独立 journal 时保留整组，失败不能被别名掩盖。诊断缓存准入规则不变。
+
+维护摘要明确 dryRun、逐项 eligible 和 eligibleNotReclaimed：后者只计 apply 中合格却未回收的结果，
+dry-run 恒为0；预览合格不等于删除授权。历史 removed 回执与别名都不是本次新增释放；逻辑删除量和
+文件系统可用空间前后值分别报告，维护失败不回滚已经完成的任务/闭轮事实。
+
+### 专属 Git 文件监视器的正常收尾
+
+已退役的注册现场只有原有归属、原生终态、固定候选与 REPORT、洁净源码、registry、残留上限、
+journal/ABA 等全部条件通过后，才可把唯一打开者判定为专属 Git fsmonitor。共享 main、其它进程、
+其它现场、未知身份与不明确的套接字继续 HOLD。所有代次和原始归属在停止前、删除前分别重核。
+
+证明包含 PID/start/UID/argv、实际 Git executable、worktree/private-admin 目录身份、原生 status、
+IPC socket 与完整描述符检查。优先使用直接 IPC owner；长路径产生相对 listener 名时，只允许
+可信 Git run 映像、唯一现场打开者、精确 private-admin、唯一相对 listener、无冲突直接 owner、
+真实私有 endpoint 和精确 status 的组合证明。它不声称内核提供了绝对路径归属；任何缺项都保留。
+
+预览 last-user-absent=null、native-fsmonitor-release=null、eligible=true 只表示可尝试原生停止，
+不是无人使用或已删除。目标 TTL sweep 仍保护这种待停止 target。apply 首先允许自然退出进入普通
+quiet 通路；否则重核身份后只向该 worktree 调用原生 fsmonitor--daemon stop，不发信号、不改配置、
+不启动新 daemon。要求 stop 成功、status=not-watching、IPC 不存在和严格 quiet，再进入原有物理回收。
+
+native-fsmonitor-release 记录尝试/确认的停止事实；后续失败会保留该事实，只有真正进入 reaper 才计
+删除字节。失败不撤销 TaskRecorded/RoundClosed。旧生命周期清理路径不新增停止能力，普通 quiet
+现场行为不变；本机不支持证明的情形继续保留。未知目录和共享缓存不由本能力接管。
 
 ### 统一维护、触发与空间准入
 
