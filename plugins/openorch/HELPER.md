@@ -116,8 +116,13 @@ Checksums detect local changes, not publisher identity or reproducible builds.
 The current core supports consultation for Codex, Claude, OpenCode, Cursor,
 MiMo, CodeBuddy, SmartClaw, DSH, Pi and ZCode, subject to actual configuration
 discovery. AGY is not a consultation target in this core release. DSH Web can
-host this plugin and invoke supported targets. Host integration and target
+host this plugin and DSH can also be a target; host integration and target
 capabilities are separate. Runtime discovery is the final authority.
+
+The source checkout also contains an independent read-only `orch-tui` binary for
+captured invocation observations. It is not part of the default six-command
+prebuilt runtime and never starts, cancels, collects, reconciles or garbage-
+collects an invocation.
 
 ## Errors and recovery
 

@@ -1147,3 +1147,71 @@ WAL 异常        orch ledger recover（先干跑；只修严格前缀）
 `EffectUnknown(5)`。
 退出码只是分类入口，下一动作仍需绑定当前 attempt、事件和证据。
 <!-- orch-guide-section-end:quick-reference -->
+
+
+### 同步咨询捕获限额与 EOF
+
+同步 consultation 通过父侧管道捕获 stdout/stderr，各自最多持久化 **64 MiB**。恰好达到上限仍合法；下一字节分别置 `stdoutOverflow` / `stderrOverflow`。超限后继续有界读取并丢弃，不提前关闭管道，也不接受超限前出现的有效形状 final。每轮每流最多读取/丢弃 1 MiB，64 KiB 缓冲；单次 poll 同时等待两路，最长 50ms，并持续检查进程、进程组与当前 deadline。父侧写入或观测错误保留诊断，能继续时丢弃读取至正常有界生命周期结束。
+
+`stdoutEofObserved` / `stderrEofObserved` 仅来自真实 read=0。主进程退出后仍持续读取同组后代输出；进程组为空不推出 EOF，逃逸写者或转移的描述符仍可持有写端。正常组结束后以剩余 action 时间为上限，最多给 2 秒事件驱动 EOF 宽限；硬 deadline 的受管取消之后，最多 2 秒最终读取/回收。原有未回收主进程和 pgid 所有权证明继续约束取消，不能向已经回收的旧 PID 发信号。
+
+`rawCaptureStable` 必须同时满足两路真实 EOF、无溢出/观测错误、捕获文件保全及本地进程组已结束。任一路溢出或缺 EOF，在咨询接受原生 final 或提取答卷之前明确拒绝为 `incomplete-capture`；它不同于原生未闭合的 `unclosed`，不把同波其他有效成员改成 HOLD。`success()` 仍只表示真实 OS 成功退出，不能表示答卷有效。
+
+此路径不再新增子进程级 RLIMIT_FSIZE，不修改继承的用户限额或原生数据库/账户目录；限额只约束父侧捕获。managed/wake 路径保持原样。返回时父侧前缀冻结；未结束写者在随后写入时可能收到 EPIPE，或按其信号处置收到 SIGPIPE。这是管道拆除的效果，不是提前溢出取消，也不证明原生服务端结束。历史不完整/失败证据继续保留，不能以本地结束赋予未知原生现场 GC 权限。
+
+### Read-only invocation observations
+
+`orch_host::observation::ObservationReader::open(root)` opens an existing project;
+`refresh()` lists consult, standalone and explicitly linked selfhost invocations,
+and `detail(id)` revalidates a selected stable invocation ID before exposing text.
+Neither method requires an active round, valid IR or current harness configuration.
+They do not invoke a provider, recovery, reconcile, collection, control or GC, and
+create no files. Observing an answer does not mean the planner has consumed it.
+
+Consult publishes immutable `start.json` for every explicit slot before fanout;
+publication failure prevents child launches. Captured parameters, project, HEAD,
+action ID and source time belong to that invocation and never follow later config
+edits. Optional entered/spawned markers are bound to the start digest; spawned is
+published only after the actual process spawn. These are **last observed** facts,
+not live PID/heartbeat/timeout assertions. The UI read time is separate from source
+time. A controller exit or local scope end is not an upstream termination receipt.
+`phaseObservationV1` contains bounded, nonfatal publication diagnostics separately
+from capture errors; callback errors or panics never abandon child custody or change
+answer validity. Normal capture and deadline semantics remain authoritative.
+
+The reader checks regular files, no symlink traversal, owner and non-writable-to-
+others modes. Private standalone controls retain the existing stricter authentication;
+control tokens, private sidecar names and raw verifier errors never enter projections.
+Unsupported native status remains unknown. Native status, invocation phase, answer
+validity and exact task/attempt/revision status are independent. Contradictory or
+unclosed terminal evidence cannot become a verified answer or a Recorded task.
+
+Consultation enumeration retains up to 1024 newest IDs and standalone enumeration
+up to 1024 control candidates. At most eight numeric round ledgers include the
+current round. Each ledger uses an 8 MiB tail; records are at most 64 KiB. Aggregate
+metadata processing reserves 32 MiB per refresh, independently from an 8 MiB answer
+verification budget. A result is fully read only up to 1 MiB; larger bodies are
+unverified/too-large, never verified by prefix. Display text is sanitized before a
+64 KiB visible limit; summaries use 240 Unicode characters. Every clipped source is
+reported. Caches bind inode/device/size/time/mode/owner and actual body hashes;
+changed expected hashes are compared again, and missing markers are never cached.
+
+Valid start records provide full rosters. Without a start, completed schema 3 meta
+must match the explicit ordered membership and every member disposition to provide
+a full historical roster. Manifest-only or damaged records preserve known siblings
+with unknown totals. Old missing parameters and times remain unknown. Safe text
+removes executable controls and masks a field if boundary-preserving, control-joined
+or ANSI-normalized detection finds a known credential pattern. This is a conservative
+presentation rule, not a guarantee to recognize every possible credential format.
+
+### Independent invocation terminal UI
+
+Build from the project/worktree root: `cargo build -p orch-ui --bin orch-tui --locked --manifest-path orch/Cargo.toml`. Default CLI builds do not build this independent binary or acquire UI dependencies. Run `orch/target/debug/orch-tui` for the current directory or `orch-tui --root PATH` for another existing project. `--help` exits0 without entering raw mode; malformed arguments exit2, nonTTY/initialization/runtime errors exit1. Both stdin and stdout must be terminals before raw mode.
+
+The foreground view refreshes bounded local facts every 2 seconds using a monotonic deadline. It never launches, cancels, collects, reconciles or GC's an observed invocation and adds no watcher or daemon. A user viewing the TUI does not consume a planner answer. Source times, last successful read and its age remain distinct; failed reads retain the old snapshot with an error and invalidate detail text. Phase means last observed, not current liveness. Native termination, result verification, exact task state and known/unknown fusion total remain separate; unknown total is not a completion percentage. Historical captured parameters are read from invocation facts, not current configuration.
+
+Keys1/2/3 select calls/harness/tasks grouping without deduplication; arrows and PageUp/PageDown move the stable-ID selection, or scroll an open detail. Enter revalidates detail and synchronizes its row/counts; invalid, missing or failed detail cannot keep old verified answer text. Periodic revalidation preserves same-ID detail scroll; disappearing IDs do not reopen another call's detail. Esc closes details; p enters a literal project path (q/r/y remain text), Enter validates first, Esc cancels. Failed switches retain the entire old project; successful switches replace the reader and view context. r refreshes, y copies only a safe evidence locator, q/Ctrl+C exits. Exact task groups include round/task/attempt/head, and unassociated calls are never inferred from summaries.
+
+Every untrusted rendered/copied field uses safe_observation_text before clipping; this detects known credential formats, not every possible secret. Unicode details wrap by grapheme display width; oversized graphemes in a single-column view are visibly clipped. The macOS clipboard is argv-only /usr/bin/pbcopy with nonblocking bounded input and a 2second clipboard deadline; failure/deadline kills and reaps only that owned clipboard child and displays an error. Other platforms report unsupported clipboard.
+
+The terminal guard is armed immediately after raw mode succeeds, before screen/backend setup. Normal, initialization/body/drawing/event errors and Rust unwind independently attempt cursor/screen restoration and disable raw mode. Rust abort, SIGKILL and external terminal destruction cannot be promised destructor recovery. Real owned PTY verification must compare termios and actual cursor/alternate-screen sequences, including both input/output TTY combinations; synthetic Buffer tests alone do not prove terminal recovery.

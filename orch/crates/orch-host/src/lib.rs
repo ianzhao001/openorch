@@ -39,6 +39,8 @@ pub mod close;
 #[cfg(feature = "selfhost")]
 pub mod collect;
 pub mod consult;
+/// Read-only invocation observation surface, independent of task execution controls.
+pub mod observation;
 #[cfg(feature = "selfhost")]
 pub mod cost;
 #[cfg(feature = "selfhost")]

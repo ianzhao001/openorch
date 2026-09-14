@@ -6,7 +6,7 @@ OpenOrch connects installed AI harnesses to Codex Desktop and DSH Web through on
 shared skill and a bundled local runtime. Choose your own clients/models, consult
 one or several members, and let the current host synthesize their original answers.
 
-Plugin release: `v0.1.0-alpha.6` · core executable: `orch 0.1.0`.
+Plugin release: `v0.1.0-alpha.7` · core executable: `orch 0.1.0`.
 
 ## 中文
 
@@ -17,7 +17,7 @@ DSH 插件管理还使用其正常的 Node.js/pnpm 环境，并从官方包源�
 完整 Release 包已包含运行核心，使用者不需要 Rust，也不需要任何私有仓库。
 
 ```sh
-release=v0.1.0-alpha.6
+release=v0.1.0-alpha.7
 bundle=openorch-$release-darwin-arm64
 base=https://github.com/ianzhao001/openorch/releases/download/$release
 curl -fLO "$base/$bundle.tar.gz"
@@ -61,11 +61,12 @@ Codex 安装后打开新任务使用 OpenOrch。DSH Web 新会话选择包含 Sk
 | 类型 | 本版支持 |
 | --- | --- |
 | 插件宿主 | Codex Desktop、DSH Web |
-| Consult 目标 | Codex、Claude、OpenCode、Cursor、MiMo、CodeBuddy、SmartClaw；以本机实际发现结果为准 |
+| Consult 目标 | Codex、Claude、OpenCode、Cursor、MiMo、CodeBuddy、SmartClaw、DSH、Pi、ZCode；以本机实际发现结果为准 |
 | 当前不支持的 Consult 目标 | AGY |
-| 命令面 | 默认6个叶命令；可选 selfhost 30个；既有 `orch-ui` 保留 |
+| 命令面 | 默认6个叶命令；可选 selfhost 30个；只读 `orch-tui` 源码二进制 |
 
-DSH 作为宿主可调用其它受支持通道；宿主集成与目标通道能力分开判断。
+DSH 既是宿主，也可作为 Consult 目标；Pi、ZCode 同样受支持。宿主集成与目标通道能力
+仍需分开判断，并以运行时发现、原生终态和项目历史证据为准。
 本插件不扩展执行/审查动作支持，不新增后台 scheduler、自动接替或自动重试。
 缺少客户端、未登录、unsupported、partial、空答或 tool-only 结果都会保留为实际状态，
 不会以进程退出0或文件出现冒充有效答卷，也不会偷偷替换模型。
@@ -110,6 +111,17 @@ cargo build --release -p orch-cli --no-default-features \
 默认产品面包含 `guide`、`doctor`、`harness list`、`harness lint`、`wake`、`consult`；
 完整参数以安装核心的 help/guide 为准。
 
+源码还提供独立的只读 `orch-tui` 观察面板，预编译默认 runtime 不包含它。构建和运行：
+
+```sh
+cargo build -p orch-ui --bin orch-tui --locked --manifest-path orch/Cargo.toml
+orch/target/debug/orch-tui --root /absolute/project
+```
+
+它每两秒刷新已捕获的 invocation 观察，不启动、取消、收取、reconcile 或 GC 调用，也不消费
+planner 答卷；来源时间、陈旧、原生终态和未知总量会分别显示。所有展示与复制内容经过安全
+裁剪，非 TTY、参数错误或初始化失败不会伪装成成功。
+
 `SOURCE-MANIFEST.json` 只列导出的相对路径与SHA-256。公开树不包含私有历史、roster、
 本机配置或原生转写；`coordination/scripts/wake-multica.sh` 是唯一公开的 coordination 资源。
 产品仍为 alpha，仅验证 Apple Silicon macOS。许可证为 [MIT](LICENSE)。
@@ -118,7 +130,7 @@ cargo build --release -p orch-cli --no-default-features \
 
 ### Install and use
 
-Use the complete [Release](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.6)
+Use the complete [Release](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.7)
 archive on Apple Silicon macOS. Python3.9+, Git and the native Codex/DSH client are
 required. DSH uses its normal Node.js/pnpm environment and fetches the declared
 filesystem-skill dependency. The bundle includes the runtime; Rust and the private
@@ -146,9 +158,16 @@ member count does not prove model diversity. Native client usage costs still app
 
 Current Consult targets are Codex, Claude, OpenCode, Cursor, MiMo, CodeBuddy,
 SmartClaw, DSH, Pi and ZCode, subject to runtime discovery. AGY is an unsupported
-Consult target in this core. DSH Web can host the plugin and invoke supported
-targets. Execution/review capabilities and the default6/selfhost30/UI boundaries
-are unchanged. There is no added daemon, scheduler, automatic takeover or retry.
+Consult target in this core. DSH Web can host the plugin and DSH can also be a
+target. Execution/review capabilities and the default6/selfhost30 boundaries are
+unchanged. There is no added daemon, scheduler, automatic takeover or retry.
+
+The source checkout also provides an independent read-only `orch-tui` binary for
+captured invocation observations; it is not shipped in the default prebuilt runtime.
+Build it with `cargo build -p orch-ui --bin orch-tui --locked --manifest-path orch/Cargo.toml`.
+It refreshes bounded local facts every two seconds, never starts/cancels/collects/reconciles/GCs
+an invocation, and does not consume planner answers. Source time, staleness, terminal facts and
+unknown totals remain distinct; rendered and copied fields are safely clipped.
 
 ### Update, remove and verify
 

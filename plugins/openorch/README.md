@@ -10,7 +10,7 @@ Git projects.
 ## 安装 / Install
 
 下载 [OpenOrch Release](https://github.com/ianzhao001/openorch/releases) 中的完整
-Apple Silicon macOS 插件归档并解压。插件版本为 `0.1.0-alpha.6`，核心版本仍是
+Apple Silicon macOS 插件归档并解压。插件版本为 `0.1.0-alpha.7`，核心版本仍是
 `orch 0.1.0`。源码仓本身不含运行核心，不能代替完整 Release 安装包。
 
 Download and extract the complete Apple Silicon macOS plugin archive. It includes
@@ -70,7 +70,8 @@ Two aliases can still use the same backend; member count alone does not establis
 independent model diversity. Native clients may incur their normal usage costs.
 
 配置细节和完整助手命令见 [HELPER.md](HELPER.md)。更新个人默认配置需要明确选择，
-不会自动覆盖已有项目配置。没有后台常驻编排或自动追加咨询轮次。
+不会自动覆盖已有项目配置。没有后台常驻编排或自动追加咨询轮次。源码还保留独立的只读
+`orch-tui` 观察面板；它不启动、取消、收取或回收任何调用，也不消费 planner 答卷。
 
 ## 支持边界 / Current support
 
@@ -79,10 +80,21 @@ independent model diversity. Native clients may incur their normal usage costs.
 | Plugin hosts | Codex Desktop and DSH Web |
 | Consult targets | Codex, Claude, OpenCode, Cursor, MiMo, CodeBuddy, SmartClaw, DSH, Pi, ZCode, subject to actual discovery/configuration |
 | Unsupported Consult targets | AGY |
-| Core surfaces | Default CLI 6 commands; selfhost CLI 30; existing UI preserved |
+| Core surfaces | Default CLI 6 commands; selfhost CLI 30; read-only `orch-tui` source binary |
 
-DSH 既可作为插件宿主，也可作为 Consult 目标；宿主集成与目标通道能力仍需分别核验。
+DSH 既可作为插件宿主，也可作为 Consult 目标；Pi、ZCode 同样受支持。宿主集成与目标通道
+能力仍需分别核验，并以运行时发现、原生终态和项目历史证据为准。
 执行和审查动作的支持范围没有由本插件扩展。配置模型名称不等于原生证据已验证该身份。
+
+`orch-tui` 仅随源码构建，不随默认六命令预编译 runtime 发布。源码构建命令为：
+
+```sh
+cargo build -p orch-ui --bin orch-tui --locked --manifest-path orch/Cargo.toml
+orch/target/debug/orch-tui --root /absolute/project
+```
+
+它以只读方式每两秒刷新已捕获的 invocation 观察，明确区分来源时间、陈旧、终态与未知，
+并对展示/复制内容做安全裁剪；非 TTY、参数错误或初始化失败均不会伪装成成功。
 
 Missing clients, unsupported members, failed/partial calls and empty or tool-only
 answers remain visible. Do not treat a process exit or partial text as success.

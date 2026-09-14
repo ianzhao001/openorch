@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -20,7 +21,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
-use wait_timeout::ChildExt;
 
 use crate::harness::{DriverAction, DriverContract, HarnessId, HarnessTransport};
 use crate::harness_config::{
@@ -41,16 +41,27 @@ pub(crate) mod smartclaw;
 unsafe extern "C" {
     fn killpg(pgrp: i32, signal: i32) -> i32;
     fn getpgid(pid: i32) -> i32;
-    fn setrlimit(resource: i32, limits: *const ChannelRlimit) -> i32;
+    fn poll(fds: *mut ChannelPollFd, count: ChannelNfds, timeout: i32) -> i32;
+    fn fcntl(fd: i32, command: i32, ...) -> i32;
 }
 
+// Darwin sys/poll.h uses unsigned int nfds_t; Linux uses unsigned long.
+#[cfg(target_os = "macos")]
+type ChannelNfds = u32;
+#[cfg(not(target_os = "macos"))]
+type ChannelNfds = std::os::raw::c_ulong;
 #[repr(C)]
-struct ChannelRlimit {
-    current: u64,
-    maximum: u64,
-}
-
-const CHANNEL_RLIMIT_FSIZE: i32 = 1;
+struct ChannelPollFd { fd: i32, events: i16, revents: i16 }
+// Darwin sys/fcntl.h and Linux libc declarations; preserve existing file flags.
+#[cfg(target_os = "macos")]
+const CHANNEL_NONBLOCK: i32 = 4;
+#[cfg(not(target_os = "macos"))]
+const CHANNEL_NONBLOCK: i32 = 2048;
+// Bound both persisted and discarded work before serving the sibling/status/deadline.
+const CHANNEL_DRAIN_PASS_BYTES: usize = 1024 * 1024;
+const CHANNEL_DRAIN_BUFFER_BYTES: usize = 64 * 1024;
+// Actual EOF grace, never a fixed sleep or proof derived from group emptiness.
+const CHANNEL_EOF_GRACE: Duration = Duration::from_secs(2);
 
 /// Version of the unified schema-3 invocation-channel contract.
 pub const UNIFIED_CHANNEL_CONTRACT_V1: u32 = 1;
@@ -825,20 +836,90 @@ fn channel_process_group_empty(pgid: i32) -> Result<bool> {
     if unsafe { killpg(pgid, 0) } == 0 { return Ok(false); }
     let error = std::io::Error::last_os_error();
     if error.raw_os_error() == Some(3) { return Ok(true); } // ESRCH on supported Unix hosts.
+    // killpg(2): EPERM means members exist but cannot be signaled. Treat that as
+    // not-empty, never as closure or cancellation authority; only ESRCH closes.
+    if error.raw_os_error() == Some(1) { return Ok(false); }
     Err(error).context("cannot establish invocation process-group termination")
 }
 
-fn await_channel_process_group_empty(pgid: i32) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        if channel_process_group_empty(pgid)? {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!("unified driver process group 未在 bounded cleanup 内收敛");
-        }
-        std::thread::sleep(Duration::from_millis(10));
+fn channel_nonblocking(fd: i32) -> std::io::Result<()> {
+    // SAFETY: fd belongs to our ChildStdout/ChildStderr, GETFL takes no third arg.
+    let flags = unsafe { fcntl(fd, 3) };
+    if flags < 0 || unsafe { fcntl(fd, 4, flags | CHANNEL_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(())
+}
+
+#[derive(Default)]
+struct CaptureDrain {
+    observed: u64,
+    persisted: u64,
+    overflow: bool,
+    eof: bool,
+    read_failed: bool,
+    discard: bool,
+}
+
+impl CaptureDrain {
+    fn live(&self) -> bool { !self.eof && !self.read_failed }
+
+    fn drain(&mut self, reader: &mut impl Read, writer: &mut impl Write,
+        label: &str, errors: &mut Vec<String>) -> usize {
+        if !self.live() { return 0; }
+        let mut buffer = [0u8; CHANNEL_DRAIN_BUFFER_BYTES];
+        let mut serviced = 0;
+        // Also bound repeated EINTR without consuming any bytes.
+        for _ in 0..64 {
+            if serviced >= CHANNEL_DRAIN_PASS_BYTES { break; }
+            let wanted = buffer.len().min(CHANNEL_DRAIN_PASS_BYTES - serviced);
+            match reader.read(&mut buffer[..wanted]) {
+                Ok(0) => { self.eof = true; break; }
+                Ok(count) => {
+                    serviced += count; // Discarded bytes consume fairness budget too.
+                    let remaining = MAX_CHANNEL_CAPTURE_BYTES.saturating_sub(self.persisted);
+                    let keep = (count as u64).min(remaining) as usize;
+                    self.observed = self.observed.saturating_add(count as u64).min(MAX_CHANNEL_CAPTURE_BYTES + 1);
+                    if self.observed > MAX_CHANNEL_CAPTURE_BYTES { self.overflow = true; }
+                    if !self.discard && keep > 0 {
+                        match writer.write_all(&buffer[..keep]) {
+                            Ok(()) => self.persisted += keep as u64,
+                            Err(error) => {
+                                self.discard = true;
+                                errors.push(format!("{label} capture write failed; continuing discard: {error}"));
+                            }
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    self.read_failed = true;
+                    errors.push(format!("{label} capture read failed: {error}"));
+                    break;
+                }
+            }
+        }
+        serviced
+    }
+}
+
+fn poll_capture(stdout: i32, stderr: i32, wait: Duration) -> std::io::Result<()> {
+    // Negative descriptors are absent from the active poll set (EOF/error streams).
+    let mut fds = [ChannelPollFd { fd: stdout, events: 1, revents: 0 },
+        ChannelPollFd { fd: stderr, events: 1, revents: 0 }];
+    let millis = wait.as_millis().min(50) as i32;
+    // SAFETY: repr(C) layout matches pollfd; count is the platform's nfds_t.
+    let result = unsafe { poll(fds.as_mut_ptr(), 2 as ChannelNfds, millis) };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted { return Err(error); }
+    }
+    if fds.iter().any(|fd| fd.revents & 0x20 != 0) {
+        return Err(std::io::Error::other("capture poll descriptor invalid"));
+    }
+    // POLLHUP is only readiness: drain must still read tail bytes and actual zero.
+    Ok(())
 }
 
 /// Actual synchronous execution facts. Process-group closure is not proof that
@@ -868,11 +949,21 @@ pub struct ChannelExecution {
     pub process_group_terminated: bool,
     /// Redacted observation errors; none authorizes cancellation by itself.
     pub observation_errors: Vec<String>,
+    /// Nonfatal phase-publication diagnostics, separate from capture and lifecycle validity.
+    pub phase_observation_v1: Vec<String>,
     /// Private raw capture (or recovered prefix), absent if preservation failed.
-    /// It can still grow while the invocation is unclosed.
+    /// Parent-written prefixes freeze at return even when native work is unclosed.
     pub stdout_capture_path: Option<PathBuf>,
     /// Private stderr capture, with the same absence/closure qualification as stdout.
     pub stderr_capture_path: Option<PathBuf>,
+    /// Per-stream overflow: stdout exceeded its independent exact 64 MiB cap.
+    pub stdout_overflow: bool,
+    /// Per-stream overflow: stderr exceeded its independent exact 64 MiB cap.
+    pub stderr_overflow: bool,
+    /// True only after a read from the stdout pipe actually returned zero.
+    pub stdout_eof_observed: bool,
+    /// True only after a read from the stderr pipe actually returned zero.
+    pub stderr_eof_observed: bool,
     pub(crate) native_final: Option<serde_json::Value>,
 }
 
@@ -889,6 +980,17 @@ impl ChannelExecution {
     /// Whether an actual observed exit status is successful; missing status is false.
     pub fn success(&self) -> bool { self.status.is_some_and(|status| status.success()) }
 
+    /// Capture completeness requires both actual pipe EOFs, no per-stream overflow,
+    /// no observation errors, preserved captures, and an ended local process scope.
+    /// This is never evidence that a persistent native backend has terminated.
+    pub fn capture_complete(&self) -> bool {
+        self.stdout_eof_observed && self.stderr_eof_observed
+            && !self.stdout_overflow && !self.stderr_overflow
+            && self.process_group_terminated && self.status.is_some()
+            && self.observation_errors.is_empty() && self.stdout_capture_path.is_some()
+            && self.stderr_capture_path.is_some()
+    }
+
     /// Compact metadata that does not copy the raw streams into a manifest.
     pub fn facts(&self) -> serde_json::Value {
         serde_json::json!({
@@ -901,15 +1003,24 @@ impl ChannelExecution {
             "processGroupTerminated": self.process_group_terminated,
             // Killing/reaping this client is not a provider-owned cancellation receipt.
             "upstreamTermination": "unconfirmed",
-            "rawCaptureStable": self.process_group_terminated && self.status.is_some()
-                && self.observation_errors.is_empty() && self.stdout_capture_path.is_some()
-                && self.stderr_capture_path.is_some(),
+            "rawCaptureStable": self.capture_complete(),
+            "stdoutOverflow": self.stdout_overflow, "stderrOverflow": self.stderr_overflow,
+            "stdoutEofObserved": self.stdout_eof_observed, "stderrEofObserved": self.stderr_eof_observed,
             "observationErrors": self.observation_errors,
+            "phaseObservationV1": {"version":1,"samples":self.phase_observation_v1,"truncated":false},
             "stdoutCapturePath": self.stdout_capture_path,
             "stderrCapturePath": self.stderr_capture_path,
             "nativeFinal": self.native_final.as_ref().map(smartclaw::without_text),
         })
     }
+}
+
+// Keep the real native-observation call coupled to the independently tested
+// capture contract, rather than accepting group-empty as stream closure.
+pub(crate) fn inspect_smartclaw_capture(root: &Path, database: &Path, session: &str,
+    cwd: &Path, prompt_sha: &str, output: &ChannelExecution) -> Result<serde_json::Value> {
+    smartclaw::inspect_native_final(root, database, session, cwd, prompt_sha,
+        &output.stdout, output.capture_complete())
 }
 
 #[derive(Default)]
@@ -942,168 +1053,133 @@ impl FirstFrameObservation {
     }
 }
 
+fn observe_phase(observer: &mut dyn FnMut(&str, Option<u32>) -> Result<()>, phase: &str, pid: Option<u32>, errors: &mut Vec<String>) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(phase, pid)));
+    if !matches!(result, Ok(Ok(()))) && errors.len() < 8 {
+        // No raw observer errors: paths and user data must not leak here.
+        errors.push(format!("{phase} publication unavailable"));
+    }
+}
+
 /// Spawn a preflighted command with a closed environment and capture its output.
 ///
 /// This synchronous primitive is used by consultation and tests. Managed wake
 /// custody consumes the same preflighted argv/env/cwd through its supervisor.
 pub fn run_preflighted_invocation_v1(invocation: PreflightedInvocationV1) -> Result<ChannelExecution> {
+    run_preflighted_observed(invocation, &mut |_, _| Ok(()))
+}
+
+// The observer receives only a past phase and PID, never process custody.
+pub(crate) fn run_preflighted_observed(invocation: PreflightedInvocationV1, observer: &mut dyn FnMut(&str, Option<u32>) -> Result<()>) -> Result<ChannelExecution> {
+    let mut phase_observation_v1 = Vec::new();
+    observe_phase(observer, "entered", None, &mut phase_observation_v1);
     let rendered = invocation.rendered;
-    let (program, args) = rendered
-        .argv
-        .split_first()
-        .context("preflighted invocation 缺 program")?;
-    let (stdout_path, stdout_file) =
-        channel_capture_file(rendered.prepared.project_root(), "stdout")?;
-    let (stderr_path, stderr_file) =
-        match channel_capture_file(rendered.prepared.project_root(), "stderr") {
-            Ok(capture) => capture,
-            Err(error) => {
-                let _ = fs::remove_file(&stdout_path);
-                return Err(error);
-            }
-        };
-    let child_stdout = match stdout_file.try_clone() {
-        Ok(file) => file,
-        Err(error) => {
-            let _ = fs::remove_file(&stdout_path);
-            let _ = fs::remove_file(&stderr_path);
-            return Err(error).context("clone unified stdout capture failed");
-        }
-    };
-    let child_stderr = match stderr_file.try_clone() {
-        Ok(file) => file,
-        Err(error) => {
-            let _ = fs::remove_file(&stdout_path);
-            let _ = fs::remove_file(&stderr_path);
-            return Err(error).context("clone unified stderr capture failed");
-        }
+    let (program, args) = rendered.argv.split_first().context("preflighted invocation 缺 program")?;
+    let (stdout_path, mut stdout_file) = channel_capture_file(rendered.prepared.project_root(), "stdout")?;
+    let (stderr_path, mut stderr_file) = match channel_capture_file(rendered.prepared.project_root(), "stderr") {
+        Ok(capture) => capture,
+        Err(error) => { let _ = fs::remove_file(&stdout_path); return Err(error); }
     };
     let mut command = Command::new(program);
-    command
-        .args(args)
-        .current_dir(rendered.prepared.cwd())
-        .env_clear()
-        .envs(&rendered.env)
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(child_stdout))
-        .stderr(Stdio::from(child_stderr));
-    // SAFETY: the closure calls only async-signal-safe `setrlimit` with a
-    // stack-owned POD value before exec; it performs no allocation or locking.
-    unsafe {
-        command.pre_exec(|| {
-            let limits = ChannelRlimit {
-                current: MAX_CHANNEL_CAPTURE_BYTES,
-                maximum: MAX_CHANNEL_CAPTURE_BYTES,
-            };
-            if setrlimit(CHANNEL_RLIMIT_FSIZE, &limits) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    command.args(args).current_dir(rendered.prepared.cwd()).env_clear().envs(&rendered.env)
+        .process_group(0).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // No child-wide file limit: only parent-owned capture writes are bounded.
+    // Existing inherited user limits and native database locations are untouched.
     let started = Instant::now();
-    let child = command.spawn().with_context(|| {
-        format!(
-            "spawn unified harness driver 失败: alias={} driver={}",
-            rendered.prepared.alias(),
-            rendered.prepared.driver().as_str()
-        )
-    });
-    let mut child = match child {
+    let mut child = match command.spawn().with_context(|| format!("spawn unified harness driver 失败: alias={} driver={}",
+        rendered.prepared.alias(), rendered.prepared.driver().as_str())) {
         Ok(child) => child,
         Err(error) => {
-            let _ = fs::remove_file(&stdout_path);
-            let _ = fs::remove_file(&stderr_path);
+            let _ = fs::remove_file(&stdout_path); let _ = fs::remove_file(&stderr_path);
             return Err(error);
         }
     };
-    let deadline = Duration::from_secs(rendered.context.deadline_secs);
-    let pgid = child.id() as i32;
-    let mut status = None;
-    let mut leader_exited = None;
-    let mut frame = FirstFrameObservation::default();
+    drop(command);
+    observe_phase(observer, "spawned", Some(child.id()), &mut phase_observation_v1);
+    // Stdio::piped guarantees both handles. Do not return early after spawn on
+    // setup/observation errors: retain custody and the same bounded deadline.
+    let mut stdout_pipe = child.stdout.take().expect("requested stdout pipe");
+    let mut stderr_pipe = child.stderr.take().expect("requested stderr pipe");
+    let mut out = CaptureDrain::default(); let mut err = CaptureDrain::default();
     let mut errors = Vec::new();
-    let mut group_terminated = false;
-    let mut reason = ChannelExitReason::Exited;
-    loop {
-        if let Err(error) = frame.observe(&stdout_file, started) {
-            errors.push(format!("stdout observation failed: {error:#}"));
-            reason = ChannelExitReason::ObservationFailed;
-            break; // observation failure alone never signals a process.
-        }
-        if status.is_some() {
-            match channel_process_group_empty(pgid) {
-                Ok(true) => { group_terminated = true; break; }
-                Ok(false) => {}
-                Err(error) => {
-                    errors.push(format!("{error:#}"));
-                    reason = ChannelExitReason::ObservationFailed;
-                    break;
-                }
-            }
-        }
-        let remaining = deadline.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            // Drain an already-finished child before choosing a deadline winner.
-            // A delayed observation is not proof that the runtime killed it.
-            if status.is_none() {
-                match child.try_wait() {
-                    Ok(Some(actual)) => {
-                        status = Some(actual);
-                        leader_exited = Some(started.elapsed().as_millis() as u64);
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        errors.push(format!("deadline status observation failed: {error}"));
-                        reason = ChannelExitReason::ObservationFailed;
-                        break;
-                    }
-                }
-            }
-            reason = ChannelExitReason::HardDeadline;
-            // A live, unreaped leader keeps its PID ownership. Once reaped, do
-            // not signal a potentially reused group solely by its old number.
-            if status.is_none() && unsafe { getpgid(child.id() as i32) } == pgid {
-                // SAFETY: unreaped owned child is still the group leader.
-                if unsafe { killpg(pgid, 9) } == 0 {
-                    // The unreaped child remains owned even if it changes group
-                    // between getpgid and killpg. Keep final reap bounded too.
-                    if let Err(error) = child.kill() {
-                        errors.push(format!("direct owned-child cancellation: {error}"));
-                    }
-                    match child.wait_timeout(Duration::from_secs(2)) {
-                        Ok(Some(actual)) => { status = Some(actual); leader_exited = Some(started.elapsed().as_millis() as u64); }
-                        Ok(None) => errors.push("owned child remains unclosed after deadline cleanup; HOLD".into()),
-                        Err(error) => errors.push(format!("reap after hard deadline failed: {error}")),
-                    }
-                    match await_channel_process_group_empty(pgid) {
-                        Ok(()) => group_terminated = true,
-                        Err(error) => errors.push(format!("{error:#}")),
-                    }
-                } else {
-                    errors.push(format!("owned deadline cancellation failed: {}", std::io::Error::last_os_error()));
-                }
-            } else {
-                errors.push("hard deadline reached without current leader ownership proof; HOLD".into());
-            }
-            break;
-        }
-        if status.is_none() {
-            match child.wait_timeout(remaining.min(Duration::from_millis(50))) {
-                Ok(Some(actual)) => { status = Some(actual); leader_exited = Some(started.elapsed().as_millis() as u64); }
-                Ok(None) => {}
-                Err(error) => {
-                    errors.push(format!("child observation failed: {error}"));
-                    reason = ChannelExitReason::ObservationFailed;
-                    break;
-                }
-            }
-        } else {
-            std::thread::sleep(remaining.min(Duration::from_millis(50)));
+    for (fd, label, state) in [(stdout_pipe.as_raw_fd(), "stdout", &mut out),
+        (stderr_pipe.as_raw_fd(), "stderr", &mut err)] {
+        if let Err(error) = channel_nonblocking(fd) {
+            state.read_failed = true; // Never risk a blocking read after failed setup.
+            errors.push(format!("{label} nonblocking setup failed: {error}"));
         }
     }
+    let action_end = started + Duration::from_secs(rendered.context.deadline_secs);
+    let pgid = child.id() as i32;
+    let mut status = None; let mut leader_exited = None;
+    let mut frame = FirstFrameObservation::default(); let mut frame_failed = false;
+    let mut group_terminated = false; let mut reason = ChannelExitReason::Exited;
+    let mut cleanup_end = None; let mut eof_end = None;
+    let mut status_error = false; let mut group_error = false; let mut poll_failed = false;
+    loop {
+        // Service both pipes throughout normal work, group wait and deadline cleanup.
+        out.drain(&mut stdout_pipe, &mut stdout_file, "stdout", &mut errors);
+        err.drain(&mut stderr_pipe, &mut stderr_file, "stderr", &mut errors);
+        if !frame_failed {
+            if let Err(error) = frame.observe(&stdout_file, started) {
+                errors.push(format!("stdout observation failed: {error:#}")); frame_failed = true;
+            }
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(actual)) => { status = Some(actual); leader_exited = Some(started.elapsed().as_millis() as u64); }
+                Ok(None) => {}
+                Err(error) if !status_error => { errors.push(format!("child observation failed: {error}")); status_error = true; }
+                Err(_) => {}
+            }
+        }
+        if status.is_some() && !group_terminated {
+            match channel_process_group_empty(pgid) {
+                Ok(true) => group_terminated = true,
+                Ok(false) => {}
+                Err(error) if !group_error => { errors.push(format!("{error:#}")); group_error = true; }
+                Err(_) => {}
+            }
+        }
+        let now = Instant::now();
+        let until;
+        if group_terminated && status.is_some() {
+            if out.eof && err.eof { break; }
+            // Empty group is not EOF: an escaped writer can still own a pipe.
+            let limit = *eof_end.get_or_insert_with(|| (now + CHANNEL_EOF_GRACE).min(cleanup_end.unwrap_or(action_end)));
+            if now >= limit { break; }
+            until = limit;
+        } else if let Some(limit) = cleanup_end {
+            if now >= limit { errors.push("owned process scope remains unclosed after bounded deadline cleanup; HOLD".into()); break; }
+            until = limit;
+        } else if now >= action_end {
+            reason = ChannelExitReason::HardDeadline;
+            // Same ownership proof as before: never signal a reaped/reused leader.
+            if status.is_none() && unsafe { getpgid(child.id() as i32) } == pgid {
+                if unsafe { killpg(pgid, 9) } == 0 {
+                    if let Err(error) = child.kill() { errors.push(format!("direct owned-child cancellation: {error}")); }
+                    cleanup_end = Some(Instant::now() + CHANNEL_EOF_GRACE);
+                    continue; // Reap and final-drain in this very same loop.
+                }
+                errors.push(format!("owned deadline cancellation failed: {}", std::io::Error::last_os_error()));
+            } else { errors.push("hard deadline reached without current leader ownership proof; HOLD".into()); }
+            break;
+        } else { until = action_end; }
+        let wait = until.saturating_duration_since(Instant::now()).min(Duration::from_millis(50));
+        if poll_failed {
+            std::thread::sleep(wait); // Bounded fallback, with both nonblocking drains above.
+        } else if let Err(error) = poll_capture(if out.live() {stdout_pipe.as_raw_fd()} else {-1},
+            if err.live() {stderr_pipe.as_raw_fd()} else {-1}, wait) {
+            errors.push(format!("capture poll failed: {error}")); poll_failed = true;
+        }
+    }
+    if out.overflow { errors.push("stdout capture overflow beyond 64 MiB".into()); }
+    if err.overflow { errors.push("stderr capture overflow beyond 64 MiB".into()); }
+    if !out.eof { errors.push("stdout capture EOF unproven".into()); }
+    if !err.eof { errors.push("stderr capture EOF unproven".into()); }
+    // Teardown freezes diagnostic prefixes. A surviving writer may see EPIPE or
+    // SIGPIPE; this is not early overflow cancellation or proof of upstream end.
+    drop(stdout_pipe); drop(stderr_pipe);
     let stdout = read_channel_capture(&stdout_file).unwrap_or_else(|error| {
         errors.push(format!("stdout final capture failed: {error:#}")); Vec::new()
     });
@@ -1111,36 +1187,30 @@ pub fn run_preflighted_invocation_v1(invocation: PreflightedInvocationV1) -> Res
         errors.push(format!("stderr final capture failed: {error:#}")); Vec::new()
     });
     let stdout_capture_path = retain_channel_capture(rendered.prepared.project_root(), stdout_path,
-        &stdout_file, &stdout, "stdout-recovered").map_err(|error| {
-            errors.push(format!("stdout preservation failed: {error:#}"));
-        }).ok();
+        &stdout_file, &stdout, "stdout-recovered").map_err(|error| {errors.push(format!("stdout preservation failed: {error:#}"));}).ok();
     let stderr_capture_path = retain_channel_capture(rendered.prepared.project_root(), stderr_path,
-        &stderr_file, &stderr, "stderr-recovered").map_err(|error| {
-            errors.push(format!("stderr preservation failed: {error:#}"));
-        }).ok();
+        &stderr_file, &stderr, "stderr-recovered").map_err(|error| {errors.push(format!("stderr preservation failed: {error:#}"));}).ok();
     if !errors.is_empty() && reason == ChannelExitReason::Exited { reason = ChannelExitReason::ObservationFailed; }
-    let native_final = if rendered.prepared.driver() == HarnessId::SmartClaw {
+    let mut output = ChannelExecution {
+        process_id: child.id(), status, stdout, stderr, reason, hard_deadline_secs: rendered.context.deadline_secs,
+        first_frame_after_millis: frame.at_millis, leader_exited_after_millis: leader_exited,
+        elapsed_millis: started.elapsed().as_millis() as u64, process_group_terminated: group_terminated,
+        phase_observation_v1,
+        observation_errors: errors.into_iter().map(|error| crate::redact::redact_full(&error)).collect(),
+        stdout_capture_path, stderr_capture_path, stdout_overflow: out.overflow, stderr_overflow: err.overflow,
+        stdout_eof_observed: out.eof, stderr_eof_observed: err.eof, native_final: None,
+    };
+    if rendered.prepared.driver() == HarnessId::SmartClaw {
         let session = format!("orch-wake-{}", rendered.context.wake_id);
         let prompt_sha = hex::encode(Sha256::digest(rendered.prepared.prompt().as_bytes()));
         let database = smartclaw::database_from_environment(&rendered.env);
-        Some(match database {
-            Some(database) => smartclaw::inspect_native_final(rendered.prepared.project_root(),
-                &database, &session, rendered.prepared.cwd(), &prompt_sha, &stdout, status.is_some() && group_terminated),
+        output.native_final = Some(match database {
+            Some(database) => inspect_smartclaw_capture(rendered.prepared.project_root(), &database,
+                &session, rendered.prepared.cwd(), &prompt_sha, &output),
             None => Err(anyhow::anyhow!("captured HOME is unavailable for native observation")),
-        }.unwrap_or_else(|error| smartclaw::unavailable(&format!("{error:#}"))))
-    } else { None };
-    Ok(ChannelExecution {
-        process_id: child.id(), status, stdout, stderr, reason,
-        hard_deadline_secs: rendered.context.deadline_secs,
-        first_frame_after_millis: frame.at_millis,
-        leader_exited_after_millis: leader_exited,
-        elapsed_millis: started.elapsed().as_millis() as u64,
-        process_group_terminated: group_terminated,
-        observation_errors: errors.into_iter().map(|error| crate::redact::redact_full(&error)).collect(),
-        stdout_capture_path,
-        stderr_capture_path,
-        native_final,
-    })
+        }.unwrap_or_else(|error| smartclaw::unavailable(&format!("{error:#}"))));
+    }
+    Ok(output)
 }
 
 fn validate_context(prepared: &PreparedInvocation, context: &InvocationContextV1) -> Result<()> {
@@ -2111,4 +2181,68 @@ pub fn with_capacity_lock<T>(root: &Path, action: impl FnOnce() -> Result<T>) ->
         Err(error) => return Err(error).context("获取 capacity admission lease 失败"),
     };
     action()
+}
+
+
+#[cfg(test)]
+mod capture_drain_contract_tests {
+    use super::*;
+    struct AlwaysReadable { bytes: usize }
+    impl Read for AlwaysReadable {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            out.fill(b'x'); self.bytes += out.len(); Ok(out.len())
+        }
+    }
+    struct BrokenWriter;
+    impl Write for BrokenWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> { Err(std::io::Error::other("owned injected write failure")) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    #[test]
+    fn never_eagain_reader_has_a_bounded_discard_pass() {
+        let mut source=AlwaysReadable{bytes:0}; let mut state=CaptureDrain{observed:MAX_CHANNEL_CAPTURE_BYTES,persisted:MAX_CHANNEL_CAPTURE_BYTES,..Default::default()};
+        let mut target=Vec::new();let mut errors=Vec::new();
+        let count=state.drain(&mut source,&mut target,"fixture",&mut errors);
+        assert_eq!(count,CHANNEL_DRAIN_PASS_BYTES);assert_eq!(source.bytes,CHANNEL_DRAIN_PASS_BYTES);
+        assert!(state.overflow);assert!(!state.eof);assert!(target.is_empty());assert!(errors.is_empty());
+        let mut sibling=std::io::Cursor::new(b"sibling-tail".to_vec());let mut sibling_state=CaptureDrain::default();
+        sibling_state.drain(&mut sibling,&mut target,"sibling",&mut errors);
+        assert_eq!(target,b"sibling-tail");assert!(sibling_state.eof);
+    }
+    #[test]
+    fn capture_write_failure_discards_until_actual_eof_without_repeating_errors() {
+        let mut source=std::io::Cursor::new(vec![b'x';CHANNEL_DRAIN_PASS_BYTES*2+1]);
+        let mut state=CaptureDrain::default();let mut errors=Vec::new();
+        for _ in 0..3 {state.drain(&mut source,&mut BrokenWriter,"fixture",&mut errors);}
+        assert_eq!(source.position(),(CHANNEL_DRAIN_PASS_BYTES*2+1) as u64);
+        assert!(state.eof);assert!(state.discard);assert_eq!(errors.len(),1);assert_eq!(state.persisted,0);
+        let mut forever=AlwaysReadable{bytes:0};
+        while state.observed <= MAX_CHANNEL_CAPTURE_BYTES {
+            state.eof=false;
+            state.drain(&mut forever,&mut BrokenWriter,"fixture",&mut errors);
+        }
+        assert!(state.overflow);assert_eq!(errors.len(),1);assert_eq!(state.persisted,0);
+    }
+}
+
+#[cfg(test)]
+mod phase_observation_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn phase_failure_and_panic_preserve_real_child_capture_and_validity() {
+        for panic_observer in [false,true] {
+            let root=crate::util::test_scratch_dir("phase-observer-custody");
+            fs::write(root.join("tracked"),"base").unwrap();
+            for args in [vec!["init","-q"],vec!["add","tracked"],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-qm","base"]]{assert!(Command::new("git").arg("-C").arg(&root).args(args).status().unwrap().success());}
+            let head=crate::gitx::rev_parse(&root,"HEAD").unwrap();let exe=root.join("provider");fs::write(&exe,"#!/bin/sh\nprintf '%s' complete\n").unwrap();fs::set_permissions(&exe,fs::Permissions::from_mode(0o755)).unwrap();
+            let config=format!("version: 1\nharnesses:\n  fixture:\n    driver: opencode\n    executable: {}\n    enabled: true\n    cwdPolicy: project-root\n",exe.display());
+            let snapshot=crate::harness_config::parse_harness_config_snapshot(&root.join(".orch/harnesses.yaml"),&config).unwrap();
+            let prepared=prepare_invocation(&snapshot,InvocationRequest{alias:"fixture".into(),action:InvocationAction::Consult,prompt:"fixture".into(),project_root:root.clone(),target_worktree:root.clone(),target_head:head,attachments:capture_attachment_manifest_v1(&[]).unwrap()}).unwrap();
+            let rendered=render_invocation_v1(prepared,InvocationContextV1{action_id:"phase-fixture".into(),wake_id:"phase-fixture".into(),round:"manual".into(),task_id:"CONSULT".into(),attempt_id:"CONSULT-A0000".into(),review_output:None,orch_executable:exe,deadline_secs:5}).unwrap();
+            let mut seen=Vec::new();let output=run_preflighted_observed(preflight_invocation_v1(rendered).unwrap(),&mut |phase,pid|{seen.push((phase.to_owned(),pid));if panic_observer{panic!("fixture observer panic")}else{bail!("fixture observer failure")}}).unwrap();
+            assert_eq!(seen[0],("entered".into(),None));assert_eq!(seen[1],("spawned".into(),Some(output.process_id)));assert_eq!(output.stdout,b"complete");assert!(output.success()&&output.capture_complete());assert!(output.observation_errors.is_empty());assert_eq!(output.phase_observation_v1.len(),2);assert_eq!(output.reason,ChannelExitReason::Exited);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 }

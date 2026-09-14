@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
@@ -711,6 +711,7 @@ fn archive_channel_consult_member(
         .transpose()?;
     let manifest = serde_json::json!({
         "schemaVersion": 3,
+        "observedAt": now_rfc3339(),
         "member": outcome.member,
         "index": outcome.index,
         "status": member_status_name(outcome.status),
@@ -756,7 +757,7 @@ pub(crate) fn write_new_regular(path: &Path, bytes: &[u8]) -> Result<()> {
     let temporary = parent.join(format!(".consult-artifact-{}", ulid::Ulid::new()));
     let mut owned_temporary = false;
     let install = (|| -> Result<()> {
-        let mut file = OpenOptions::new().create_new(true).write(true).open(&temporary)?;
+        let mut file = OpenOptions::new().mode(0o600).create_new(true).write(true).open(&temporary)?;
         owned_temporary = true;
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -1059,6 +1060,21 @@ fn finish_channel_consult_member_v3(
                 "status": "unknown", "managedScopeTerminated": false,
                 "turnEnded": false, "gcAuthorized": false,
             });
+        }
+        return Ok(outcome);
+    }
+
+    // Capture facts independently veto even an otherwise acceptable native final.
+    // This is distinct from unclosed: other stable members still complete the wave.
+    if output.stdout_overflow || output.stderr_overflow
+        || !output.stdout_eof_observed || !output.stderr_eof_observed {
+        outcome.failure_class = Some(FailureClass::ObservationFailed);
+        outcome.reason = Some("incomplete capture: overflow or actual pipe EOF unproven".into());
+        outcome.answer = None;
+        if let Some(facts) = outcome.channel_facts.as_mut() {
+            facts["stage"] = serde_json::json!("incomplete-capture");
+            facts["terminal"] = serde_json::json!({"status":"failed", "managedScopeTerminated":true,
+                "turnEnded":false, "gcAuthorized":false});
         }
         return Ok(outcome);
     }
@@ -1401,10 +1417,26 @@ fn run_channel_consultation_v3(root: &Path, args: &ConsultArgs) -> Result<Consul
         }
     }
 
+    let slots = explicit_members.as_slice().iter().enumerate().map(|(index, alias)| {
+        let facts = ready.iter().find(|member| member.index == index).map(|member| member.outcome.channel_facts.clone())
+            .or_else(|| outcomes[index].as_ref().map(|outcome| outcome.channel_facts.clone())).flatten();
+        serde_json::json!({"index":index,"alias":alias,"actionId":format!("{}-{index}-{alias}",skeleton.id),"facts":facts})
+    }).collect::<Vec<_>>();
+    let start_bytes = serde_json::to_vec(&serde_json::json!({"version":1,"consultationId":skeleton.id,
+        "project":canonical_root,"head":fixed_head,"configDigest":snapshot.sha256(),"startedAt":now_rfc3339(),
+        "summary":crate::observation::safe_observation_text(&question.text).chars().take(240).collect::<String>(),"members":slots}))?;
+    #[cfg(test)]
+    if FAIL_OBSERVATION_START.with(|flag| flag.get()) {bail!("injected start publication failure");}
+    write_new_regular(&skeleton.dir.join("start.json"), &start_bytes)?;
+    let start_digest = sha256(&start_bytes);
+
     std::thread::scope(|scope| -> Result<()> {
         let (sender, receiver) = std::sync::mpsc::channel();
         for mut member in ready {
             let sender = sender.clone();
+            let phase_dir = skeleton.dir.clone();
+            let phase_digest = start_digest.clone();
+            let consultation_id = skeleton.id.clone();
             scope.spawn(move || {
                     let started = Instant::now();
                     let execution = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -1413,7 +1445,10 @@ fn run_channel_consultation_v3(root: &Path, args: &ConsultArgs) -> Result<Consul
                             .take()
                             .context("prepared consult member lost its render")?;
                         crate::channel::preflight_invocation_v1(rendered)
-                            .and_then(crate::channel::run_preflighted_invocation_v1)
+                            .and_then(|invocation| crate::channel::run_preflighted_observed(invocation, &mut |phase, pid| {
+                                let marker=serde_json::json!({"version":1,"consultationId":consultation_id,"startDigest":phase_digest,"index":member.index,"actionId":member.action_id,"phase":phase,"observedAt":now_rfc3339(),"pid":pid});
+                                write_new_regular(&phase_dir.join(format!("{}.{phase}.json",member.index)), &serde_json::to_vec(&marker)?)
+                            }))
                     }));
                     let _ = sender.send((member, started.elapsed().as_secs(), execution));
             });
@@ -1971,6 +2006,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn incomplete_capture_independently_vetoes_clean_exit_and_bound_native_final() {
+        use crate::channel::{ChannelExecution, ChannelExitReason};
+        let root=crate::util::test_scratch_dir("b349-independent-veto");
+        let text="substantive independently bound native answer";
+        let status=std::process::Command::new("/bin/sh").args(["-c","exit 0"]).status().unwrap();
+        let mut results=Vec::new();
+        for case in 0..5 {
+            let path=root.join(format!("case-{case}"));fs::create_dir_all(&path).unwrap();
+            let raw=path.join("raw");fs::write(&raw,b"diagnostic").unwrap();
+            let output=ChannelExecution{process_id:1,status:Some(status),stdout:vec![],stderr:vec![],
+                reason:ChannelExitReason::Exited,hard_deadline_secs:30,first_frame_after_millis:None,
+                leader_exited_after_millis:Some(1),elapsed_millis:1,process_group_terminated:true,
+                phase_observation_v1:vec![],observation_errors:vec![],stdout_capture_path:Some(raw.clone()),stderr_capture_path:Some(raw),
+                stdout_overflow:case==1,stderr_overflow:case==2,stdout_eof_observed:case!=3,stderr_eof_observed:case!=4,
+                native_final:Some(serde_json::json!({"projectionStatus":"available","nativeTerminated":true,
+                    "final":{"text":text,"sha256":hex::encode(Sha256::digest(text.as_bytes()))}}))};
+            let driver=crate::harness::HarnessId::SmartClaw;
+            let mut outcome=MemberOutcome::new(case,format!("fixture-{case}"),MemberStatus::Failed);
+            outcome.channel_facts=Some(serde_json::json!({}));
+            let ready=ReadyConsultMemberV3{index:case,alias:format!("fixture-{case}"),action_id:format!("fixture-{case}"),
+                driver,effective_model:None,contract:driver.driver_contract(crate::harness::DriverAction::Consult).unwrap(),
+                rendered:None,outcome};
+            let result=finish_channel_consult_member_v3(&path,ready,1,Ok(Ok(output))).unwrap();
+            if case==0 {assert_eq!(result.status,MemberStatus::Ok,"{result:?}");assert_eq!(result.answer.as_deref(),Some(text));}
+            else {
+                assert_eq!(result.status,MemberStatus::Failed,"case {case}: {result:?}");
+                assert_eq!(result.failure_class,Some(FailureClass::ObservationFailed));assert!(result.answer.is_none());
+                assert_eq!(result.channel_facts.as_ref().unwrap()["stage"],"incomplete-capture");
+                assert_eq!(result.channel_facts.as_ref().unwrap()["terminal"]["turnEnded"],false);
+            }
+            results.push(result);
+        }
+        assert!(!results.iter().any(|r|r.channel_facts.as_ref().unwrap()["stage"]=="unclosed"));
+        let skeleton=create_consultation_skeleton(&root).unwrap();
+        for result in &results {archive_channel_consult_member(&skeleton,result).unwrap();}
+        let summary=write_root_summary(&skeleton,&results).unwrap();
+        let body=fs::read_to_string(summary).unwrap();assert!(body.contains("fixture-0: ok"));assert!(body.contains("fixture-4: failed"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn bound_native_final_survives_transport_eof_but_not_timeout_or_unclosed_native_work() {
         use crate::channel::{ChannelExecution, ChannelExitReason};
         use std::os::unix::process::CommandExt;
@@ -2012,11 +2088,23 @@ c.commit()
                 &wanted,&process.stdout,true).unwrap();
             let stdout_path = path.join("raw.stdout"); let stderr_path = path.join("raw.stderr");
             fs::write(&stdout_path,&process.stdout).unwrap(); fs::write(&stderr_path,&process.stderr).unwrap();
-            let execution = ChannelExecution { process_id:pid,status:Some(process.status),stdout:process.stdout,
+            let mut execution = ChannelExecution { process_id:pid,status:Some(process.status),stdout:process.stdout,
                 stderr:process.stderr,reason:ChannelExitReason::Exited,hard_deadline_secs:30,
                 first_frame_after_millis:None,leader_exited_after_millis:Some(1),elapsed_millis:1,
-                process_group_terminated:true,observation_errors:vec![],stdout_capture_path:Some(stdout_path),
-                stderr_capture_path:Some(stderr_path),native_final:Some(native) };
+                process_group_terminated:true,phase_observation_v1:vec![],observation_errors:vec![],stdout_capture_path:Some(stdout_path),
+                stderr_capture_path:Some(stderr_path),stdout_overflow:false,stderr_overflow:false,
+                stdout_eof_observed:true,stderr_eof_observed:true,native_final:Some(native) };
+            if index==0 {
+                for bad in 0..4 {
+                    execution.stdout_overflow=bad==0;execution.stderr_overflow=bad==1;
+                    execution.stdout_eof_observed=bad!=2;execution.stderr_eof_observed=bad!=3;
+                    let observed=crate::channel::inspect_smartclaw_capture(&root,&database,&session,&root,&wanted,&execution).unwrap();
+                    assert_eq!(observed["raw"]["streamClosed"],false,"case {bad}: {observed}");
+                    assert_eq!(observed["projectionStatus"],"unavailable");
+                }
+                execution.stdout_overflow=false;execution.stderr_overflow=false;
+                execution.stdout_eof_observed=true;execution.stderr_eof_observed=true;
+            }
             let driver = crate::harness::HarnessId::SmartClaw;
             let mut outcome = MemberOutcome::new(index,"native",MemberStatus::Failed);
             outcome.channel_facts=Some(serde_json::json!({}));
@@ -2410,5 +2498,26 @@ pub fn consultation_admitted(root: &Path) -> Result<GateDecision> {
         Ok(GateDecision::Refuse { reason: "project contains selfhost state; use an orch build with --features selfhost".to_owned() })
     } else {
         Ok(GateDecision::Admit { basis: "standalone Git project with local harness configuration".to_owned() })
+    }
+}
+
+#[cfg(test)]
+std::thread_local! { static FAIL_OBSERVATION_START: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+mod observation_start_tests {
+    use super::*;
+    use std::{process::Command,os::unix::fs::PermissionsExt};
+    #[test]
+    fn start_publication_failure_prevents_real_consult_fanout() {
+        let root=crate::util::test_scratch_dir("start-publication-failure");fs::create_dir_all(root.join(".orch")).unwrap();
+        fs::write(root.join(".gitignore"),".orch/\ncoordination/\n.cowork-temp/\n").unwrap();fs::write(root.join("question"),"fixture").unwrap();
+        for args in [vec!["init","-q"],vec!["add","question",".gitignore"],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-qm","base"]]{assert!(Command::new("git").arg("-C").arg(&root).args(args).status().unwrap().success())}
+        let exe=root.join("provider");fs::write(&exe,"#!/bin/sh\nprintf started > unexpected-child\n").unwrap();fs::set_permissions(&exe,fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(root.join(".orch/harnesses.yaml"),format!("version: 1\nharnesses:\n  one:\n    driver: claude\n    executable: {}\n    enabled: true\n    cwdPolicy: project-root\n",exe.display())).unwrap();
+        struct Reset;impl Drop for Reset{fn drop(&mut self){FAIL_OBSERVATION_START.with(|flag|flag.set(false));}}
+        let _reset=Reset;FAIL_OBSERVATION_START.with(|flag|flag.set(true));
+        let result=run_consultation(&root,&ConsultArgs{question:"question".into(),harnesses:vec!["one".into()],member_timeout_secs:Some(3),total_wall_secs:Some(5),..Default::default()});
+        assert!(result.unwrap_err().to_string().contains("start publication failure"));assert!(!root.join("unexpected-child").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }

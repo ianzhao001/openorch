@@ -6,6 +6,20 @@ This file records the public OpenOrch release line. Internal selfhost rounds, ta
 
 ## 中文
 
+### [v0.1.0-alpha.7](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.7) — 2026-09-14
+
+本版发布 r89 的只读观测产品增量，继续保持默认 CLI、手动 selfhost 和插件宿主边界。
+
+- 新增独立 `orch-tui` 前台观察面板：只读刷新 invocation 事实，不启动、取消、收取、reconcile 或 GC
+- 增加 invocation observation 捕获、文件大小上限与默认安全状态，保留旧快照并将失败显式标为未知
+- TUI 支持调用/通道/任务导航、详情、项目切换、手动刷新和安全复制；不把观察结果消费成 planner 答卷
+- PTY、宽字符、kernel 状态、clipboard 子进程和凭据格式均采用保守失败边界；非 TTY 与无效参数不会伪装成功
+- DSH、Pi、ZCode 作为 Consult 目标与宿主能力分开记录；AGY 仍不是 Consult 目标
+- 预编译包仍只提供默认 6 叶 `orch` 与四个 wrapper；`orch-ui`/`orch-tui` 仅从源码构建
+
+本版仅验证 Apple Silicon macOS。二进制为 ad-hoc 签名，非 Developer ID、未 notarize；公开快照
+不携带 r89 账本、私有审查现场、历史 fixture、模型转写或本机配置。
+
 ### [v0.1.0-alpha.6](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.6) — 2026-09-13
 
 本版继续完善全通道的原生 Consult/执行安全边界，并修复 r88 暴露的通道、回收和固定 source gate 问题。
@@ -87,6 +101,22 @@ OpenOrch 现在提供 Codex Desktop 与 DSH Web 共用的插件包。核心版�
 ---
 
 ## English
+
+### [v0.1.0-alpha.7](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.7) — 2026-09-14
+
+This release publishes the r89 read-only observation increment while keeping the
+default CLI, manual selfhost, and native plugin-host boundaries unchanged.
+
+- Adds the independent `orch-tui` foreground observation panel: it refreshes invocation facts only and never starts, cancels, collects, reconciles, or GCs work
+- Adds bounded invocation-observation capture and conservative defaults; failed reads retain the old snapshot and surface an explicit unknown state
+- TUI navigation covers invocation/channel/task views, details, project switching, refresh, and safe copy without consuming planner answers
+- PTY, Unicode width, kernel state, clipboard children, and credential-format handling fail closed; non-TTY and invalid arguments never look successful
+- DSH, Pi, and ZCode are documented as Consult targets separately from the DSH plugin host; AGY remains unsupported for Consult
+- The prebuilt bundle still contains only the default six-leaf `orch` and four wrappers; `orch-ui`/`orch-tui` are source-built only
+
+Only Apple Silicon macOS is validated. The binary is ad-hoc signed, not Developer ID
+signed, and not notarized. The public snapshot excludes r89 ledgers, private review
+sites, historical fixtures, model transcripts, and machine configuration.
 
 ### [v0.1.0-alpha.6](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.6) — 2026-09-13
 

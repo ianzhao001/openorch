@@ -8953,6 +8953,41 @@ pub fn direct_wake_status(root: &Path, wake_id: &str) -> Result<ManagedWakeStatu
     status_from_artifacts(&dir, &descriptor, &facts.binding.alias, facts.binding.driver.as_str())
 }
 
+// Enumerate only inside the private authentication boundary. No raw entry name or
+// verification error is returned, because sidecar names contain credentials.
+pub(crate) fn observation_projection(root: &Path, remaining: &mut usize) -> (Vec<serde_json::Value>, Vec<String>, bool) {
+    let mut rows=Vec::new(); let mut diagnostics=Vec::new(); let mut truncated=false;
+    if !root.join("coordination/runtime/supervisors").try_exists().unwrap_or(true) {return (rows,diagnostics,false);}
+    let dir=match authenticated_supervisor_dir(root,false) {Ok(d)=>d,Err(_)=>return (rows,vec!["supervisor directory unavailable".into()],false)};
+    let entries=match fs::read_dir(&dir) {Ok(e)=>e,Err(_)=>return (rows,vec!["supervisor enumeration unavailable".into()],false)};
+    let mut ids=std::collections::BTreeSet::new();
+    for entry in entries {
+        let Ok(entry)=entry else {diagnostics.push("supervisor entry unavailable".into());continue};
+        let name=entry.file_name();let Some(name)=name.to_str() else {continue};
+        if let Some(id)=name.strip_suffix(".control.json") {
+            if is_strict_uuid(id) {ids.insert(id.to_owned());if ids.len()>1024 {ids.pop_first();truncated=true;}}
+            else if diagnostics.is_empty(){diagnostics.push("unknown supervisor control entry".into());}
+        }
+    }
+    for id in ids.into_iter().rev() {
+        // Reserve bounded descriptor and status/session frames before existing readers.
+        const RESERVATION:usize=256*1024;
+        if *remaining<RESERVATION {truncated=true;break;} *remaining-=RESERVATION;
+        let projected=(||->Result<Option<serde_json::Value>> {
+            let (dir,descriptor)=read_managed_wake_control_descriptor(root,&id)?;
+            let Some(facts)=descriptor.invocation.as_ref().filter(|f|f.binding.standalone) else {return Ok(None)};
+            let contract=channel_binding_driver_contract(&facts.binding)?;
+            let status=if contract.control.status {status_from_artifacts(&dir,&descriptor,&facts.binding.alias,facts.binding.driver.as_str()).ok()} else {None};
+            Ok(Some(serde_json::json!({"wakeId":id,"publishedAt":facts.published_at,"alias":facts.binding.alias,
+                "driver":facts.binding.driver.as_str(),"action":facts.binding.action,"requestedTuple":facts.binding.requested_tuple,
+                "effectiveTuple":facts.binding.effective_tuple,"fixedHead":facts.binding.fixed_head,"parameters":{"configDigest":facts.binding.config_digest,"runtimeLimit":descriptor.runtime_limit},"statusSupported":contract.control.status,"status":status})))
+        })();
+        match projected {Ok(Some(v))=>rows.push(v),Ok(None)=>{},Err(_)=>{if diagnostics.len()<8 {diagnostics.push("supervisor observation unavailable".into());}}}
+    }
+    if truncated {diagnostics.push("supervisor candidates or metadata budget clipped".into());}
+    (rows,diagnostics,truncated)
+}
+
 /// Request the existing authenticated custodian cancellation for one direct wake.
 /// The request does not signal processes or certify termination of a persistent backend.
 pub fn cancel_direct_wake(root: &Path, wake_id: &str, reason: &str) -> Result<ManagedWakeCancelResult> {

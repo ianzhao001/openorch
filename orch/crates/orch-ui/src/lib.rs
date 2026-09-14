@@ -21,6 +21,9 @@ use ratatui::text::Line;
 use orch_host::redact;
 use orch_host::snapshot::{Alert, OrchSnapshot, Severity, SnapshotSource};
 
+/// Independent invocation-observation application; legacy snapshot assets remain available.
+pub mod app;
+
 /// 只读动作集合：TUI 面板能触发的动作。**全部只读**——`is_read_only()` 恒真。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
