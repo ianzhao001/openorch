@@ -21,7 +21,7 @@ from install import (ASSETS, PLUGIN, SEMVER, InstallError, absolute, check_path,
 SOURCE_FILES = (".codex-plugin/plugin.json", "package.json", "cordis.patch.yml",
                 "dsh-entry.mjs", "skills/openorch/SKILL.md", "scripts/openorch.py",
                 "scripts/install.py", "scripts/package.py", "HELPER.md", "README.md",
-                "LICENSE", "catalog.json")
+                "LICENSE", "catalog.json", "AGENTS.md")
 
 
 def json_bytes(value):

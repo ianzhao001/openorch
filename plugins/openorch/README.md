@@ -10,7 +10,7 @@ Git projects.
 ## 安装 / Install
 
 下载 [OpenOrch Release](https://github.com/ianzhao001/openorch/releases) 中的完整
-Apple Silicon macOS 插件归档并解压。插件版本为 `0.1.0-alpha.7`，核心版本仍是
+Apple Silicon macOS 插件归档并解压。插件版本为 `0.1.0-alpha.8`，核心版本仍是
 `orch 0.1.0`。源码仓本身不含运行核心，不能代替完整 Release 安装包。
 
 Download and extract the complete Apple Silicon macOS plugin archive. It includes
@@ -80,21 +80,24 @@ independent model diversity. Native clients may incur their normal usage costs.
 | Plugin hosts | Codex Desktop and DSH Web |
 | Consult targets | Codex, Claude, OpenCode, Cursor, MiMo, CodeBuddy, SmartClaw, DSH, Pi, ZCode, subject to actual discovery/configuration |
 | Unsupported Consult targets | AGY |
-| Core surfaces | Default CLI 6 commands; selfhost CLI 30; read-only `orch-tui` source binary |
+| Core surfaces | Default CLI 6 commands; selfhost CLI 30; read-only `orch-tui` / `orch-web` source binaries |
 
 DSH 既可作为插件宿主，也可作为 Consult 目标；Pi、ZCode 同样受支持。宿主集成与目标通道
 能力仍需分别核验，并以运行时发现、原生终态和项目历史证据为准。
 执行和审查动作的支持范围没有由本插件扩展。配置模型名称不等于原生证据已验证该身份。
 
-`orch-tui` 仅随源码构建，不随默认六命令预编译 runtime 发布。源码构建命令为：
+`orch-tui` 与 `orch-web` 仅随源码构建，不随默认六命令预编译 runtime 发布。源码构建命令为：
 
 ```sh
 cargo build -p orch-ui --bin orch-tui --locked --manifest-path orch/Cargo.toml
 orch/target/debug/orch-tui --root /absolute/project
+cargo run -p orch-ui --bin orch-web --all-features -- --root /exact/git/root
 ```
 
 它以只读方式每两秒刷新已捕获的 invocation 观察，明确区分来源时间、陈旧、终态与未知，
 并对展示/复制内容做安全裁剪；非 TTY、参数错误或初始化失败均不会伪装成成功。
+
+`orch-web` 是仅绑定 `127.0.0.1` 的本机浏览器观察面板。启动 capability、精确同源检查、无 CORS、严格响应安全头和 opaque ID API 共同限制浏览器访问；它没有任意文件接口。它不会调用 provider、编辑项目、启动、取消、收取、reconcile 或 GC 调用，答案 Markdown 被视为不可信内容并在本地净化，页面不加载外部资源。
 
 Missing clients, unsupported members, failed/partial calls and empty or tool-only
 answers remain visible. Do not treat a process exit or partial text as success.

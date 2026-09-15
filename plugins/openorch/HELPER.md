@@ -124,6 +124,10 @@ captured invocation observations. It is not part of the default six-command
 prebuilt runtime and never starts, cancels, collects, reconciles or garbage-
 collects an invocation.
 
+It also contains a source-built loopback-only `orch-web` frontend. It serves
+read-only observation data only from `127.0.0.1`, never opens arbitrary project
+files, and is not included in the prebuilt runtime.
+
 ## Errors and recovery
 
 Helper setup/validation errors print an actionable message to stderr and return

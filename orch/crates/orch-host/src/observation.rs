@@ -3,9 +3,9 @@
 //! Phase records describe past observations, never liveness. Native termination,
 //! answer verification and associated task state are independent dimensions.
 //! This module never loads current harness configuration or invokes recovery.
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -123,6 +123,16 @@ pub struct ProjectObservation {
     /// At least one enumeration or byte budget was clipped.
     pub truncated: bool,
 }
+/// Typed lookup absence after a successful refresh; distinct from unsafe or unreadable sources.
+#[derive(Debug)]
+pub struct InvocationUnavailable;
+impl std::fmt::Display for InvocationUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invocation no longer available")
+    }
+}
+impl std::error::Error for InvocationUnavailable {}
+
 /// On-demand, bounded answer text and its current verification result.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InvocationDetail {
@@ -170,18 +180,92 @@ pub fn safe_observation_text(text: &str) -> String {
         boundary
     }
 }
-fn safe_value(value: &Value) -> Value {
+/// Preserve Markdown line structure after credential detection and ANSI removal.
+/// This is display text, never executable HTML; terminal callers keep the flat API.
+pub fn safe_observation_multiline(text: &str) -> String {
+    if safe_observation_text(text) == "[redacted]" {
+        return "[redacted]".into();
+    }
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::new();
+    let mut chars = normalized.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    for n in chars.by_ref() {
+                        if ('@'..='~').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(n) = chars.next() {
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if c == '\n' || c == '\t' || !c.is_control() {
+            out.push(c);
+        }
+    }
+    out
+}
+fn sensitive_key(key: &str) -> bool {
+    let key: String = key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    ["token", "secret", "password", "key"]
+        .iter()
+        .any(|suffix| key.ends_with(suffix))
+        || ["authorization", "proxyauthorization", "cookie", "setcookie"].contains(&key.as_str())
+}
+fn sanitize_value(value: &Value, multiline: bool) -> Value {
     match value {
-        Value::String(s) => safe_observation_text(s).into(),
-        Value::Array(v) => v.iter().map(safe_value).collect(),
+        Value::String(s) => if multiline {
+            safe_observation_multiline(s)
+        } else {
+            safe_observation_text(s)
+        }
+        .into(),
+        Value::Array(v) => v.iter().map(|v| sanitize_value(v, multiline)).collect(),
         Value::Object(v) => Value::Object(
             v.iter()
-                .map(|(k, v)| (safe_observation_text(k), safe_value(v)))
+                .map(|(k, v)| {
+                    (
+                        safe_observation_text(k),
+                        if sensitive_key(k) {
+                            Value::from("[redacted]")
+                        } else {
+                            sanitize_value(v, multiline)
+                        },
+                    )
+                })
                 .collect(),
         ),
         _ => value.clone(),
     }
 }
+/// Recursively sanitize untrusted JSON, masking the entire value of credential keys.
+/// LF/tab remain in ordinary string values for safe Markdown/text rendering.
+pub fn safe_observation_value(value: &Value) -> Value {
+    sanitize_value(value, true)
+}
+fn safe_value(value: &Value) -> Value {
+    sanitize_value(value, false)
+}
+
 fn string(v: &Value, k: &str) -> Option<String> {
     v.get(k)?.as_str().map(safe_observation_text)
 }
@@ -457,12 +541,20 @@ impl ObservationReader {
     }
     /// Revalidate the selected ID and return only fully verified answer bytes.
     pub fn detail(&mut self, id: &str) -> Result<InvocationDetail> {
+        self.detail_text(id, false)
+    }
+    /// Revalidate complete answer bytes and retain safe Markdown newlines and tabs.
+    /// Invalid, missing or oversized sources never reuse a previously verified body.
+    pub fn detail_multiline(&mut self, id: &str) -> Result<InvocationDetail> {
+        self.detail_text(id, true)
+    }
+    fn detail_text(&mut self, id: &str, multiline: bool) -> Result<InvocationDetail> {
         let snap = self.refresh()?;
         let mut row = snap
             .rows
             .into_iter()
             .find(|r| r.id == id)
-            .context("invocation no longer available")?;
+            .ok_or(InvocationUnavailable)?;
         let mut text = None;
         let mut truncated = false;
         if row.result == "verified" {
@@ -477,7 +569,12 @@ impl ObservationReader {
                         truncated: false,
                     });
                 }
-                let safe = safe_observation_text(std::str::from_utf8(&bytes)?);
+                let source = std::str::from_utf8(&bytes)?;
+                let safe = if multiline {
+                    safe_observation_multiline(source)
+                } else {
+                    safe_observation_text(source)
+                };
                 let mut end = safe.len().min(RECORD);
                 while !safe.is_char_boundary(end) {
                     end -= 1
@@ -508,18 +605,20 @@ impl ObservationReader {
             return;
         };
         let mut ids = BTreeSet::new();
+        let mut candidates_clipped = false;
         for e in entries {
             if let Ok(e) = e {
                 if let Some(id) = e.file_name().to_str().filter(|id| ulid(id)) {
                     ids.insert(id.to_owned());
                     if ids.len() > 1024 {
                         ids.pop_first();
+                        candidates_clipped = true;
                         out.truncated = true;
                     }
                 }
             }
         }
-        if out.truncated {
+        if candidates_clipped {
             out.diagnostics
                 .push("consultation candidates clipped".into());
         }
@@ -1343,14 +1442,12 @@ mod tests {
         let mut events = original.clone();
         events.swap(1, 3);
         write(&events);
-        assert!(
-            reader
-                .refresh()
-                .unwrap()
-                .rows
-                .iter()
-                .all(|r| r.result != "verified")
-        );
+        assert!(reader
+            .refresh()
+            .unwrap()
+            .rows
+            .iter()
+            .all(|r| r.result != "verified"));
         let mut events = original.clone();
         events.push(events[2].clone());
         write(&events);

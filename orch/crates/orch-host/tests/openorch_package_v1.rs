@@ -68,6 +68,9 @@ with tempfile.TemporaryDirectory(prefix='b337-',dir=PARENT) as t:
     assert dsh['name']=='openorch' and dsh['version']==manifest['version']
     assert (plugin/dsh['dsh']['bundle']['patch']).is_file()
     skill=plugin/'skills/openorch/SKILL.md';assert skill.is_file()
+    agents=plugin/'AGENTS.md';assert agents.read_bytes()==(SOURCE/'plugins/openorch/AGENTS.md').read_bytes()
+    full_inventory=json.loads((bundle/'manifest.json').read_text())['files']
+    assert full_inventory['plugins/openorch/AGENTS.md']=={'sha256':hashlib.sha256(agents.read_bytes()).hexdigest(),'bytes':len(agents.read_bytes())}
     inventory=json.loads((plugin/'runtime/manifest.json').read_text())
     expected={'orch','scripts/wake-multica.sh','scripts/wake-dsh-stream.sh','scripts/wake-pi-stream.sh','scripts/wake-zcode-stream.sh'}
     assert set(inventory['files'])==expected

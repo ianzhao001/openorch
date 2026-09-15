@@ -38,3 +38,6 @@ DSH Web is a plugin **host**, and DSH, Pi and ZCode are also supported Consult
 targets in this release; AGY is not. Actual core discovery and native terminal
 evidence are authoritative. This plugin does not add execution/review scheduling
 or background orchestration.
+
+Native Codex delegation and waiting own local implementation work. OpenOrch is
+only the explicit cross-harness consultation/fusion layer requested by the user.

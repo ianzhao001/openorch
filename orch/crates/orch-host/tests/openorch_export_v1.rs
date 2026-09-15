@@ -33,6 +33,7 @@ with tempfile.TemporaryDirectory(prefix='b338-',dir=PARENT) as t:
       'plugins/openorch/.codex-plugin/plugin.json':json.dumps({'name':'openorch','version':'0.1.0-alpha.4'}),
       'plugins/openorch/scripts/openorch.py':'# public helper\n',
       'plugins/openorch/skills/openorch/SKILL.md':'---\nname: openorch\ndescription: explicit harness consultation\n---\n',
+      'plugins/openorch/AGENTS.md':'# Published collaboration policy\n',
       'plugins/openorch/PUBLIC-README.md':'# OpenOrch\nPublic installation instructions.\n',
       'plugins/openorch/PUBLIC-CHANGELOG.md':'# Changelog\nPlugin alpha.4.\n',
       'plugins/openorch/LICENSE':'MIT fixture\n',
@@ -50,6 +51,9 @@ with tempfile.TemporaryDirectory(prefix='b338-',dir=PARENT) as t:
     out=base/'public output';export(out)
     assert (out/'orch/crates/orch-cli/src/main.rs').read_text()=='fn main() {}\n'
     assert (out/'plugins/openorch/scripts/openorch.py').is_file()
+    agents=out/'plugins/openorch/AGENTS.md';assert agents.read_text()==files['plugins/openorch/AGENTS.md']
+    inventory=json.loads((out/'SOURCE-MANIFEST.json').read_text())['files']
+    assert inventory['plugins/openorch/AGENTS.md']==__import__('hashlib').sha256(agents.read_bytes()).hexdigest()
     assert (out/'README.md').read_text()==files['plugins/openorch/PUBLIC-README.md']
     assert (out/'CHANGELOG.md').read_text()==files['plugins/openorch/PUBLIC-CHANGELOG.md']
     assert (out/'LICENSE').read_text()==files['plugins/openorch/LICENSE']

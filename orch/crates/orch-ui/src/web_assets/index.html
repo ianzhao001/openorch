@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="orch-capability" content="__ORCH_CAPABILITY__">
+  <title>OpenOrch · Observation</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <a class="skip-link" href="#cards">Skip to observations</a>
+  <header class="topbar">
+    <div class="brand" aria-label="OpenOrch local observation">
+      <span class="brand-mark" aria-hidden="true">O</span>
+      <span><strong>OpenOrch</strong><small data-i18n="readonly">Read-only observation</small></span>
+    </div>
+    <div class="header-actions">
+      <label class="compact-field"><span data-i18n="project">Project</span><select id="project-select" aria-label="Project"></select></label>
+      <button id="register-toggle" class="quiet" type="button" data-i18n="addProject">Add project</button>
+      <label class="compact-field"><span data-i18n="theme">Theme</span><select id="theme-select"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+      <button id="lang-toggle" class="quiet" type="button" aria-label="Switch language">中</button>
+    </div>
+    <form id="project-form" class="project-form" hidden>
+      <label for="project-path" data-i18n="projectPath">Exact Git root</label>
+      <input id="project-path" autocomplete="off" placeholder="/path/to/project">
+      <button type="submit" data-i18n="register">Register</button>
+    </form>
+  </header>
+
+  <nav class="views" aria-label="Observation views">
+    <button class="view active" data-view="home" type="button" data-i18n="tasks">Tasks</button>
+    <button class="view" data-view="calls" type="button" data-i18n="calls">All calls</button>
+    <button class="view" data-view="members" type="button" data-i18n="members">Members</button>
+    <span class="read-status"><span id="status-dot" aria-hidden="true"></span><span id="read-status">Loading…</span></span>
+  </nav>
+
+  <main>
+    <section class="filters" aria-label="Filters">
+      <label class="search-wrap"><span class="sr-only" data-i18n="search">Search</span><input id="search" type="search" placeholder="Search ID, summary, member…" autocomplete="off"></label>
+      <label><span data-i18n="result">Answer</span><select id="result-filter"><option value="">All</option><option>verified</option><option>invalid</option><option>failed</option><option>none</option><option>unknown</option><option>too-large</option></select></label>
+      <label><span data-i18n="member">Member</span><select id="member-filter"><option value="">All</option></select></label>
+      <label><span data-i18n="time">Time</span><select id="time-filter"><option value="all">All</option><option value="24h">24h</option><option value="7d">7d</option><option value="30d">30d</option></select></label>
+      <label><span data-i18n="task">Task</span><select id="task-filter"><option value="">All</option></select></label>
+      <label><span data-i18n="taskState">Task state</span><select id="task-state-filter"><option value="">All</option></select></label>
+      <label><span data-i18n="purpose">Purpose</span><select id="purpose-filter"><option value="">All</option></select></label>
+      <button id="refresh" class="quiet" type="button" data-i18n="refresh">Refresh</button>
+    </section>
+
+    <p id="window-summary" class="window-summary"></p>
+    <section id="notice" class="notice" aria-live="polite" hidden></section>
+    <section id="cards" class="content" tabindex="-1" aria-busy="true">
+      <div id="task-section"><div class="section-heading"><div><span class="eyebrow" data-i18n="linked">EXPLICITLY LINKED</span><h1 data-i18n="taskOverview">Task overview</h1></div><span id="task-count" class="count"></span></div><div id="task-cards" class="card-grid"></div></div>
+      <div id="unassociated-section"><div class="section-heading"><div><span class="eyebrow" data-i18n="unlinked">NOT LINKED TO A TASK</span><h2 data-i18n="unassociated">Unassociated calls</h2></div><span id="unassociated-count" class="count"></span></div><div id="unassociated-cards" class="card-grid"></div></div>
+      <button id="load-more" class="load-more" type="button" data-i18n="loadMore" hidden>Load 30 more</button>
+    </section>
+  </main>
+
+  <div id="scrim" class="scrim" hidden></div>
+  <aside id="drawer" class="drawer" aria-label="Observation detail" aria-hidden="true" tabindex="-1" inert>
+    <div class="drawer-head"><div><span class="eyebrow" data-i18n="details">DETAILS</span><h2 id="drawer-title">—</h2></div><button id="drawer-close" class="icon-button" type="button" aria-label="Close detail">×</button></div>
+    <div id="drawer-summary" class="drawer-summary"></div>
+    <div id="member-list" class="member-list"></div>
+    <button id="open-reader" type="button" data-i18n="readAnswer">Read verified answer</button>
+  </aside>
+
+  <section id="reader" class="reader" aria-label="Answer reader" aria-hidden="true" tabindex="-1" inert>
+    <div class="reader-head"><button id="reader-back" class="quiet" type="button" data-i18n="back">Back</button><div><span class="eyebrow" data-i18n="verifiedAnswer">VERIFIED ANSWER</span><h2 id="reader-title">—</h2></div><button id="copy-answer" class="quiet" type="button" data-i18n="copy">Copy text</button></div>
+    <div id="answer-state" class="notice" aria-live="polite"></div>
+    <article id="answer" class="markdown"></article>
+  </section>
+
+  <script type="module" src="/assets/app.mjs"></script>
+</body>
+</html>

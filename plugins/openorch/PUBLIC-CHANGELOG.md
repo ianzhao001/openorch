@@ -6,6 +6,19 @@ This file records the public OpenOrch release line. Internal selfhost rounds, ta
 
 ## 中文
 
+### [v0.1.0-alpha.8](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.8) — 2026-09-16
+
+本版在 r89 的只读终端观察面板基础上，新增本机 loopback-only WebUI；默认 CLI、手动 selfhost 和插件调用边界保持不变。
+
+- 新增独立 `orch-web` 前台服务与内嵌 WebUI，只绑定 `127.0.0.1`，不增加默认 `orch` 命令、不控制 provider 或修改项目
+- 以启动 capability、严格同源/Origin/Host 校验、无 CORS、CSP/no-store/nosniff/no-referrer 和无任意文件接口保护本机观察 API
+- 支持任务、全部调用和成员三视图；关联任务与未关联调用分区显示，共享 30 卡窗口，窗口内异常优先且可按 30 加载更多
+- 双主题、双语、宽中窄布局、键盘可达性、减少动态效果、刷新与详情过期保护；失败读取保留旧快照并诚实显示错误
+- 页面不加载 CDN、远程字体或答卷图片；不可信 Markdown 经受限语义重建，外链仅保留绝对 HTTP/HTTPS 且附安全关系
+- `orch-web` 与既有 `orch-tui` 都仅从源码构建；预编译插件包仍为默认 6 叶 runtime 与四个 wrapper
+
+仅验证 Apple Silicon macOS。核心为 ad-hoc 签名，非 Developer ID、未 notarize；公开快照不包含 r90 账本、审查现场、运行配置、历史 fixture 或模型转写。
+
 ### [v0.1.0-alpha.7](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.7) — 2026-09-14
 
 本版发布 r89 的只读观测产品增量，继续保持默认 CLI、手动 selfhost 和插件宿主边界。
@@ -101,6 +114,19 @@ OpenOrch 现在提供 Codex Desktop 与 DSH Web 共用的插件包。核心版�
 ---
 
 ## English
+
+### [v0.1.0-alpha.8](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.8) — 2026-09-16
+
+This release adds a local loopback-only WebUI alongside r89's read-only terminal observation panel. Default CLI, manual selfhost, and native-plugin boundaries remain unchanged.
+
+- Adds the independent `orch-web` foreground service and embedded WebUI, bound only to `127.0.0.1`; it adds no default `orch` command, provider control, or project writes
+- Protects local observation APIs with a startup capability, exact same-origin/Origin/Host checks, no CORS, CSP/no-store/nosniff/no-referrer headers, and no arbitrary-file endpoint
+- Adds Tasks, All calls, and Members views with separate associated/unassociated sections, a shared 30-card window, in-window failure/invalid priority, and load-more by 30
+- Adds bilingual themes, responsive layouts, keyboard access, reduced motion, refresh/detail staleness protection, and honest retained snapshots after failed reads
+- Loads no CDN, remote font, or answer image; untrusted Markdown is reconstructed from a restricted semantic set and links are limited to absolute HTTP/HTTPS with safe relations
+- `orch-web` and `orch-tui` are source-built only; the prebuilt plugin bundle remains the default six-leaf runtime plus four wrappers
+
+Only Apple Silicon macOS is validated. The core is ad-hoc signed, not Developer ID signed or notarized. The public snapshot excludes r90 ledgers, review sites, runtime configuration, historical fixtures, and model transcripts.
 
 ### [v0.1.0-alpha.7](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.7) — 2026-09-14
 

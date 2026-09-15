@@ -1215,3 +1215,105 @@ Keys1/2/3 select calls/harness/tasks grouping without deduplication; arrows and 
 Every untrusted rendered/copied field uses safe_observation_text before clipping; this detects known credential formats, not every possible secret. Unicode details wrap by grapheme display width; oversized graphemes in a single-column view are visibly clipped. The macOS clipboard is argv-only /usr/bin/pbcopy with nonblocking bounded input and a 2second clipboard deadline; failure/deadline kills and reaps only that owned clipboard child and displays an error. Other platforms report unsupported clipboard.
 
 The terminal guard is armed immediately after raw mode succeeds, before screen/backend setup. Normal, initialization/body/drawing/event errors and Rust unwind independently attempt cursor/screen restoration and disable raw mode. Rust abort, SIGKILL and external terminal destruction cannot be promised destructor recovery. Real owned PTY verification must compare termios and actual cursor/alternate-screen sequences, including both input/output TTY combinations; synthetic Buffer tests alone do not prove terminal recovery.
+
+## Local Web observation service (r90)
+
+The `orch-ui::web::WebServer` library is the service foundation for the separate
+`orch-web` frontend entry. It is not a new default CLI command. It binds only
+`127.0.0.1`; port zero retains an OS-selected listener without a rebind race.
+Drop closes its own listener and joins its runtime thread. It never controls a
+provider, edits project files, collects reports, reconciles or garbage-collects.
+
+GET `/api/v1/projects` lists session-only opaque project IDs. POST to that route
+with JSON `root` validates an exact committed Git root and reads its first
+snapshot before registration. Subdirectories, non-projects and missing commits
+are rejected; failed registration preserves the existing registry. The maximum
+is 16 roots, no eviction; registering the same canonical root is idempotent.
+Git HEAD may advance after registration. Request bodies are limited to8192bytes,
+paths to4096bytes. GET `/api/v1/projects/{id}/snapshot` and
+`/api/v1/projects/{id}/detail?id=...` accept only registered project IDs; invocation
+IDs are opaque lookups, never file paths. There is no arbitrary file endpoint.
+
+Every API requires `X-Orch-Capability`, generated from32bytes of OS entropy on
+startup and bootstrapped in a same-origin HTML meta element. Host must match the
+actual127.0.0.1:port; Origin, when present, must match exactly; Sec-Fetch-Site,
+when present, must be same-origin or none. Same-site is insufficient. OPTIONS is
+rejected without CORS permission. Responses have no-store, nosniff, restrictive
+CSP, frame-ancestors none and no-referrer. The capability protects against browser
+cross-origin access/DNS rebinding, not a same-UID local process that can already
+read this user's files. Do not put capabilities in logs or URLs.
+
+The envelope contains serverInstanceId, projectId, snapshotGeneration and data
+or a fixed safe error. Each project has its own monotonically increasing
+snapshotGeneration, advanced only after a successful observation/detail read.
+Errors retain that generation and never claim fresh data. Clients must reject
+stale project/request/generation responses, retain old snapshots with an honest
+last-success time on read failure, and hide old answer text until revalidation.
+At most eight observation jobs may run or wait for a reader; overload is503busy.
+Source reads run off the async reactor and readers are serialized. Errors are
+400bad_project/bad_invocation,403forbidden,404not_found,409registry_full,
+413body_limit,415json_required,503read_failed/busy or500internal; no raw source
+error or submitted path is returned. The service does not claim a live process
+from a last-observed phase. Task state, native terminal and result validity remain
+separate facts; answer counts are not task completion percentages.
+
+ObservationReader::detail_multiline reuses complete-body hash/identity checks
+while preserving safe LF/tab for Markdown. The legacy detail method retains flat
+TUI text. Both refuse previous verified text after source tampering or missing,
+oversized or unsafe files. safe_observation_value recursively redacts credential
+keys and string patterns; all Web data uses this single encoding boundary.
+Returned text is not trusted HTML. The frontend must parse Markdown and enforce
+its own allowed tags/URLs, disable raw HTML and remote images. Consultation
+candidate clipping now reflects only that enumeration, independently of the
+ledger round window and aggregate read-budget diagnostics.
+
+Slow HTTP requests are bounded by a10second handler timeout (408request_timeout).
+Shutdown allows2seconds for graceful connection draining, then drops the owned
+server future so a stalled body cannot hold the foreground service indefinitely.
+
+### Running and reading the WebUI
+
+Build or run the separate `orch-web` binary; it remains outside the default
+`orch` command surface:
+
+```text
+cargo run -p orch-ui --bin orch-web --all-features -- --root /exact/git/root
+orch-web --port 0 --no-open
+```
+
+`--root` defaults to the current directory and must be an exact committed Git
+root. `--port 0` is the safe default. After the listener is ready the process
+prints `OpenOrch Web: http://127.0.0.1:<port>/`; browser-open failure leaves that
+URL usable. `--no-open` is intended for controlled tests and manual browser
+choice. SIGINT or SIGTERM closes only this owned service. Invalid arguments,
+roots or occupied ports fail without leaving a daemon.
+
+The page is fully embedded: no CDN, remote font or runtime package installation.
+Its three views are Tasks, All calls and Members. The task view groups only
+explicit round/task relationships; unassociated Fusion and standalone calls
+remain separate. Text, task, task state, result, member, purpose and time filters
+intersect before grouping. Both task and unassociated sections share the newest
+30-card window; explicit failed/invalid answers move first only inside that
+window. Load-more expands by30. Unknown times remain visible under All and sort
+last. Task state, last observed call phase, native terminal and answer validity
+are displayed independently and never form a completion percentage.
+
+Refresh runs about every2seconds. A failed read keeps the last snapshot with its
+last-success time and error; old answer text stays hidden until the selected
+invocation is revalidated. Server instance, project epoch, request sequence,
+snapshot generation and selected ID reject late replies after project, selection
+or server changes. The reader preserves pixel scroll across accepted refreshes.
+
+Theme supports system/light/dark and language supports Chinese/English. These
+two non-sensitive values use validated host-only cookies so they survive the
+default ephemeral port; no project path, capability or observation data enters
+cookies. Wide/medium/narrow layouts use three/two/one columns, keyboard-visible
+focus, a skip link, Escape/back restoration and reduced-motion handling.
+
+Verified answer text is still untrusted. The pinned local Marked module parses
+it into a detached document; the application then constructs a new DOM fragment
+from an explicit semantic tag set. Raw HTML, SVG/MathML, forms, executable or
+style attributes and images are discarded (image alt text remains plain text).
+Only absolute HTTP/HTTPS links survive, with `noopener noreferrer`; the page
+never loads answer images or other external resources. The bundled Marked
+license is shipped next to the module.
