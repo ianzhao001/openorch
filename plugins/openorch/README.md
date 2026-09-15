@@ -10,7 +10,7 @@ Git projects.
 ## 安装 / Install
 
 下载 [OpenOrch Release](https://github.com/ianzhao001/openorch/releases) 中的完整
-Apple Silicon macOS 插件归档并解压。插件版本为 `0.1.0-alpha.8`，核心版本仍是
+Apple Silicon macOS 插件归档并解压。插件版本为 `0.1.0-alpha.9`，核心版本仍是
 `orch 0.1.0`。源码仓本身不含运行核心，不能代替完整 Release 安装包。
 
 Download and extract the complete Apple Silicon macOS plugin archive. It includes

@@ -6,7 +6,7 @@ OpenOrch connects installed AI harnesses to Codex Desktop and DSH Web through on
 shared skill and a bundled local runtime. Choose your own clients/models, consult
 one or several members, and let the current host synthesize their original answers.
 
-Plugin release: `v0.1.0-alpha.8` · core executable: `orch 0.1.0`.
+Plugin release: `v0.1.0-alpha.9` · core executable: `orch 0.1.0`.
 
 ## 中文
 
@@ -17,7 +17,7 @@ DSH 插件管理还使用其正常的 Node.js/pnpm 环境，并从官方包源�
 完整 Release 包已包含运行核心，使用者不需要 Rust，也不需要任何私有仓库。
 
 ```sh
-release=v0.1.0-alpha.8
+release=v0.1.0-alpha.9
 bundle=openorch-$release-darwin-arm64
 base=https://github.com/ianzhao001/openorch/releases/download/$release
 curl -fLO "$base/$bundle.tar.gz"
