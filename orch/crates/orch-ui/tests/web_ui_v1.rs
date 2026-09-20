@@ -27,6 +27,16 @@ fn js(program: &str) {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+fn app_js(program: &str) {
+    let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web_assets");
+    let source = format!("import assert from 'node:assert/strict';import fs from 'node:fs';const app=fs.readFileSync(process.argv[1]+'/app.mjs','utf8');const fragment=app.slice(app.indexOf('async function request('),app.indexOf('function formatTime')).replace('export function createDetailDeadline','function createDetailDeadline');const build=fetch=>new Function('fetch','Headers','setTimeout','clearTimeout',`const capability='capability';${{fragment}};return {{request,createDetailDeadline}};`)(fetch,Headers,setTimeout,clearTimeout);const make=fetch=>build(fetch).request;{program}");
+    let out = Command::new("node")
+        .args(["--input-type=module", "--eval", &source])
+        .arg(assets)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
 const ROWS: &str = r#"const row=(id,over={})=>({id,source:'consult',summary:'',phase:'prepared',result:'none',alias:'one',driver:'claude',source_time:'2026-09-15T10:00:00Z',...over});"#;
 #[test]
 fn explicit_tasks_keep_round_and_versions() {
@@ -42,6 +52,11 @@ fn fusion_and_unassociated_rows_are_honest() {
 fn filter_then_window_then_failure_priority() {
     js(&(ROWS.to_owned()
         + r#"const task=(i)=>({round:'r1',id:'B'+i,attempt:'A1',head:'h'+i,state:'invoked'});const r=Array.from({length:36},(_,i)=>row(String(i).padStart(2,'0'),{task:i%2?task(i):null,fusion_id:i%2?null:'F'+i,source_time:new Date(Date.UTC(2026,8,15,10,i)).toISOString(),result:i===0?'failed':i===20?'invalid':i===32?'failed':i===33?'none':i===34?'unknown':i===35?'too-large':'verified'}));let p=m.project(r,[],{limit:30});assert.equal(p.cards.length,30);assert.equal(p.cards[0].rows[0].id,'32');assert.equal(p.cards[1].rows[0].id,'20');assert.equal(p.hiddenFailures,1);assert.equal(p.outsideWindow,6);assert(!p.cards.some(c=>c.rows[0].id==='00'));assert.equal(p.sections.tasks.length+p.sections.unassociated.length,30);p=m.project(r,[],{limit:30,result:'failed'});assert.deepEqual(p.cards.map(c=>c.rows[0].id),['32','00']);assert.equal(m.project(r,[],{limit:30,offset:30}).cards.length,6);"#));
+}
+#[test]
+fn historical_capture_gap_stays_in_invalid_filter_without_failure_priority() {
+    js(&(ROWS.to_owned()
+        + r#"const historical=row('historical',{result:'invalid',parameters:{channelDiagnostic:{code:'capture_evidence_missing'}}});const failed=row('failed',{result:'failed',source_time:'2026-09-15T09:00:00Z'});let p=m.project([historical,failed],[],{});assert.equal(m.historicalUnverified(historical),true);assert.equal(p.cards[0].rows[0].id,'failed');assert.equal(p.cards.find(c=>c.rows[0].id==='historical').failed,false);p=m.project([historical,failed],[],{result:'invalid'});assert.deepEqual(p.cards.map(c=>c.rows[0].id),['historical']);assert.equal(p.hiddenFailures,0);"#));
 }
 #[test]
 fn timestamps_offsets_unknown_and_stable_ties() {
@@ -61,7 +76,25 @@ fn filters_are_intersections() {
 #[test]
 fn stale_project_request_and_generation_are_rejected() {
     js(
-        r#"let s=m.initialState('S','P');s=m.beginRefresh(s);const e={serverInstanceId:'S',projectId:'P',snapshotGeneration:4,data:{rows:[{id:'a'}]}};s=m.applySnapshot(s,e,s.epoch,s.lastSeq);assert.equal(s.generation,4);assert.equal(s.snapshot.rows[0].id,'a');const same=m.applySnapshot(s,e,s.epoch,s.lastSeq);assert.deepEqual(same,s);for(const bad of [{...e,projectId:'Q'},{...e,serverInstanceId:'old'},{...e,snapshotGeneration:3}])assert.deepEqual(m.applySnapshot(s,bad,s.epoch,s.lastSeq),s);assert.deepEqual(m.applySnapshot(s,e,s.epoch-1,s.lastSeq),s);assert.deepEqual(m.applySnapshot(s,e,s.epoch,s.lastSeq-1),s);s=m.select(s,'a');s=m.beginDetail(s,'a');assert.equal(s.answer,null);s=m.applyDetail(s,{...e,snapshotGeneration:5,data:{row:{id:'a'},text:'ok'}},s.epoch,s.lastSeq,'a');assert.equal(s.answer,'ok');const changed=m.select(s,'b');assert.equal(m.applyDetail(changed,{...e,snapshotGeneration:6,data:{row:{id:'a'},text:'wrong'}},changed.epoch,changed.lastSeq,'a').answer,null);const pending=m.beginRefresh(s);const failed=m.failRefresh(pending,'read_failed',1234);assert.equal(failed.snapshot.rows[0].id,'a');assert.equal(failed.refreshError,'read_failed');assert.equal(failed.lastSuccessAt,1234);assert.equal(failed.answer,null);"#,
+        r#"let s=m.initialState('S','P');s=m.beginRefresh(s);const e={serverInstanceId:'S',projectId:'P',snapshotGeneration:4,data:{rows:[{id:'a',result:'verified'}]}};s=m.applySnapshot(s,e,s.epoch,s.lastSeq);assert.equal(s.generation,4);assert.equal(s.snapshot.rows[0].id,'a');const same=m.applySnapshot(s,e,s.epoch,s.lastSeq);assert.deepEqual(same,s);for(const bad of [{...e,projectId:'Q'},{...e,serverInstanceId:'old'},{...e,snapshotGeneration:3}])assert.deepEqual(m.applySnapshot(s,bad,s.epoch,s.lastSeq),s);assert.deepEqual(m.applySnapshot(s,e,s.epoch-1,s.lastSeq),s);assert.deepEqual(m.applySnapshot(s,e,s.epoch,s.lastSeq-1),s);s=m.select(s,'a');s=m.beginDetail(s,'a');assert.equal(s.answer,null);s=m.applyDetail(s,{...e,snapshotGeneration:5,data:{row:{id:'a',result:'verified'},text:'ok'}},s.epoch,s.detailSeq,'a');assert.equal(s.answer,'ok');const changed=m.select(s,'b');assert.equal(m.applyDetail(changed,{...e,snapshotGeneration:6,data:{row:{id:'a',result:'verified'},text:'wrong'}},changed.epoch,changed.detailSeq,'a').answer,null);const pending=m.beginRefresh(s);const failed=m.failRefresh(pending,'read_failed',1234);assert.equal(failed.snapshot.rows[0].id,'a');assert.equal(failed.refreshError,'read_failed');assert.equal(failed.lastSuccessAt,1234);assert.equal(failed.answer,'ok');"#,
+    );
+}
+#[test]
+fn request_preserves_error_codes_and_rejects_invalid_json() {
+    app_js(
+        r#"const envelope={serverInstanceId:'S',projectId:'P',snapshotGeneration:1,error:{code:'busy'}};await assert.rejects(make(async()=>({ok:false,status:503,json:async()=>envelope}))('/x'),error=>error.message==='busy'&&error.httpStatus===503&&error.envelope===envelope);for(const body of [null,[],{}, {serverInstanceId:'S',snapshotGeneration:1}]){await assert.rejects(make(async()=>({ok:false,status:503,json:async()=>body}))('/x'),error=>error.message==='invalid_response');await assert.rejects(make(async()=>({ok:true,status:200,json:async()=>body}))('/x'),error=>error.message==='invalid_response');}await assert.rejects(make(async()=>({ok:true,status:200,json:async()=>{throw Error('bad json')}}))('/x'),error=>error.message==='invalid_response'&&error.httpStatus===200);let seen;const controller=new AbortController();const value=await make(async(path,init)=>{seen=init;return{ok:true,status:200,json:async()=>({serverInstanceId:'S',projectId:'P',snapshotGeneration:1,data:'ok'})}})('/x',{signal:controller.signal});assert.equal(value.data,'ok');assert.equal(seen.signal,controller.signal);assert.equal(seen.headers.get('X-Orch-Capability'),'capability');"#,
+    );
+}
+#[test]
+fn current_malformed_detail_settles_but_superseded_detail_is_silent() {
+    js(
+        r#"let s=m.initialState('S','P');s={...s,snapshot:{rows:[{id:'a',result:'verified'}],groups:[]},selected:'a'};s=m.beginDetail(s,'a');const seq=s.detailSeq;const malformed=m.applyDetail(s,{serverInstanceId:'S',projectId:'P',snapshotGeneration:1,data:{}},s.epoch,seq,'a');assert.equal(malformed.detailPending,false);assert.equal(malformed.detailError,'invalid_response');const changed=m.select(s,'b');assert.deepEqual(m.applyDetail(changed,{serverInstanceId:'S',projectId:'P',snapshotGeneration:1,data:{}},changed.epoch,seq,'a'),changed);"#,
+    );
+}
+#[test]
+fn detail_deadline_uses_exact_bound_and_supports_cancellation() {
+    app_js(
+        r#"const api=build(async()=>{});let callback,scheduled,cancelled,aborted=0;const controller={abort(){aborted+=1}};const deadline=api.createDetailDeadline(controller,{schedule(fn,ms){callback=fn;scheduled=ms;return 41},cancel(id){cancelled=id}});assert.equal(scheduled,12000);assert.equal(deadline.timedOut,false);callback();assert.equal(deadline.timedOut,true);assert.equal(aborted,1);deadline.cancel();assert.equal(cancelled,41);deadline.cancel();assert.equal(cancelled,41);"#,
     );
 }
 #[test]
@@ -256,6 +289,8 @@ fn actual_chrome_dom_network_theme_locale_and_viewport_matrix() {
         "markdownDom=pass",
         "overflow=pass",
         "readonly=pass",
+        "readerPolling=delayed-detail-three-refreshes-pass",
+        "diagnostics=historical-neutral-language-width-filter-pass",
     ] {
         assert!(text.contains(proof), "missing {proof}: {text}");
     }

@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -30,9 +30,12 @@ use crate::harness_config::{
 pub(crate) mod managed;
 pub(crate) mod process;
 /// Shared rich-message input and the hidden managed-supervisor entry.
-pub use managed::{MessageInput, MessageSource, ResolvedMessage, resolve_message_input, run_wake_supervisor_from_stdin,
-    run_direct_wake, is_direct_wake, direct_wake_status, cancel_direct_wake,
-    WakeRunOutcome, ManagedWakeStatusView, ManagedWakeCancelDisposition, ManagedWakeCancelResult, AttachMode};
+pub use managed::{
+    cancel_direct_wake, direct_wake_status, is_direct_wake, resolve_message_input, run_direct_wake,
+    run_wake_supervisor_from_stdin, AttachMode, ManagedWakeCancelDisposition,
+    ManagedWakeCancelResult, ManagedWakeStatusView, MessageInput, MessageSource, ResolvedMessage,
+    WakeRunOutcome,
+};
 
 mod completion;
 pub use completion::{classify_driver_failure, ChannelExitReason, DriverFailure};
@@ -51,7 +54,11 @@ type ChannelNfds = u32;
 #[cfg(not(target_os = "macos"))]
 type ChannelNfds = std::os::raw::c_ulong;
 #[repr(C)]
-struct ChannelPollFd { fd: i32, events: i16, revents: i16 }
+struct ChannelPollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
 // Darwin sys/fcntl.h and Linux libc declarations; preserve existing file flags.
 #[cfg(target_os = "macos")]
 const CHANNEL_NONBLOCK: i32 = 4;
@@ -589,6 +596,30 @@ pub fn render_invocation_v1(
     prepared: PreparedInvocation,
     context: InvocationContextV1,
 ) -> Result<RenderedInvocationV1> {
+    render_invocation_inner(prepared, context, None, None)
+}
+
+// Only the trusted finite Fusion caller can forward a captured native config
+// environment. The browser and legacy invocation API cannot provide raw env.
+pub(crate) fn render_native_role_v1(
+    prepared: PreparedInvocation,
+    context: InvocationContextV1,
+    native: &crate::native_discovery::DiscoveryContext,
+    private_root: &Path,
+) -> Result<RenderedInvocationV1> {
+    if prepared.requested().action != InvocationAction::Consult {
+        bail!("native role rendering is Consult-only");
+    }
+    require_canonical_exact_directory(private_root, "native role private root")?;
+    render_invocation_inner(prepared, context, Some(native), Some(private_root))
+}
+
+fn render_invocation_inner(
+    prepared: PreparedInvocation,
+    context: InvocationContextV1,
+    native: Option<&crate::native_discovery::DiscoveryContext>,
+    private_root: Option<&Path>,
+) -> Result<RenderedInvocationV1> {
     validate_context(&prepared, &context)?;
     let mut env = controlled_operational_environment(prepared.driver())?;
     let contract = prepared.driver_contract();
@@ -610,9 +641,50 @@ pub fn render_invocation_v1(
     if let Some(wrapper) = wrapper_path {
         argv.push(path_text(&wrapper, "driver wrapper")?);
         argv.push(prepared.prompt().to_string());
-        render_wrapper_environment(&prepared, &context, &mut env)?;
+        render_wrapper_environment(&prepared, &context, &mut env, native.is_some())?;
     } else {
-        argv.extend(render_direct_arguments(&prepared, &context)?);
+        argv.extend(render_direct_arguments(
+            &prepared,
+            &context,
+            native.is_some(),
+        )?);
+    }
+    if let Some(native) = native {
+        env.insert("ORCH_FUSION_ROLE".into(), "1".into());
+        if !native.home.is_absolute() {
+            bail!("native HOME must be absolute");
+        }
+        env.insert("HOME".into(), path_text(&native.home, "native HOME")?);
+        env.insert(
+            "PATH".into(),
+            std::env::join_paths(&native.search_path)?
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("native PATH must be UTF-8"))?,
+        );
+        let keys: &[&str] = match prepared.driver() {
+            HarnessId::Codex => &["CODEX_HOME"],
+            HarnessId::Claude => &["CLAUDE_CONFIG_DIR"],
+            HarnessId::Pi => &["PI_CODING_AGENT_DIR"],
+            HarnessId::OpenCode | HarnessId::Mimo => &["XDG_CONFIG_HOME"],
+            HarnessId::Dsh => &["DSH_HOME"],
+            HarnessId::ZCode => &["ORCH_ZCODE_CONFIG"],
+            _ => &[],
+        };
+        for key in keys {
+            env.remove(*key);
+            if let Some(value) = native.overrides.get(*key) {
+                env.insert((*key).into(), value.clone());
+            }
+        }
+        if prepared.driver() == HarnessId::ZCode {
+            env.insert(
+                "ORCH_FUSION_PRIVATE_ROOT".into(),
+                path_text(
+                    private_root.context("missing private role root")?,
+                    "private role root",
+                )?,
+            );
+        }
     }
     let command_digest = rendered_command_digest(
         &prepared,
@@ -815,11 +887,21 @@ fn read_channel_capture(file: &File) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn retain_channel_capture(root: &Path, path: PathBuf, file: &File, bytes: &[u8], stream: &str) -> Result<PathBuf> {
+fn retain_channel_capture(
+    root: &Path,
+    path: PathBuf,
+    file: &File,
+    bytes: &[u8],
+    stream: &str,
+) -> Result<PathBuf> {
     let opened = file.metadata()?;
-    if fs::symlink_metadata(&path).is_ok_and(|current|
-        current.is_file() && !current.file_type().is_symlink() && current.nlink() == 1
-        && current.dev() == opened.dev() && current.ino() == opened.ino()) {
+    if fs::symlink_metadata(&path).is_ok_and(|current| {
+        current.is_file()
+            && !current.file_type().is_symlink()
+            && current.nlink() == 1
+            && current.dev() == opened.dev()
+            && current.ino() == opened.ino()
+    }) {
         return Ok(path);
     }
     // A child may replace the pathname with a FIFO/symlink. Preserve the bytes
@@ -864,9 +946,16 @@ struct CaptureDrain {
 impl CaptureDrain {
     fn live(&self) -> bool { !self.eof && !self.read_failed }
 
-    fn drain(&mut self, reader: &mut impl Read, writer: &mut impl Write,
-        label: &str, errors: &mut Vec<String>) -> usize {
-        if !self.live() { return 0; }
+    fn drain(
+        &mut self,
+        reader: &mut impl Read,
+        writer: &mut impl Write,
+        label: &str,
+        errors: &mut Vec<String>,
+    ) -> usize {
+        if !self.live() {
+            return 0;
+        }
         let mut buffer = [0u8; CHANNEL_DRAIN_BUFFER_BYTES];
         let mut serviced = 0;
         // Also bound repeated EINTR without consuming any bytes.
@@ -906,8 +995,18 @@ impl CaptureDrain {
 
 fn poll_capture(stdout: i32, stderr: i32, wait: Duration) -> std::io::Result<()> {
     // Negative descriptors are absent from the active poll set (EOF/error streams).
-    let mut fds = [ChannelPollFd { fd: stdout, events: 1, revents: 0 },
-        ChannelPollFd { fd: stderr, events: 1, revents: 0 }];
+    let mut fds = [
+        ChannelPollFd {
+            fd: stdout,
+            events: 1,
+            revents: 0,
+        },
+        ChannelPollFd {
+            fd: stderr,
+            events: 1,
+            revents: 0,
+        },
+    ];
     let millis = wait.as_millis().min(50) as i32;
     // SAFETY: repr(C) layout matches pollfd; count is the platform's nfds_t.
     let result = unsafe { poll(fds.as_mut_ptr(), 2 as ChannelNfds, millis) };
@@ -1017,10 +1116,23 @@ impl ChannelExecution {
 
 // Keep the real native-observation call coupled to the independently tested
 // capture contract, rather than accepting group-empty as stream closure.
-pub(crate) fn inspect_smartclaw_capture(root: &Path, database: &Path, session: &str,
-    cwd: &Path, prompt_sha: &str, output: &ChannelExecution) -> Result<serde_json::Value> {
-    smartclaw::inspect_native_final(root, database, session, cwd, prompt_sha,
-        &output.stdout, output.capture_complete())
+pub(crate) fn inspect_smartclaw_capture(
+    root: &Path,
+    database: &Path,
+    session: &str,
+    cwd: &Path,
+    prompt_sha: &str,
+    output: &ChannelExecution,
+) -> Result<serde_json::Value> {
+    smartclaw::inspect_native_final(
+        root,
+        database,
+        session,
+        cwd,
+        prompt_sha,
+        &output.stdout,
+        output.capture_complete(),
+    )
 }
 
 #[derive(Default)]
@@ -1053,7 +1165,12 @@ impl FirstFrameObservation {
     }
 }
 
-fn observe_phase(observer: &mut dyn FnMut(&str, Option<u32>) -> Result<()>, phase: &str, pid: Option<u32>, errors: &mut Vec<String>) {
+fn observe_phase(
+    observer: &mut dyn FnMut(&str, Option<u32>) -> Result<()>,
+    phase: &str,
+    pid: Option<u32>,
+    errors: &mut Vec<String>,
+) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(phase, pid)));
     if !matches!(result, Ok(Ok(()))) && errors.len() < 8 {
         // No raw observer errors: paths and user data must not leak here.
@@ -1065,12 +1182,17 @@ fn observe_phase(observer: &mut dyn FnMut(&str, Option<u32>) -> Result<()>, phas
 ///
 /// This synchronous primitive is used by consultation and tests. Managed wake
 /// custody consumes the same preflighted argv/env/cwd through its supervisor.
-pub fn run_preflighted_invocation_v1(invocation: PreflightedInvocationV1) -> Result<ChannelExecution> {
+pub fn run_preflighted_invocation_v1(
+    invocation: PreflightedInvocationV1,
+) -> Result<ChannelExecution> {
     run_preflighted_observed(invocation, &mut |_, _| Ok(()))
 }
 
 // The observer receives only a past phase and PID, never process custody.
-pub(crate) fn run_preflighted_observed(invocation: PreflightedInvocationV1, observer: &mut dyn FnMut(&str, Option<u32>) -> Result<()>) -> Result<ChannelExecution> {
+pub(crate) fn run_preflighted_observed(
+    invocation: PreflightedInvocationV1,
+    observer: &mut dyn FnMut(&str, Option<u32>) -> Result<()>,
+) -> Result<ChannelExecution> {
     let mut phase_observation_v1 = Vec::new();
     observe_phase(observer, "entered", None, &mut phase_observation_v1);
     let rendered = invocation.rendered;
@@ -1086,8 +1208,13 @@ pub(crate) fn run_preflighted_observed(invocation: PreflightedInvocationV1, obse
     // No child-wide file limit: only parent-owned capture writes are bounded.
     // Existing inherited user limits and native database locations are untouched.
     let started = Instant::now();
-    let mut child = match command.spawn().with_context(|| format!("spawn unified harness driver 失败: alias={} driver={}",
-        rendered.prepared.alias(), rendered.prepared.driver().as_str())) {
+    let mut child = match command.spawn().with_context(|| {
+        format!(
+            "spawn unified harness driver 失败: alias={} driver={}",
+            rendered.prepared.alias(),
+            rendered.prepared.driver().as_str()
+        )
+    }) {
         Ok(child) => child,
         Err(error) => {
             let _ = fs::remove_file(&stdout_path); let _ = fs::remove_file(&stderr_path);
@@ -1095,15 +1222,22 @@ pub(crate) fn run_preflighted_observed(invocation: PreflightedInvocationV1, obse
         }
     };
     drop(command);
-    observe_phase(observer, "spawned", Some(child.id()), &mut phase_observation_v1);
+    observe_phase(
+        observer,
+        "spawned",
+        Some(child.id()),
+        &mut phase_observation_v1,
+    );
     // Stdio::piped guarantees both handles. Do not return early after spawn on
     // setup/observation errors: retain custody and the same bounded deadline.
     let mut stdout_pipe = child.stdout.take().expect("requested stdout pipe");
     let mut stderr_pipe = child.stderr.take().expect("requested stderr pipe");
     let mut out = CaptureDrain::default(); let mut err = CaptureDrain::default();
     let mut errors = Vec::new();
-    for (fd, label, state) in [(stdout_pipe.as_raw_fd(), "stdout", &mut out),
-        (stderr_pipe.as_raw_fd(), "stderr", &mut err)] {
+    for (fd, label, state) in [
+        (stdout_pipe.as_raw_fd(), "stdout", &mut out),
+        (stderr_pipe.as_raw_fd(), "stderr", &mut err),
+    ] {
         if let Err(error) = channel_nonblocking(fd) {
             state.read_failed = true; // Never risk a blocking read after failed setup.
             errors.push(format!("{label} nonblocking setup failed: {error}"));
@@ -1146,11 +1280,21 @@ pub(crate) fn run_preflighted_observed(invocation: PreflightedInvocationV1, obse
         if group_terminated && status.is_some() {
             if out.eof && err.eof { break; }
             // Empty group is not EOF: an escaped writer can still own a pipe.
-            let limit = *eof_end.get_or_insert_with(|| (now + CHANNEL_EOF_GRACE).min(cleanup_end.unwrap_or(action_end)));
-            if now >= limit { break; }
+            let limit = *eof_end.get_or_insert_with(|| {
+                (now + CHANNEL_EOF_GRACE).min(cleanup_end.unwrap_or(action_end))
+            });
+            if now >= limit {
+                break;
+            }
             until = limit;
         } else if let Some(limit) = cleanup_end {
-            if now >= limit { errors.push("owned process scope remains unclosed after bounded deadline cleanup; HOLD".into()); break; }
+            if now >= limit {
+                errors.push(
+                    "owned process scope remains unclosed after bounded deadline cleanup; HOLD"
+                        .into(),
+                );
+                break;
+            }
             until = limit;
         } else if now >= action_end {
             reason = ChannelExitReason::HardDeadline;
@@ -1161,16 +1305,35 @@ pub(crate) fn run_preflighted_observed(invocation: PreflightedInvocationV1, obse
                     cleanup_end = Some(Instant::now() + CHANNEL_EOF_GRACE);
                     continue; // Reap and final-drain in this very same loop.
                 }
-                errors.push(format!("owned deadline cancellation failed: {}", std::io::Error::last_os_error()));
-            } else { errors.push("hard deadline reached without current leader ownership proof; HOLD".into()); }
+                errors.push(format!(
+                    "owned deadline cancellation failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            } else {
+                errors.push(
+                    "hard deadline reached without current leader ownership proof; HOLD".into(),
+                );
+            }
             break;
         } else { until = action_end; }
         let wait = until.saturating_duration_since(Instant::now()).min(Duration::from_millis(50));
         if poll_failed {
             std::thread::sleep(wait); // Bounded fallback, with both nonblocking drains above.
-        } else if let Err(error) = poll_capture(if out.live() {stdout_pipe.as_raw_fd()} else {-1},
-            if err.live() {stderr_pipe.as_raw_fd()} else {-1}, wait) {
-            errors.push(format!("capture poll failed: {error}")); poll_failed = true;
+        } else if let Err(error) = poll_capture(
+            if out.live() {
+                stdout_pipe.as_raw_fd()
+            } else {
+                -1
+            },
+            if err.live() {
+                stderr_pipe.as_raw_fd()
+            } else {
+                -1
+            },
+            wait,
+        ) {
+            errors.push(format!("capture poll failed: {error}"));
+            poll_failed = true;
         }
     }
     if out.overflow { errors.push("stdout capture overflow beyond 64 MiB".into()); }
@@ -1186,11 +1349,31 @@ pub(crate) fn run_preflighted_observed(invocation: PreflightedInvocationV1, obse
     let stderr = read_channel_capture(&stderr_file).unwrap_or_else(|error| {
         errors.push(format!("stderr final capture failed: {error:#}")); Vec::new()
     });
-    let stdout_capture_path = retain_channel_capture(rendered.prepared.project_root(), stdout_path,
-        &stdout_file, &stdout, "stdout-recovered").map_err(|error| {errors.push(format!("stdout preservation failed: {error:#}"));}).ok();
-    let stderr_capture_path = retain_channel_capture(rendered.prepared.project_root(), stderr_path,
-        &stderr_file, &stderr, "stderr-recovered").map_err(|error| {errors.push(format!("stderr preservation failed: {error:#}"));}).ok();
-    if !errors.is_empty() && reason == ChannelExitReason::Exited { reason = ChannelExitReason::ObservationFailed; }
+    let stdout_capture_path = retain_channel_capture(
+        rendered.prepared.project_root(),
+        stdout_path,
+        &stdout_file,
+        &stdout,
+        "stdout-recovered",
+    )
+    .map_err(|error| {
+        errors.push(format!("stdout preservation failed: {error:#}"));
+    })
+    .ok();
+    let stderr_capture_path = retain_channel_capture(
+        rendered.prepared.project_root(),
+        stderr_path,
+        &stderr_file,
+        &stderr,
+        "stderr-recovered",
+    )
+    .map_err(|error| {
+        errors.push(format!("stderr preservation failed: {error:#}"));
+    })
+    .ok();
+    if !errors.is_empty() && reason == ChannelExitReason::Exited {
+        reason = ChannelExitReason::ObservationFailed;
+    }
     let mut output = ChannelExecution {
         process_id: child.id(), status, stdout, stderr, reason, hard_deadline_secs: rendered.context.deadline_secs,
         first_frame_after_millis: frame.at_millis, leader_exited_after_millis: leader_exited,
@@ -1204,11 +1387,22 @@ pub(crate) fn run_preflighted_observed(invocation: PreflightedInvocationV1, obse
         let session = format!("orch-wake-{}", rendered.context.wake_id);
         let prompt_sha = hex::encode(Sha256::digest(rendered.prepared.prompt().as_bytes()));
         let database = smartclaw::database_from_environment(&rendered.env);
-        output.native_final = Some(match database {
-            Some(database) => inspect_smartclaw_capture(rendered.prepared.project_root(), &database,
-                &session, rendered.prepared.cwd(), &prompt_sha, &output),
-            None => Err(anyhow::anyhow!("captured HOME is unavailable for native observation")),
-        }.unwrap_or_else(|error| smartclaw::unavailable(&format!("{error:#}"))));
+        output.native_final = Some(
+            match database {
+                Some(database) => inspect_smartclaw_capture(
+                    rendered.prepared.project_root(),
+                    &database,
+                    &session,
+                    rendered.prepared.cwd(),
+                    &prompt_sha,
+                    &output,
+                ),
+                None => Err(anyhow::anyhow!(
+                    "captured HOME is unavailable for native observation"
+                )),
+            }
+            .unwrap_or_else(|error| smartclaw::unavailable(&format!("{error:#}"))),
+        );
     }
     Ok(output)
 }
@@ -1302,17 +1496,29 @@ fn resolve_code_owned_wrapper(root: &Path, wrapper: &str) -> Result<PathBuf> {
         // distributions may place the unchanged wrapper beside the binary;
         // source builds use their own compile-time checkout.
         let expected: &[u8] = match wrapper {
-            "coordination/scripts/wake-multica.sh" => include_bytes!("../../../../coordination/scripts/wake-multica.sh"),
-            "orch/scripts/wake-dsh-stream.sh" => include_bytes!("../../../scripts/wake-dsh-stream.sh"),
-            "orch/scripts/wake-pi-stream.sh" => include_bytes!("../../../scripts/wake-pi-stream.sh"),
-            "orch/scripts/wake-zcode-stream.sh" => include_bytes!("../../../scripts/wake-zcode-stream.sh"),
+            "coordination/scripts/wake-multica.sh" => {
+                include_bytes!("../../../../coordination/scripts/wake-multica.sh")
+            }
+            "orch/scripts/wake-dsh-stream.sh" => {
+                include_bytes!("../../../scripts/wake-dsh-stream.sh")
+            }
+            "orch/scripts/wake-pi-stream.sh" => {
+                include_bytes!("../../../scripts/wake-pi-stream.sh")
+            }
+            "orch/scripts/wake-zcode-stream.sh" => {
+                include_bytes!("../../../scripts/wake-zcode-stream.sh")
+            }
             _ => bail!("unknown code-owned wrapper asset {wrapper}"),
         };
         let source_root = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")).ok();
         let executable = std::env::current_exe()?;
         let mut candidates = source_root.into_iter().map(|root| root.join(relative)).collect::<Vec<_>>();
         if let Some(parent) = executable.parent() {
-            candidates.push(parent.join("scripts").join(relative.file_name().context("wrapper basename missing")?));
+            candidates.push(
+                parent
+                    .join("scripts")
+                    .join(relative.file_name().context("wrapper basename missing")?),
+            );
         }
         for candidate in candidates {
             if fs::symlink_metadata(&candidate).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) { continue; }
@@ -1341,6 +1547,7 @@ fn render_wrapper_environment(
     prepared: &PreparedInvocation,
     context: &InvocationContextV1,
     env: &mut BTreeMap<String, String>,
+    native_role: bool,
 ) -> Result<()> {
     let role = match prepared.requested().action {
         InvocationAction::Execute => "implement",
@@ -1420,6 +1627,9 @@ fn render_wrapper_environment(
                     Some("headless") => {
                         env.insert("ORCH_DSH_PROFILE".to_string(), "headless".to_string());
                     }
+                    Some(other) if native_role => {
+                        env.insert("ORCH_DSH_PROFILE".into(), other.to_owned());
+                    }
                     Some(other) => bail!("dsh mode {other:?} 未建模"),
                     None => {}
                 }
@@ -1448,7 +1658,11 @@ fn render_wrapper_environment(
     Ok(())
 }
 
-fn render_direct_arguments(prepared: &PreparedInvocation, context: &InvocationContextV1) -> Result<Vec<String>> {
+fn render_direct_arguments(
+    prepared: &PreparedInvocation,
+    context: &InvocationContextV1,
+    native_role: bool,
+) -> Result<Vec<String>> {
     let tuple = prepared.effective();
     let prompt = prepared.prompt().to_string();
     let cwd = path_text(prepared.cwd(), "invocation cwd")?;
@@ -1466,6 +1680,9 @@ fn render_direct_arguments(prepared: &PreparedInvocation, context: &InvocationCo
                 Some("pure") => args.push("--pure".to_string()),
                 Some(other) => bail!("opencode mode {other:?} 未建模"),
                 None => {}
+            }
+            if native_role {
+                args.extend(["--agent".into(), "plan".into()]);
             }
             args.extend(["--dir".to_string(), cwd]);
             Ok(args)
@@ -1486,7 +1703,7 @@ fn render_direct_arguments(prepared: &PreparedInvocation, context: &InvocationCo
             if let Some(effort) = tuple.effort.as_deref() {
                 args.extend([
                     "-c".to_string(),
-                    format!("model_reasoning_effort=\"{effort}\""),
+                    format!("model_reasoning_effort={}", serde_json::to_string(effort)?),
                 ]);
             }
             match tuple.mode.as_deref() {
@@ -1503,11 +1720,20 @@ fn render_direct_arguments(prepared: &PreparedInvocation, context: &InvocationCo
                     prepared.project_root().display()
                 ),
             ]);
+            if native_role {
+                args.extend([
+                    "--sandbox".into(),
+                    "read-only".into(),
+                    "-c".into(),
+                    "approval_policy=\"never\"".into(),
+                ]);
+            }
             Ok(args)
         }
         HarnessId::Claude => {
             if tuple.provider.is_some()
-                || !matches!(tuple.mode.as_deref(), None | Some("auto"))
+                || (native_role && !matches!(tuple.mode.as_deref(), None | Some("plan")))
+                || (!native_role && !matches!(tuple.mode.as_deref(), None | Some("auto")))
             {
                 bail!("claude provider/mode pin 未建模；不得静默忽略");
             }
@@ -1525,7 +1751,15 @@ fn render_direct_arguments(prepared: &PreparedInvocation, context: &InvocationCo
                 "stream-json".to_string(),
                 "--verbose".to_string(),
             ]);
-            if tuple.mode.as_deref() == Some("auto") {
+            if native_role {
+                args.extend([
+                    "--permission-mode".into(),
+                    "plan".into(),
+                    "--tools".into(),
+                    "Read,Glob,Grep".into(),
+                    "--strict-mcp-config".into(),
+                ]);
+            } else if tuple.mode.as_deref() == Some("auto") {
                 args.extend(["--permission-mode".to_string(), "auto".to_string()]);
             } else {
                 args.push("--dangerously-skip-permissions".to_string());
@@ -1533,14 +1767,35 @@ fn render_direct_arguments(prepared: &PreparedInvocation, context: &InvocationCo
             Ok(args)
         }
         HarnessId::Cursor => {
-            require_empty_tuple(prepared)?;
-            Ok(vec![
-                "-p".to_string(),
-                prompt,
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--force".to_string(),
-            ])
+            if native_role {
+                if tuple.provider.is_some()
+                    || tuple.effort.is_some()
+                    || !matches!(tuple.mode.as_deref(), None | Some("ask") | Some("plan"))
+                {
+                    bail!("cursor accepts an opaque model ID and ask/plan mode, not separate provider/effort pins");
+                }
+                let mut args = vec![
+                    "-p".into(),
+                    prompt,
+                    "--output-format".into(),
+                    "stream-json".into(),
+                    "--mode".into(),
+                    tuple.mode.clone().unwrap_or_else(|| "ask".into()),
+                ];
+                if let Some(model) = &tuple.model {
+                    args.extend(["--model".into(), model.clone()]);
+                }
+                Ok(args)
+            } else {
+                require_empty_tuple(prepared)?;
+                Ok(vec![
+                    "-p".into(),
+                    prompt,
+                    "--output-format".into(),
+                    "stream-json".into(),
+                    "--force".into(),
+                ])
+            }
         }
         HarnessId::Mimo => {
             if tuple.provider.is_some() {
@@ -1559,15 +1814,19 @@ fn render_direct_arguments(prepared: &PreparedInvocation, context: &InvocationCo
                 Some(other) => bail!("mimo mode {other:?} 未建模"),
                 None => {}
             }
-            args.extend([
-                "--dangerously-skip-permissions".to_string(),
-                "--dir".to_string(),
-                cwd,
-            ]);
+            if native_role {
+                args.extend(["--agent".into(), "plan".into()]);
+            } else {
+                args.push("--dangerously-skip-permissions".into());
+            }
+            args.extend(["--dir".into(), cwd]);
             Ok(args)
         }
         HarnessId::CodeBuddy => {
-            if tuple.provider.is_some() || tuple.mode.is_some() {
+            if tuple.provider.is_some()
+                || (native_role && !matches!(tuple.mode.as_deref(), None | Some("plan")))
+                || (!native_role && tuple.mode.is_some())
+            {
                 bail!("codebuddy provider/mode pin 未建模；不得静默忽略");
             }
             let mut args = vec!["-p".to_string(), prompt];
@@ -1577,11 +1836,18 @@ fn render_direct_arguments(prepared: &PreparedInvocation, context: &InvocationCo
             if let Some(effort) = tuple.effort.as_deref() {
                 args.extend(["--effort".to_string(), effort.to_string()]);
             }
-            args.extend([
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-            ]);
+            args.extend(["--output-format".into(), "stream-json".into()]);
+            if native_role {
+                args.extend([
+                    "--permission-mode".into(),
+                    "plan".into(),
+                    "--tools".into(),
+                    "Read,Glob,Grep".into(),
+                    "--strict-mcp-config".into(),
+                ]);
+            } else {
+                args.push("--dangerously-skip-permissions".into());
+            }
             Ok(args)
         }
         HarnessId::Agy => {
@@ -1595,8 +1861,12 @@ fn render_direct_arguments(prepared: &PreparedInvocation, context: &InvocationCo
             }
             // The CLI has its own print wait. Carry the already-selected
             // deadline instead of silently retaining a shorter client default.
-            let mut args = vec!["-p".to_string(), prompt, "--print-timeout".to_string(),
-                format!("{}s", context.deadline_secs)];
+            let mut args = vec![
+                "-p".to_string(),
+                prompt,
+                "--print-timeout".to_string(),
+                format!("{}s", context.deadline_secs),
+            ];
             if let Some(model) = tuple.model.as_deref() {
                 args.extend(["--model".to_string(), model.to_string()]);
             }
@@ -2183,11 +2453,12 @@ pub fn with_capacity_lock<T>(root: &Path, action: impl FnOnce() -> Result<T>) ->
     action()
 }
 
-
 #[cfg(test)]
 mod capture_drain_contract_tests {
     use super::*;
-    struct AlwaysReadable { bytes: usize }
+    struct AlwaysReadable {
+        bytes: usize,
+    }
     impl Read for AlwaysReadable {
         fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
             out.fill(b'x'); self.bytes += out.len(); Ok(out.len())
@@ -2231,17 +2502,87 @@ mod phase_observation_tests {
     use std::os::unix::fs::PermissionsExt;
     #[test]
     fn phase_failure_and_panic_preserve_real_child_capture_and_validity() {
-        for panic_observer in [false,true] {
-            let root=crate::util::test_scratch_dir("phase-observer-custody");
-            fs::write(root.join("tracked"),"base").unwrap();
-            for args in [vec!["init","-q"],vec!["add","tracked"],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-qm","base"]]{assert!(Command::new("git").arg("-C").arg(&root).args(args).status().unwrap().success());}
-            let head=crate::gitx::rev_parse(&root,"HEAD").unwrap();let exe=root.join("provider");fs::write(&exe,"#!/bin/sh\nprintf '%s' complete\n").unwrap();fs::set_permissions(&exe,fs::Permissions::from_mode(0o755)).unwrap();
+        for panic_observer in [false, true] {
+            let root = crate::util::test_scratch_dir("phase-observer-custody");
+            fs::write(root.join("tracked"), "base").unwrap();
+            for args in [
+                vec!["init", "-q"],
+                vec!["add", "tracked"],
+                vec![
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "-qm",
+                    "base",
+                ],
+            ] {
+                assert!(Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            let head = crate::gitx::rev_parse(&root, "HEAD").unwrap();
+            let exe = root.join("provider");
+            fs::write(&exe, "#!/bin/sh\nprintf '%s' complete\n").unwrap();
+            fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
             let config=format!("version: 1\nharnesses:\n  fixture:\n    driver: opencode\n    executable: {}\n    enabled: true\n    cwdPolicy: project-root\n",exe.display());
-            let snapshot=crate::harness_config::parse_harness_config_snapshot(&root.join(".orch/harnesses.yaml"),&config).unwrap();
-            let prepared=prepare_invocation(&snapshot,InvocationRequest{alias:"fixture".into(),action:InvocationAction::Consult,prompt:"fixture".into(),project_root:root.clone(),target_worktree:root.clone(),target_head:head,attachments:capture_attachment_manifest_v1(&[]).unwrap()}).unwrap();
-            let rendered=render_invocation_v1(prepared,InvocationContextV1{action_id:"phase-fixture".into(),wake_id:"phase-fixture".into(),round:"manual".into(),task_id:"CONSULT".into(),attempt_id:"CONSULT-A0000".into(),review_output:None,orch_executable:exe,deadline_secs:5}).unwrap();
-            let mut seen=Vec::new();let output=run_preflighted_observed(preflight_invocation_v1(rendered).unwrap(),&mut |phase,pid|{seen.push((phase.to_owned(),pid));if panic_observer{panic!("fixture observer panic")}else{bail!("fixture observer failure")}}).unwrap();
-            assert_eq!(seen[0],("entered".into(),None));assert_eq!(seen[1],("spawned".into(),Some(output.process_id)));assert_eq!(output.stdout,b"complete");assert!(output.success()&&output.capture_complete());assert!(output.observation_errors.is_empty());assert_eq!(output.phase_observation_v1.len(),2);assert_eq!(output.reason,ChannelExitReason::Exited);
+            let snapshot = crate::harness_config::parse_harness_config_snapshot(
+                &root.join(".orch/harnesses.yaml"),
+                &config,
+            )
+            .unwrap();
+            let prepared = prepare_invocation(
+                &snapshot,
+                InvocationRequest {
+                    alias: "fixture".into(),
+                    action: InvocationAction::Consult,
+                    prompt: "fixture".into(),
+                    project_root: root.clone(),
+                    target_worktree: root.clone(),
+                    target_head: head,
+                    attachments: capture_attachment_manifest_v1(&[]).unwrap(),
+                },
+            )
+            .unwrap();
+            let rendered = render_invocation_v1(
+                prepared,
+                InvocationContextV1 {
+                    action_id: "phase-fixture".into(),
+                    wake_id: "phase-fixture".into(),
+                    round: "manual".into(),
+                    task_id: "CONSULT".into(),
+                    attempt_id: "CONSULT-A0000".into(),
+                    review_output: None,
+                    orch_executable: exe,
+                    deadline_secs: 5,
+                },
+            )
+            .unwrap();
+            let mut seen = Vec::new();
+            let output = run_preflighted_observed(
+                preflight_invocation_v1(rendered).unwrap(),
+                &mut |phase, pid| {
+                    seen.push((phase.to_owned(), pid));
+                    if panic_observer {
+                        panic!("fixture observer panic")
+                    } else {
+                        bail!("fixture observer failure")
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(seen[0], ("entered".into(), None));
+            assert_eq!(seen[1], ("spawned".into(), Some(output.process_id)));
+            assert_eq!(output.stdout, b"complete");
+            assert!(output.success() && output.capture_complete());
+            assert!(output.observation_errors.is_empty());
+            assert_eq!(output.phase_observation_v1.len(), 2);
+            assert_eq!(output.reason, ChannelExitReason::Exited);
             fs::remove_dir_all(root).unwrap();
         }
     }

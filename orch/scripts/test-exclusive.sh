@@ -59,3 +59,6 @@ run_exact orch-host --test manual_retirement_safety_v1 manual_lifecycle_wal_and_
 
 # One default-product invocation: exact tree plus the narrow standalone safety cases.
 "$cargo_bin" test -p orch-cli --no-default-features --locked --manifest-path orch/Cargo.toml --test feature_command_surface_v1 --test standalone_channel_v1
+
+# Keep default host unit tests buildable independently of selfhost feature unification.
+"$cargo_bin" test -p orch-host --lib --no-default-features --locked --manifest-path orch/Cargo.toml

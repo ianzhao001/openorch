@@ -10,7 +10,7 @@
 //! （`rev-parse --show-toplevel` == canonical root 且 `HEAD^{commit}` 可解析），
 //! 再写 gitignored `.orch/harnesses.yaml`（code-owned `opencode` driver +
 //! `cwdPolicy: project-root`，绝不声明 raw argv/env），fake provider 打印
-//! opencode 形状 JSONL 后短暂存活以完成 managed supervisor 握手。
+//! opencode 形状 JSONL 后保持存活以完成 managed supervisor 握手。
 //! WakeIssued 仍落 messageSource/messageBytes，绝不调用真实模型 CLI。
 //! nudge/冲突输入/副作用前拒绝用例保留 tracked `agents.yaml` legacy 夹具。
 
@@ -156,9 +156,10 @@ fn init_fixture_git(root: &Path) {
 }
 
 /// B321 rev3：unified channel 只接受 gitignored `.orch/harnesses.yaml` 的
-/// code-owned driver 配置。fake provider 输出 opencode 形状 JSONL 并短暂
-/// 存活（`/bin/sleep 2`），让 managed wake supervisor 的 OFFER→ACCEPT→
-/// ACCEPTED 握手完成；绝不声明 raw argv/env，绝不调用真实模型 CLI。
+/// code-owned driver 配置。fake provider 输出 opencode 形状 JSONL 后保持
+/// 存活（`/bin/sleep 8`），覆盖 supervisor 的 5 秒 OFFER 和 2 秒 ACCEPTED
+/// 最长窗口，让 OFFER→ACCEPT→ACCEPTED 握手完成；绝不声明 raw argv/env，
+/// 绝不调用真实模型 CLI。
 /// 必须在 [init_fixture_git] 的 commit 之后调用：`.orch/harnesses.yaml`
 /// 被 fixture `.gitignore` 覆盖，config 字节永不入 git。
 fn write_fake_harness(root: &Path, alias: &str) {
@@ -168,7 +169,7 @@ fn write_fake_harness(root: &Path, alias: &str) {
     let executable = local.join("fake-provider.sh");
     fs::write(
         &executable,
-        b"#!/bin/sh\nprintf '%s\\n' '{\"type\":\"step_start\",\"sessionID\":\"session-alpha\",\"part\":{\"type\":\"step-start\",\"modelID\":\"model-a\"}}'\nprintf '%s\\n' '{\"type\":\"text\",\"part\":{\"text\":\"done\"}}'\nprintf '%s\\n' '{\"type\":\"step_finish\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}'\n/bin/sleep 2\n",
+        b"#!/bin/sh\nprintf '%s\\n' '{\"type\":\"step_start\",\"sessionID\":\"session-alpha\",\"part\":{\"type\":\"step-start\",\"modelID\":\"model-a\"}}'\nprintf '%s\\n' '{\"type\":\"text\",\"part\":{\"text\":\"done\"}}'\nprintf '%s\\n' '{\"type\":\"step_finish\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}'\n/bin/sleep 8\n",
     )
     .unwrap();
     let mut permissions = fs::metadata(&executable).unwrap().permissions();

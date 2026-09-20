@@ -6,6 +6,18 @@ This file records the public OpenOrch release line. Internal selfhost rounds, ta
 
 ## 中文
 
+### [v0.1.0-alpha.10](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.10) — 2026-09-20
+
+- 新增本机 Native Discovery 与 WebUI 显式、有限的 Fusion；固定问题、HEAD、角色和原生配置快照。
+- 详情读取不再被后台轮询打断，提供独立取消与 12 秒浏览器超时。
+- 保守展示历史证据不完整与未知终态；OpenCode 只读就绪检查及同通道启动间隔保护。
+- 保留 alpha.9 的 DSH 包清单修复，统一公开文档、支持范围和插件版本；默认核心仍为六叶命令。
+
+### [v0.1.0-alpha.9](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.9) — 2026-09-16
+
+- 将 AGENTS.md 纳入 DSH 包清单，使原生安装可以物化并核验完整插件；产品核心与 alpha.8 相同。
+
+
 ### [v0.1.0-alpha.8](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.8) — 2026-09-16
 
 本版在 r89 的只读终端观察面板基础上，新增本机 loopback-only WebUI；默认 CLI、手动 selfhost 和插件调用边界保持不变。
@@ -114,6 +126,18 @@ OpenOrch 现在提供 Codex Desktop 与 DSH Web 共用的插件包。核心版�
 ---
 
 ## English
+
+### [v0.1.0-alpha.10](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.10) — 2026-09-20
+
+- Add local Native Discovery and explicit finite Web Fusion with fixed questions, HEAD, roles and native settings.
+- Keep detail reads independent of polling, with cancellation and a 12-second browser timeout.
+- Preserve historical-unverified/unknown terminal diagnostics; check OpenCode readiness and space same-driver launches.
+- Retain the alpha.9 DSH package fix and align public documentation, capabilities and plugin versions. The core still exposes six default leaf commands.
+
+### [v0.1.0-alpha.9](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.9) — 2026-09-16
+
+- Include AGENTS.md in the DSH package inventory so native installation can materialize and verify the complete plugin. Core behavior matches alpha.8.
+
 
 ### [v0.1.0-alpha.8](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.8) — 2026-09-16
 

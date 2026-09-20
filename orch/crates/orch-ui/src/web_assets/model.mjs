@@ -1,6 +1,14 @@
 const FAILURE_RESULTS = new Set(["failed", "invalid"]);
 const RESULT_VALUES = new Set(["none", "verified", "invalid", "failed", "unknown", "too-large"]);
 
+export function historicalUnverified(row) {
+  return row?.result === "invalid" && row?.parameters?.channelDiagnostic?.code === "capture_evidence_missing";
+}
+
+function needsAttention(row) {
+  return FAILURE_RESULTS.has(row?.result) && !historicalUnverified(row);
+}
+
 function strictTime(value) {
   if (typeof value !== "string") return null;
   const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(value);
@@ -74,7 +82,7 @@ function cardFrom(key, kind, rows, group = null) {
     task: latestTask,
     taskState: latestTask?.state ?? null,
     mixed: states.length > 1,
-    failed: sortedRows.some(row => FAILURE_RESULTS.has(row.result)),
+    failed: sortedRows.some(needsAttention),
     time: times.length ? Math.max(...times) : null,
     member: kind === "member" ? memberKey(sortedRows[0]) : null,
   };
@@ -143,38 +151,67 @@ export function project(rows = [], groups = [], options = {}) {
 }
 
 export function initialState(server, project) {
-  return { server, project, epoch: 0, lastSeq: 0, generation: 0, snapshot: null, selected: null, answer: null, refreshError: null, lastSuccessAt: null };
+  return { server, project, epoch: 0, lastSeq: 0, snapshotSeq: 0, detailSeq: 0, generation: 0, snapshot: null, selected: null, answer: null, detailPending: false, detailError: null, refreshError: null, lastSuccessAt: null };
 }
 
 export function beginRefresh(state) {
-  return { ...state, lastSeq: state.lastSeq + 1, answer: null, refreshError: null };
+  const snapshotSeq = state.snapshotSeq + 1;
+  return { ...state, lastSeq: snapshotSeq, snapshotSeq, refreshError: null };
 }
 
 export function isCurrentResponse(state, envelope, epoch, sequence) {
-  return envelope?.serverInstanceId === state.server && envelope?.projectId === state.project && epoch === state.epoch && sequence === state.lastSeq && Number(envelope.snapshotGeneration) >= state.generation;
+  return envelope?.serverInstanceId === state.server && envelope?.projectId === state.project && epoch === state.epoch && sequence === state.snapshotSeq && Number(envelope.snapshotGeneration) >= state.generation;
 }
 
 export function applySnapshot(state, envelope, epoch, sequence) {
   if (!isCurrentResponse(state, envelope, epoch, sequence)) return state;
   if (Number(envelope.snapshotGeneration) === state.generation && state.snapshot !== null) return state;
-  return { ...state, generation: Number(envelope.snapshotGeneration), snapshot: envelope.data, refreshError: null, lastSuccessAt: Date.now(), answer: null };
+  const selected = envelope.data?.rows?.find(row => row.id === state.selected);
+  const stillVerified = !state.selected || selected?.result === "verified";
+  return {
+    ...state,
+    generation: Number(envelope.snapshotGeneration),
+    snapshot: envelope.data,
+    refreshError: null,
+    lastSuccessAt: Date.now(),
+    answer: stillVerified ? state.answer : null,
+    detailPending: stillVerified ? state.detailPending : false,
+    detailError: stillVerified ? state.detailError : (selected ? "answer_changed" : "not_found"),
+    detailSeq: stillVerified ? state.detailSeq : state.detailSeq + 1,
+  };
 }
 
 export function select(state, id) {
-  return { ...state, selected: id, answer: null };
+  return { ...state, selected: id, answer: null, detailSeq: state.detailSeq + 1, detailPending: false, detailError: null };
 }
 
 export function beginDetail(state, id) {
-  return { ...state, selected: id, lastSeq: state.lastSeq + 1, answer: null };
+  return { ...state, selected: id, detailSeq: state.detailSeq + 1, answer: null, detailPending: true, detailError: null };
 }
 
 export function applyDetail(state, envelope, epoch, sequence, selectedId) {
-  if (state.selected !== selectedId || envelope?.data?.row?.id !== selectedId || !isCurrentResponse(state, envelope, epoch, sequence)) return state;
-  return { ...state, generation: Number(envelope.snapshotGeneration), answer: envelope.data.text ?? null, refreshError: null };
+  const current = state.selected === selectedId && epoch === state.epoch && sequence === state.detailSeq;
+  const identity = envelope?.serverInstanceId === state.server && envelope?.projectId === state.project && envelope?.data?.row?.id === selectedId;
+  if (!current) return state;
+  if (!identity) return { ...state, answer: null, detailPending: false, detailError: "invalid_response" };
+  const selected = state.snapshot?.rows?.find(row => row.id === selectedId);
+  if (selected?.result !== "verified" || envelope.data.row.result !== "verified" || envelope.data.text == null) {
+    return { ...state, answer: null, detailPending: false, detailError: envelope.data?.row?.result ?? "not_found" };
+  }
+  return { ...state, generation: Math.max(state.generation, Number(envelope.snapshotGeneration)), answer: envelope.data.text, detailPending: false, detailError: null, refreshError: null };
+}
+
+export function failDetail(state, code, epoch, sequence, selectedId) {
+  if (state.selected !== selectedId || state.epoch !== epoch || state.detailSeq !== sequence) return state;
+  return { ...state, answer: null, detailPending: false, detailError: code };
+}
+
+export function cancelDetail(state, code = null) {
+  return { ...state, answer: null, detailSeq: state.detailSeq + 1, detailPending: false, detailError: code };
 }
 
 export function failRefresh(state, code, lastSuccessAt = state.lastSuccessAt) {
-  return { ...state, refreshError: code, lastSuccessAt, answer: null };
+  return { ...state, refreshError: code, lastSuccessAt };
 }
 
 function cookieValue(cookies, key) {
@@ -220,4 +257,54 @@ export function safeHref(value) {
 
 export function resultValues() {
   return [...RESULT_VALUES];
+}
+
+// Role edits are independent of discovery refreshes and observation snapshots.
+export function fusionRemoveRole(config, id) {
+  const next = structuredClone(config);
+  next.roles = next.roles.filter(role => role.id !== id);
+  for (const group of next.combinations) {
+    group.members = group.members.filter(member => member !== id);
+    group.disabled = group.disabled.filter(member => member !== id);
+    if (group.synthesizer === id) group.synthesizer = null;
+  }
+  return next;
+}
+export function fusionMoveMember(config, groupId, roleId, delta) {
+  const next = structuredClone(config), group = next.combinations.find(g => g.id === groupId);
+  if (!group || ![-1, 1].includes(delta)) return next;
+  const index = group.members.indexOf(roleId), target = index + delta;
+  if (index < 0 || target < 0 || target >= group.members.length) return next;
+  [group.members[index], group.members[target]] = [group.members[target], group.members[index]];
+  return next;
+}
+export function fusionTuple(role, row) {
+  const native = row?.native?.current ?? {};
+  return Object.fromEntries(["provider", "model", "effort", "mode"].map(key => [key, role?.fixed?.[key] ?? native[key] ?? null]));
+}
+export function fusionDraftError(config) {
+  if (!config) return "loading";
+  const bytes = text => new TextEncoder().encode(text ?? "").length;
+  if (config.roles.some(role => !role.name.trim() || !role.harness || bytes(role.name) > 256 || bytes(role.instructions) > 16384)) return "roleIncomplete";
+  return null;
+}
+export function fusionReady(config, groupId, rows) {
+  const group = config?.combinations.find(g => g.id === groupId);
+  if (!group) return "chooseCombination";
+  const active = group.members.filter(id => !group.disabled.includes(id));
+  if (active.length < 2 || active.length > 5) return "memberCount";
+  if (!group.synthesizer) return "chooseSynthesis";
+  for (const id of [...active, group.synthesizer]) {
+    const role = config.roles.find(r => r.id === id), row = rows.find(r => r.id === role?.harness);
+    if (!row || !row.enabled || row.availability !== "supported") return "clientUnavailable";
+    const tuple = fusionTuple(role, row);
+    if (["pi", "zcode", "dsh"].includes(row.driver) && ["provider", "model", "effort"].some(key => !tuple[key])) return "requiredNativePin";
+    if (row.driver === "smartclaw" && Object.values(tuple).some(value => value !== null)) return "unsupportedPin";
+    if (row.driver === "cursor" && (tuple.provider || tuple.effort || (tuple.mode && !["ask","plan"].includes(tuple.mode)))) return "unsupportedPin";
+    if (["claude","codebuddy"].includes(row.driver) && (tuple.provider || (tuple.mode && tuple.mode!=="plan"))) return "unsupportedPin";
+    if (row.driver === "codex" && (tuple.provider || (tuple.mode && tuple.mode!=="fast_mode"))) return "unsupportedPin";
+    if (["opencode","mimo"].includes(row.driver) && tuple.mode && tuple.mode!=="pure") return "unsupportedPin";
+    if (["pi","zcode"].includes(row.driver) && tuple.mode) return "unsupportedPin";
+  }
+  return null;
 }

@@ -318,6 +318,21 @@ impl HarnessConfigSnapshot {
                 )
             }
         }
+        self.inspect_configured(alias, action)
+    }
+
+    /// Inspect captured configuration without claiming that the requested action is available.
+    /// This metadata-only path never grants permission to invoke a disabled/unsupported alias;
+    /// execution must continue to use resolve and its action availability checks.
+    pub(crate) fn inspect_configured(
+        &self,
+        alias: &str,
+        action: HarnessAction,
+    ) -> Result<ResolvedHarness> {
+        let entry = self
+            .entries
+            .get(alias)
+            .with_context(|| format!("harness alias {alias:?} 不存在"))?;
         let driver = HarnessId::parse(&entry.driver)
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("解析 harness alias {alias:?} driver 失败"))?;
@@ -330,6 +345,103 @@ impl HarnessConfigSnapshot {
             cwd_policy: entry.cwd_policy,
             config_digest: self.sha256.clone(),
             source_path: self.source_path.clone(),
+        })
+    }
+
+    /// Read the captured enabled flag without executing or rereading configuration.
+    pub(crate) fn configured_enabled(&self, alias: &str) -> Option<bool> {
+        self.entries.get(alias).map(|entry| entry.enabled)
+    }
+
+    // The browser supplies only role IDs and parameter fields. Bind executable,
+    // enabled/action support and limits from the server's captured discovery.
+    pub(crate) fn for_fusion(
+        source_path: &Path,
+        discovery: &crate::native_discovery::DiscoverySnapshot,
+        roles: &[(
+            String,
+            crate::fusion_roles::FusionRole,
+            crate::channel::InvocationTuple,
+        )],
+        provenance: serde_json::Value,
+    ) -> Result<Self> {
+        if !source_path.is_absolute() {
+            bail!("fusion_snapshot_path_must_be_absolute");
+        }
+        let mut entries = BTreeMap::new();
+        for (alias, role, tuple) in roles {
+            validate_alias(alias)?;
+            crate::fusion_roles::validate_tuple(tuple)?;
+            let Some(row) = discovery.harnesses.iter().find(|h| h.id == role.harness) else {
+                continue;
+            };
+            let Some(executable) = row.executable.clone() else {
+                continue;
+            };
+            let existing = row
+                .alias
+                .as_ref()
+                .and_then(|id| {
+                    discovery
+                        .configured_snapshot
+                        .as_ref()
+                        .and_then(|s| s.entries.get(id))
+                })
+                .cloned();
+            let mut entry = existing.unwrap_or_else(|| HarnessEntry {
+                driver: row.driver.clone(),
+                executable: executable.clone(),
+                enabled: row.enabled,
+                defaults: HarnessTuple::default(),
+                execute: None,
+                review: None,
+                consult: None,
+                cwd_policy: HarnessCwdPolicy::ProjectRoot,
+                executable_availability: inspect_executable(&executable),
+            });
+            let limits = entry.invocation_limits(HarnessAction::Consult);
+            entry.enabled = row.enabled && row.availability == "supported";
+            entry.defaults = HarnessTuple {
+                provider: tuple.provider.clone(),
+                model: tuple.model.clone(),
+                effort: tuple.effort.clone(),
+                mode: tuple.mode.clone(),
+            };
+            entry.execute = None;
+            entry.review = None;
+            entry.consult = Some(HarnessActionOverride {
+                tuple: HarnessTuple::default(),
+                limits,
+            });
+            if entries.insert(alias.clone(), entry).is_some() {
+                bail!("duplicate_fusion_invocation_alias");
+            }
+        }
+        let bindings = entries
+            .iter()
+            .map(|(alias, entry)| {
+                serde_json::json!({
+                    "alias": alias, "driver": entry.driver, "executable": entry.executable,
+                    "enabled": entry.enabled, "cwdPolicy": format!("{:?}", entry.cwd_policy),
+                    "limits": entry.invocation_limits(HarnessAction::Consult)
+                })
+            })
+            .collect::<Vec<_>>();
+        let upstream = discovery
+            .configured_snapshot
+            .as_ref()
+            .map(HarnessConfigSnapshot::sha256);
+        let bytes = serde_json::to_vec_pretty(
+            &serde_json::json!({"version":1,"roles":roles,"bindings":bindings,"upstreamConfigSha256":upstream,"provenance":provenance}),
+        )?;
+        if bytes.len() > 2 * 1024 * 1024 {
+            bail!("fusion_snapshot_too_large");
+        }
+        Ok(Self {
+            source_path: source_path.to_path_buf(),
+            sha256: hex::encode(Sha256::digest(&bytes)),
+            source_bytes: bytes.into(),
+            entries,
         })
     }
 
@@ -474,14 +586,25 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
-fn validate_action(file: HarnessActionFile, alias: &str, action: &str) -> Result<HarnessActionOverride> {
+fn validate_action(
+    file: HarnessActionFile,
+    alias: &str,
+    action: &str,
+) -> Result<HarnessActionOverride> {
     let raw = file.limits.unwrap_or_default();
     if raw.max_prompt_bytes == Some(0) || raw.timeout_seconds == Some(0) {
         bail!("harness {alias} {action}.limits values must be positive");
     }
-    let tuple = validate_tuple(HarnessTupleFile {
-        provider: file.provider, model: file.model, effort: file.effort, mode: file.mode,
-    }, alias, action)?;
+    let tuple = validate_tuple(
+        HarnessTupleFile {
+            provider: file.provider,
+            model: file.model,
+            effort: file.effort,
+            mode: file.mode,
+        },
+        alias,
+        action,
+    )?;
     Ok(HarnessActionOverride {
         tuple,
         limits: HarnessInvocationLimits {

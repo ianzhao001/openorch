@@ -50,6 +50,12 @@ pub mod gitx;
 pub mod harness;
 /// Immutable snapshots of gitignored local harness configuration.
 pub mod harness_config;
+/// Native configuration discovery staged for the authorized r91 delivery.
+pub mod native_discovery;
+/// Project-local Fusion roles staged for the authorized r91 delivery.
+pub mod fusion_roles;
+/// Explicit role consultation staged for the authorized r91 delivery.
+pub mod fusion_run;
 #[cfg(feature = "selfhost")]
 pub mod hooks;
 #[cfg(feature = "selfhost")]

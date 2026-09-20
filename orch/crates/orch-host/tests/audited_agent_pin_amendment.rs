@@ -30,7 +30,37 @@ fn an_amendment_never_signs_the_plan_itself() {
 
 #[test]
 fn backend_reconciliation_still_reads_the_recorded_wake_pin() {
-    let source=fs::read_to_string(repo().join("orch/crates/orch-host/src/wake.rs")).unwrap();
-    assert!(source.contains("facts.requested_provider") && source.contains("facts.requested_model"));
-    assert!(!source.contains("load_agent_definitions") || source.contains("facts.requested_model"));
+    use orch_host::wake::{backend_receipt_expectation_for_wake, backend_receipt_from_log};
+    let root = audited_agent_pin_amendment_support::fixture_root("b357-durable-pin");
+    let round = "r9999";
+    let wake_id = "b357-pin";
+    let event = orch_host::ledger::event("WakeIssued", "runtime:orch", Some("B357T"), Some(round),
+        serde_json::json!({
+            "wakeId": wake_id, "agent": "executor-pi", "attemptId": "B357T-A0001",
+            "continuationId": "implementation:r9999:B357T:B357T-A0001:executor-pi",
+            "providerKind": "pi", "requestSessionId": null,
+            "probeOffset": 0, "backendState": "pending", "logPath": "fixture-only.log",
+            "requestMessageSha256": "a".repeat(64), "renderedMessageSha256": "b".repeat(64),
+            "requestedProvider": "old-provider", "requestedModel": "old-model", "requestedEffort": "high"
+        }));
+    let ledger = root.join("coordination/rounds/r9999/events.jsonl");
+    let bytes = format!("{}\n", serde_json::to_string(&event).unwrap());
+    fs::write(&ledger, &bytes).unwrap();
+    let registry = root.join("coordination/agents.yaml");
+    let current = fs::read_to_string(&registry).unwrap()
+        .replace("synthetic-provider", "new-provider")
+        .replace("synthetic-model-old", "new-model").replace("effort: xhigh", "effort: low");
+    fs::write(&registry, &current).unwrap();
+    let expected = backend_receipt_expectation_for_wake(&root, round, wake_id).unwrap();
+    let frame = serde_json::json!({"type":"pi.session", "sessionId":"session-old",
+        "provider":"old-provider", "model":"old-model", "effort":"high"});
+    assert!(backend_receipt_from_log(&expected, frame.to_string().as_bytes(), true).unwrap().is_some());
+    for (field, value) in [("provider", "new-provider"), ("model", "new-model"), ("effort", "low")] {
+        let mut wrong = frame.clone(); wrong[field] = value.into();
+        assert!(backend_receipt_from_log(&expected, wrong.to_string().as_bytes(), true).is_err(), "accepted changed {field}");
+    }
+    fs::write(&registry, "unreadable-as-registry: [").unwrap();
+    assert_eq!(backend_receipt_expectation_for_wake(&root, round, wake_id).unwrap(), expected);
+    assert_eq!(fs::read_to_string(&ledger).unwrap(), bytes);
+    fs::remove_dir_all(root).unwrap();
 }

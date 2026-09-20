@@ -322,6 +322,7 @@ c.close(); s.close()
         }
         // Legacy consumers still require an LF-complete payload. Native proof
         // does not change or lend authority to that historical parser.
+        #[cfg(feature = "selfhost")]
         assert!(crate::wake::validate_smartclaw_payload_terminal_for_test(&raw(), "orch-wake-native-fixture").unwrap().is_none());
         fs::remove_dir_all(root).unwrap();
     }

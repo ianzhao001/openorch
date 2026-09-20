@@ -225,6 +225,9 @@ argv = [
     effort,
 ]
 
+if consult_mode and os.environ.get("ORCH_FUSION_ROLE") == "1":
+    argv.extend(["--tools", "read,grep,find,ls"])
+
 if project_root is not None and project_root != workdir_real:
     executable_path = os.path.realpath(provider_bin)
     package_root = None

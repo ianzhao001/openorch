@@ -1,5 +1,6 @@
-//! Loopback-only observation HTTP service. No endpoint can execute a provider,
-//! mutate project files, collect results, or control a task. Browser-origin
+//! Loopback observation and explicitly requested finite Fusion HTTP service.
+//! Observation stays read-only; separate authenticated routes save local roles
+//! and start finite consultations. No route controls selfhost tasks. Browser-origin
 //! protections are not an authentication boundary against same-UID processes.
 use axum::{
     body::{to_bytes, Body},
@@ -44,6 +45,7 @@ struct Shared {
     host: String,
     projects: Mutex<BTreeMap<String, Arc<Mutex<Project>>>>,
     jobs: Arc<Semaphore>,
+    fusion: orch_host::fusion_run::FusionEngine,
 }
 
 /// An owned local observation server. Dropping it closes the listener and joins
@@ -59,6 +61,22 @@ impl WebServer {
     /// Validate a committed exact Git root and start an owned 127.0.0.1 listener.
     /// Port zero asks the OS for a free port without releasing/rebinding it.
     pub fn start(root: &Path, port: u16) -> Result<Self, String> {
+        Self::start_inner(root, port, None)
+    }
+    /// Start with an explicit native environment for embedding and isolated tests.
+    /// Browser requests cannot set this environment or executable search path.
+    pub fn start_with_discovery_context(
+        root: &Path,
+        port: u16,
+        context: orch_host::native_discovery::DiscoveryContext,
+    ) -> Result<Self, String> {
+        Self::start_inner(root, port, Some(context))
+    }
+    fn start_inner(
+        root: &Path,
+        port: u16,
+        context: Option<orch_host::native_discovery::DiscoveryContext>,
+    ) -> Result<Self, String> {
         let project = validate_project(root)?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
             .map_err(|_| "local port unavailable".to_string())?;
@@ -80,6 +98,9 @@ impl WebServer {
                 Arc::new(Mutex::new(project)),
             )])),
             jobs: Arc::new(Semaphore::new(8)),
+            fusion: context
+                .map(orch_host::fusion_run::FusionEngine::with_discovery_context)
+                .unwrap_or_default(),
         });
         let (shutdown, stopped) = oneshot::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -108,6 +129,10 @@ impl WebServer {
                     .route("/api/v1/projects", get(projects).post(register))
                     .route("/api/v1/projects/{project}/snapshot", get(snapshot))
                     .route("/api/v1/projects/{project}/detail", get(detail))
+                    .route("/api/v1/projects/{project}/fusion/config", get(fusion_config).post(fusion_save))
+                    .route("/api/v1/projects/{project}/fusion/discovery", get(fusion_discovery).post(fusion_refresh))
+                    .route("/api/v1/projects/{project}/fusion/runs", get(fusion_runs).post(fusion_start))
+                    .route("/api/v1/projects/{project}/fusion/runs/{run}", get(fusion_detail))
                     .fallback(not_found)
                     .layer(middleware::from_fn_with_state(shared.clone(), guards))
                     .with_state(shared);
@@ -497,10 +522,11 @@ fn open_browser(url: &str) -> bool {
     result.map(|s| s.success()).unwrap_or(false)
 }
 
-/// Run the standalone, read-only Web observation service CLI.
+/// Run the standalone local observation and explicit Fusion service CLI.
 ///
 /// The function parses only `--root`, `--port`, `--no-open`, and `--help`;
-/// it never invokes a provider or mutates an observed project. The process owns
+/// startup only observes; authenticated Fusion POST requests may save roles and
+/// invoke a finite consultation. The process owns
 /// exactly one loopback server and keeps it alive until SIGINT/SIGTERM.
 pub fn run_web_cli(args: &[String]) -> i32 {
     let mut root: Option<PathBuf> = None;
@@ -576,4 +602,231 @@ pub fn run_web_cli(args: &[String]) -> i32 {
     }
     drop(server);
     0
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SaveFusionConfig {
+    expected_revision: u64,
+    config: orch_host::fusion_roles::FusionConfig,
+}
+async fn fusion_body<T: serde::de::DeserializeOwned>(
+    s: &Shared,
+    id: &str,
+    req: Request<Body>,
+) -> Result<T, Response> {
+    if req
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or("").trim())
+        != Some("application/json")
+    {
+        return Err(response(
+            s,
+            Some(id),
+            0,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Err("json_required"),
+        ));
+    }
+    let bytes = to_bytes(req.into_body(), 2 * 1024 * 1024)
+        .await
+        .map_err(|_| {
+            response(
+                s,
+                Some(id),
+                0,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Err("body_limit"),
+            )
+        })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| response(s, Some(id), 0, StatusCode::BAD_REQUEST, Err("invalid_json")))
+}
+fn fusion_error(error: &str) -> (StatusCode, &'static str) {
+    match error {
+        "revision_conflict" => (StatusCode::CONFLICT, "revision_conflict"),
+        "config_busy" | "run_busy" => (StatusCode::CONFLICT, "busy"),
+        "request_id_conflict" => (StatusCode::CONFLICT, "request_id_conflict"),
+        "project_has_unclosed_run" => (StatusCode::CONFLICT, "project_has_unclosed_run"),
+        "invalid_identifier" | "invalid_question" => {
+            (StatusCode::BAD_REQUEST, "invalid_fusion_request")
+        }
+        "combination_not_found" => (StatusCode::NOT_FOUND, "combination_not_found"),
+        "requires_two_to_five_enabled_roles" | "synthesizer_required" | "synthesizer_not_found" => {
+            (StatusCode::BAD_REQUEST, "combination_not_ready")
+        }
+        "prompt_contains_secret" => (StatusCode::BAD_REQUEST, "prompt_contains_secret"),
+        "prompt_too_large"
+        | "config_too_large"
+        | "too_many_roles_or_combinations"
+        | "invalid_role_instructions" => (StatusCode::BAD_REQUEST, "fusion_input_limit"),
+        "duplicate_role_id"
+        | "duplicate_combination_id"
+        | "invalid_member_reference"
+        | "invalid_disabled_reference"
+        | "invalid_synthesizer_reference"
+        | "invalid_name"
+        | "invalid_harness_reference"
+        | "invalid_native_parameter" => (StatusCode::BAD_REQUEST, "invalid_fusion_config"),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "fusion_unavailable"),
+    }
+}
+async fn fusion_operation<F>(
+    s: Arc<Shared>,
+    id: String,
+    status: StatusCode,
+    operation: F,
+) -> Response
+where
+    F: FnOnce(&orch_host::fusion_run::FusionEngine, &Path) -> Result<Value, String>
+        + Send
+        + 'static,
+{
+    blocking(s, move |s| {
+        let project = s
+            .projects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned();
+        let Some(project) = project else {
+            return response(&s, Some(&id), 0, StatusCode::NOT_FOUND, Err("not_found"));
+        };
+        let root = project
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .root
+            .clone();
+        let result = operation(&s.fusion, &root);
+        let mut project = project.lock().unwrap_or_else(|e| e.into_inner());
+        match result {
+            Ok(data) => {
+                project.generation += 1;
+                response(&s, Some(&id), project.generation, status, Ok(data))
+            }
+            Err(error) => {
+                let (status, code) = fusion_error(&error);
+                response(&s, Some(&id), project.generation, status, Err(code))
+            }
+        }
+    })
+    .await
+}
+fn fusion_config_value(config: orch_host::fusion_roles::FusionConfig) -> Result<Value, String> {
+    if config
+        .roles
+        .iter()
+        .any(|role| role.instructions.lines().any(orch_host::redact::has_secret))
+    {
+        return Err("prompt_contains_secret".into());
+    }
+    serde_json::to_value(config).map_err(|e| e.to_string())
+}
+async fn fusion_config(State(s): State<Arc<Shared>>, RoutePath(id): RoutePath<String>) -> Response {
+    fusion_operation(s, id, StatusCode::OK, |_, root| {
+        orch_host::fusion_roles::load_config(root)
+            .map_err(|e| e.to_string())
+            .and_then(fusion_config_value)
+    })
+    .await
+}
+async fn fusion_save(
+    State(s): State<Arc<Shared>>,
+    RoutePath(id): RoutePath<String>,
+    req: Request<Body>,
+) -> Response {
+    let body = match fusion_body::<SaveFusionConfig>(&s, &id, req).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    fusion_operation(s, id, StatusCode::OK, move |_, root| {
+        fusion_config_value(body.config.clone())?;
+        orch_host::fusion_roles::save_config(root, body.expected_revision, &body.config)
+            .map_err(|e| e.to_string())
+            .and_then(fusion_config_value)
+    })
+    .await
+}
+async fn fusion_discovery(
+    State(s): State<Arc<Shared>>,
+    RoutePath(id): RoutePath<String>,
+) -> Response {
+    fusion_operation(s, id, StatusCode::OK, |engine, root| {
+        engine.discovery(root, false).map_err(|e| e.to_string())
+    })
+    .await
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefreshFusion {}
+async fn fusion_refresh(
+    State(s): State<Arc<Shared>>,
+    RoutePath(id): RoutePath<String>,
+    req: Request<Body>,
+) -> Response {
+    if let Err(response) = fusion_body::<RefreshFusion>(&s, &id, req).await {
+        return response;
+    }
+    fusion_operation(s, id, StatusCode::ACCEPTED, |engine, root| {
+        engine.discovery(root, true).map_err(|e| e.to_string())
+    })
+    .await
+}
+async fn fusion_runs(State(s): State<Arc<Shared>>, RoutePath(id): RoutePath<String>) -> Response {
+    fusion_operation(s, id, StatusCode::OK, |engine, root| {
+        engine
+            .list(root)
+            .map_err(|e| e.to_string())
+            .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+    })
+    .await
+}
+async fn fusion_start(
+    State(s): State<Arc<Shared>>,
+    RoutePath(id): RoutePath<String>,
+    req: Request<Body>,
+) -> Response {
+    let revision = match req.headers().get("x-orch-config-revision") {
+        None => None,
+        Some(value) => match value.to_str().ok().and_then(|v| v.parse::<u64>().ok()) {
+            Some(v) => Some(v),
+            None => {
+                return response(
+                    &s,
+                    Some(&id),
+                    0,
+                    StatusCode::BAD_REQUEST,
+                    Err("bad_revision"),
+                )
+            }
+        },
+    };
+    let request = match fusion_body::<orch_host::fusion_run::FusionRequest>(&s, &id, req).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    fusion_operation(s, id, StatusCode::ACCEPTED, move |engine, root| {
+        let result = match revision {
+            Some(v) => engine.start_with_revision(root, request, v),
+            None => engine.start(root, request),
+        };
+        result
+            .map_err(|e| e.to_string())
+            .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+    })
+    .await
+}
+async fn fusion_detail(
+    State(s): State<Arc<Shared>>,
+    RoutePath((id, run)): RoutePath<(String, String)>,
+) -> Response {
+    fusion_operation(s, id, StatusCode::OK, move |engine, root| {
+        engine
+            .read(root, &run)
+            .map_err(|e| e.to_string())
+            .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+    })
+    .await
 }

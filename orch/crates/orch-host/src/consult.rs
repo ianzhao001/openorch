@@ -11,7 +11,7 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use fd_lock::RwLock;
@@ -20,9 +20,9 @@ use orch_core::EventRecord;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{adapter, failure::FailureClass, redact};
 #[cfg(feature = "selfhost")]
 use crate::plan;
+use crate::{adapter, failure::FailureClass, redact};
 
 const CONSULTATIONS_PATH: &str = "coordination/consultations";
 const CHANNEL_V3_MEMBER_TIMEOUT_SECS: u64 = 900;
@@ -31,6 +31,155 @@ const CHANNEL_V3_MAX_MEMBERS: usize = 5;
 
 /// Version of the explicit-member, policy-free consultation contract.
 pub const LIGHTWEIGHT_CONSULT_CONTRACT_V1: u32 = 1;
+
+/// Stable, additive code for a bounded channel diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticCode {
+    /// A provider or transport invocation failed.
+    ProviderFailure,
+    /// A historical otherwise-consistent record predates capture-closure facts.
+    CaptureEvidenceMissing,
+}
+
+/// Optional, sanitized channel facts shared by observation and Fusion views.
+///
+/// Absence remains absence: callers must not infer a deadline, exit status,
+/// terminal state, model, or overflow fact that the source did not record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelDiagnostic {
+    /// Stable machine-readable diagnostic category.
+    pub code: DiagnosticCode,
+    /// Recorded provider/runtime failure class.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    /// Recorded execution stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    /// Credential-aware sanitized and bounded explanation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Recorded elapsed whole seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<u64>,
+    /// Recorded local hard deadline in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_secs: Option<u64>,
+    /// Recorded local process exit code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Recorded provider-neutral terminal status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_status: Option<String>,
+    /// Recorded observed model identifier, distinct from the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_model: Option<String>,
+    /// Recorded stdout overflow state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout_overflow: Option<bool>,
+    /// Recorded stderr overflow state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_overflow: Option<bool>,
+}
+
+impl ChannelDiagnostic {
+    /// Describe an otherwise valid historical record whose four capture facts
+    /// are all absent. This does not make the answer readable or verified.
+    pub fn capture_evidence_missing() -> Self {
+        Self::empty(DiagnosticCode::CaptureEvidenceMissing)
+    }
+
+    /// Describe a provider failure using only sanitized, bounded safe text.
+    pub fn provider_failure(
+        failure_class: Option<&str>,
+        reason: Option<&str>,
+        stage: Option<&str>,
+    ) -> Self {
+        let mut diagnostic = Self::empty(DiagnosticCode::ProviderFailure);
+        diagnostic.failure_class = failure_class.map(sanitize_diagnostic_reason);
+        diagnostic.reason = reason.map(sanitize_diagnostic_reason);
+        diagnostic.stage = stage.map(sanitize_diagnostic_reason);
+        diagnostic
+    }
+
+    /// Project only recorded, bounded facts from one completed member outcome.
+    pub(crate) fn from_outcome(outcome: &MemberOutcome) -> Option<Self> {
+        if outcome.status == MemberStatus::Ok
+            && outcome.failure_class.is_none()
+            && outcome.reason.is_none()
+        {
+            return None;
+        }
+        let facts = outcome.channel_facts.as_ref();
+        let mut diagnostic = Self::provider_failure(
+            outcome.failure_class.map(FailureClass::as_str),
+            outcome.reason.as_deref(),
+            facts.and_then(|value| value["stage"].as_str()),
+        );
+        diagnostic.duration_secs = Some(outcome.duration_secs);
+        diagnostic.deadline_secs = facts.and_then(|value| value["deadlineSecs"].as_u64());
+        diagnostic.exit_code = outcome
+            .exit_code
+            .or_else(|| {
+                facts
+                    .and_then(|value| value["execution"]["exitCode"].as_i64())
+                    .and_then(|value| i32::try_from(value).ok())
+            });
+        diagnostic.terminal_status = facts
+            .and_then(|value| value["terminal"]["status"].as_str())
+            .map(sanitize_diagnostic_reason);
+        diagnostic.observed_model = outcome
+            .observed_model
+            .as_deref()
+            .map(sanitize_diagnostic_reason);
+        diagnostic.stdout_overflow =
+            facts.and_then(|value| value["execution"]["stdoutOverflow"].as_bool());
+        diagnostic.stderr_overflow =
+            facts.and_then(|value| value["execution"]["stderrOverflow"].as_bool());
+        Some(diagnostic)
+    }
+
+    fn empty(code: DiagnosticCode) -> Self {
+        Self {
+            code,
+            failure_class: None,
+            stage: None,
+            reason: None,
+            duration_secs: None,
+            deadline_secs: None,
+            exit_code: None,
+            terminal_status: None,
+            observed_model: None,
+            stdout_overflow: None,
+            stderr_overflow: None,
+        }
+    }
+}
+
+fn sanitize_diagnostic_reason(reason: &str) -> String {
+    let safe = crate::observation::safe_observation_text(reason);
+    if safe.char_indices().any(|(index, character)| {
+        if character != '/' || safe[index..].starts_with("//") {
+            return false;
+        }
+        index == 0
+            || safe[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|previous| previous.is_whitespace() || "='\"([{:\u{60}".contains(previous))
+    }) {
+        return "[redacted path]".into();
+    }
+    if safe.len() <= 2048 {
+        return safe;
+    }
+    let mut end = 2048;
+    while !safe.is_char_boundary(end) {
+        end -= 1;
+    }
+    safe[..end].to_string()
+}
 
 /// Whether the current protocol state permits a plan-phase consultation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -664,6 +813,65 @@ fn channel_consult_not_started_facts(
     })
 }
 
+// Only the exact credential-bearing settings copy is removed, after the answer
+// and manifest have been preserved and the owning process group has ended.
+fn cleanup_ended_role_settings(outcome: &MemberOutcome) {
+    let Some(marker) = outcome
+        .channel_facts
+        .as_ref()
+        .and_then(|v| v.get("privateSettings"))
+    else {
+        return;
+    };
+    let Some(root) = outcome.worktree.as_ref() else {
+        return;
+    };
+    let attempt = (|| -> Result<()> {
+        let main = crate::fusion_roles::project_root(root)?;
+        let base = main.join(".orch/fusion-runs");
+        let path = PathBuf::from(marker["path"].as_str().context("missing settings path")?);
+        let relative = path.strip_prefix(&base)?;
+        let parts = relative.components().collect::<Vec<_>>();
+        if parts.len() != 5
+            || parts
+                .iter()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            || !matches!(parts[1].as_os_str().to_str(), Some("members" | "synthesis"))
+            || parts[2].as_os_str() != "private"
+            || parts[4].as_os_str() != "settings.json"
+            || fs::canonicalize(path.parent().context("missing parent")?)? != path.parent().unwrap()
+        {
+            bail!("settings ownership is not exact");
+        }
+        let before = fs::symlink_metadata(&path)?;
+        if !before.is_file()
+            || before.file_type().is_symlink()
+            || before.nlink() != 1
+            || Some(before.dev()) != marker["dev"].as_u64()
+            || Some(before.ino()) != marker["ino"].as_u64()
+        {
+            bail!("settings identity changed");
+        }
+        let manifest = crate::channel::capture_attachment_manifest_v1(&[path.as_path()])?;
+        if manifest.entries()[0].sha256() != marker["sha256"].as_str().unwrap_or("") {
+            bail!("settings bytes changed");
+        }
+        let after = fs::symlink_metadata(&path)?;
+        if before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.len() != after.len()
+            || before.mtime() != after.mtime()
+            || before.mtime_nsec() != after.mtime_nsec()
+        {
+            bail!("settings changed during cleanup check");
+        }
+        fs::remove_file(path)?;
+        Ok(())
+    })();
+    // Failure retains a private copy; it grants no authority to remove another file.
+    let _ = attempt;
+}
+
 fn archive_channel_consult_member(
     skeleton: &ConsultationSkeleton,
     outcome: &MemberOutcome,
@@ -742,7 +950,9 @@ fn archive_channel_consult_member(
             "归档 schema 3 consult member manifest 失败: {}",
             manifest_path.display()
         )
-    })
+    })?;
+    cleanup_ended_role_settings(outcome);
+    Ok(())
 }
 
 /// Atomically publish complete immutable artifact bytes without replacing an existing path.
@@ -1051,9 +1261,14 @@ fn finish_channel_consult_member_v3(
         });
     }
     if !output.process_group_terminated || output.status.is_none() {
-        outcome.failure_class = Some(driver_failure.as_ref().map(|failure| failure.class())
-            .unwrap_or(FailureClass::ObservationFailed));
-        outcome.reason = Some("invocation termination unproven; HOLD with private raw captures".into());
+        outcome.failure_class = Some(
+            driver_failure
+                .as_ref()
+                .map(|failure| failure.class())
+                .unwrap_or(FailureClass::ObservationFailed),
+        );
+        outcome.reason =
+            Some("invocation termination unproven; HOLD with private raw captures".into());
         if let Some(facts) = outcome.channel_facts.as_mut() {
             facts["stage"] = serde_json::json!("unclosed");
             facts["terminal"] = serde_json::json!({
@@ -1062,6 +1277,19 @@ fn finish_channel_consult_member_v3(
             });
         }
         return Ok(outcome);
+    }
+
+    if driver == crate::harness::HarnessId::ZCode {
+        let markers = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| value["type"] == "zcode.private-settings")
+            .collect::<Vec<_>>();
+        if markers.len() == 1 {
+            if let Some(facts) = outcome.channel_facts.as_mut() {
+                facts["privateSettings"] = markers[0].clone();
+            }
+        }
     }
 
     // Capture facts independently veto even an otherwise acceptable native final.
@@ -1102,14 +1330,27 @@ fn finish_channel_consult_member_v3(
     let terminal_result = if driver == crate::harness::HarnessId::SmartClaw {
         // The raw payload concatenates process text. It is preserved in raw
         // captures/logs and is never substituted for a missing native final.
-        answer = ExtractedAnswer { text: String::new(), extraction: AnswerExtraction::Structured };
+        answer = ExtractedAnswer {
+            text: String::new(),
+            extraction: AnswerExtraction::Structured,
+        };
         Ok(ChannelConsultTerminalEvidenceV1 {
             turn_ended: true,
             final_text: output.native_final_text().map(str::to_string),
-            final_text_sha256: output.native_final.as_ref().and_then(|native|
-                native.pointer("/final/sha256").and_then(serde_json::Value::as_str).map(str::to_string)),
-            exact_reason: Some(if output.native_final_text().is_some() { "native-final" }
-                else { "native-ended-without-valid-final" }.into()),
+            final_text_sha256: output.native_final.as_ref().and_then(|native| {
+                native
+                    .pointer("/final/sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            }),
+            exact_reason: Some(
+                if output.native_final_text().is_some() {
+                    "native-final"
+                } else {
+                    "native-ended-without-valid-final"
+                }
+                .into(),
+            ),
             usage: None,
         })
     } else {
@@ -1192,21 +1433,23 @@ fn finish_channel_consult_member_v3(
             managed_scope_terminated: true,
             activity_seen: !stdout.is_empty(),
             authenticated_cancel: false,
-        }, contract.wrapper.is_some()) {
-            Ok(terminal) => terminal,
-            Err(error) => {
-                outcome.failure_class = Some(FailureClass::Protocol);
-                outcome.reason = Some(format!("terminal envelope protocol error: {error:#}"));
-                if let Some(facts) = outcome.channel_facts.as_mut() {
-                    facts["stage"] = serde_json::json!("terminal-protocol-error");
-                    facts["terminal"] = serde_json::json!({
-                        "source": contract.terminal.as_str(),
-                        "status": "protocol-error",
-                    });
-                }
-                return Ok(outcome);
+        },
+        contract.wrapper.is_some(),
+    ) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            outcome.failure_class = Some(FailureClass::Protocol);
+            outcome.reason = Some(format!("terminal envelope protocol error: {error:#}"));
+            if let Some(facts) = outcome.channel_facts.as_mut() {
+                facts["stage"] = serde_json::json!("terminal-protocol-error");
+                facts["terminal"] = serde_json::json!({
+                    "source": contract.terminal.as_str(),
+                    "status": "protocol-error",
+                });
             }
-        };
+            return Ok(outcome);
+        }
+    };
     if output.reason == crate::channel::ChannelExitReason::HardDeadline {
         // The runtime winner, not a synthetic OS exit code, owns this state.
         terminal.state = crate::harness::TerminalState::TimedOut;
@@ -1265,10 +1508,18 @@ fn finish_channel_consult_member_v3(
     if timed_out {
         outcome.status = MemberStatus::TimedOut;
         outcome.failure_class = Some(FailureClass::Timeout);
-        outcome.reason = Some(if output.reason == crate::channel::ChannelExitReason::HardDeadline {
-            "member exceeded configured local wall limit"
-        } else { "code-owned wrapper reported timeout; upstream termination is a separate fact" }.into());
-    } else if native_answer_authoritative && !model_mismatch && validity == ConsultAnswerValidityV3::Valid {
+        outcome.reason = Some(
+            if output.reason == crate::channel::ChannelExitReason::HardDeadline {
+                "member exceeded configured local wall limit"
+            } else {
+                "code-owned wrapper reported timeout; upstream termination is a separate fact"
+            }
+            .into(),
+        );
+    } else if native_answer_authoritative
+        && !model_mismatch
+        && validity == ConsultAnswerValidityV3::Valid
+    {
         outcome.status = MemberStatus::Ok;
     } else if let Some(failure) = driver_failure {
         outcome.failure_class = Some(failure.class());
@@ -1292,7 +1543,32 @@ fn finish_channel_consult_member_v3(
     Ok(outcome)
 }
 
+pub(crate) struct RoleWaveV1<'a> {
+    pub fixed_head: String,
+    pub snapshot: crate::harness_config::HarnessConfigSnapshot,
+    pub prompts: std::collections::BTreeMap<String, String>,
+    pub skeleton: ConsultationSkeleton,
+    pub native_context: crate::native_discovery::DiscoveryContext,
+    pub observer: &'a mut dyn FnMut(&MemberOutcome) -> Result<()>,
+}
+
+pub(crate) fn run_role_wave(
+    root: &Path,
+    args: &ConsultArgs,
+    context: RoleWaveV1<'_>,
+) -> Result<ConsultOutcome> {
+    run_channel_consultation_inner(root, args, Some(context))
+}
+
 fn run_channel_consultation_v3(root: &Path, args: &ConsultArgs) -> Result<ConsultOutcome> {
+    run_channel_consultation_inner(root, args, None)
+}
+
+fn run_channel_consultation_inner(
+    root: &Path,
+    args: &ConsultArgs,
+    mut role_context: Option<RoleWaveV1<'_>>,
+) -> Result<ConsultOutcome> {
     let decision = consultation_admitted(root)?;
     if let GateDecision::Refuse { reason } = &decision {
         #[cfg(feature = "selfhost")]
@@ -1311,7 +1587,14 @@ fn run_channel_consultation_v3(root: &Path, args: &ConsultArgs) -> Result<Consul
     .validate("schema 3 channel consult limits")?;
 
     let canonical_root = fs::canonicalize(root)?;
-    let fixed_head = crate::gitx::rev_parse(&canonical_root, "HEAD^{commit}")?;
+    let observed_head = crate::gitx::rev_parse(&canonical_root, "HEAD^{commit}")?;
+    let fixed_head = role_context
+        .as_ref()
+        .map(|c| c.fixed_head.clone())
+        .unwrap_or_else(|| observed_head.clone());
+    if fixed_head != observed_head {
+        bail!("fusion_head_changed");
+    }
     let mut manifest_paths = Vec::with_capacity(args.attachments.len() + 1);
     manifest_paths.push(if args.question.is_absolute() {
         args.question.clone()
@@ -1336,12 +1619,24 @@ fn run_channel_consultation_v3(root: &Path, args: &ConsultArgs) -> Result<Consul
     let prompt = build_fusion_prompt(&question.text, &attachments);
     let orch_executable = std::env::current_exe().context("解析当前 orch executable 失败")?;
     let round = current_round_for_log(root).unwrap_or_else(|| "manual".to_string());
-    let snapshot = crate::harness_config::load_harness_config_snapshot(root)?;
-
-    let skeleton = create_consultation_skeleton(root)?;
+    let snapshot = match role_context.as_ref() {
+        Some(context) => context.snapshot.clone(),
+        None => crate::harness_config::load_harness_config_snapshot(root)?,
+    };
+    let native_context = role_context.as_ref().map(|c| c.native_context.clone());
+    let skeleton = match role_context.as_ref() {
+        Some(context) => context.skeleton.clone(),
+        None => create_consultation_skeleton(root)?,
+    };
     archive_request(&skeleton, &question, &attachments)?;
     let log_dir = skeleton.dir.join("adapter-logs");
     fs::create_dir_all(&log_dir)?;
+    let private_parent = skeleton.dir.join("private");
+    if native_context.is_some() {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir(&private_parent)?;
+        fs::set_permissions(&private_parent, fs::Permissions::from_mode(0o700))?;
+    }
 
     let mut ready = Vec::with_capacity(explicit_members.as_slice().len());
     let mut outcomes = (0..explicit_members.as_slice().len())
@@ -1351,12 +1646,21 @@ fn run_channel_consultation_v3(root: &Path, args: &ConsultArgs) -> Result<Consul
         let mut outcome = MemberOutcome::new(index, alias.clone(), MemberStatus::Failed);
         outcome.worktree = Some(canonical_root.clone());
         let action_id = format!("{}-{index}-{alias}", skeleton.id);
+        let member_prompt = match role_context.as_ref() {
+            Some(context) => context
+                .prompts
+                .get(&alias)
+                .cloned()
+                .context("role prompt is absent")?,
+            None => prompt.clone(),
+        };
+        reject_secret_lines("complete role prompt", &args.question, &member_prompt)?;
         let rendered = crate::channel::prepare_invocation(
             &snapshot,
             crate::channel::InvocationRequest {
                 alias: alias.clone(),
                 action: crate::channel::InvocationAction::Consult,
-                prompt: prompt.clone(),
+                prompt: member_prompt,
                 project_root: canonical_root.clone(),
                 target_worktree: canonical_root.clone(),
                 target_head: fixed_head.clone(),
@@ -1369,26 +1673,55 @@ fn run_channel_consultation_v3(root: &Path, args: &ConsultArgs) -> Result<Consul
                 CHANNEL_V3_MEMBER_TIMEOUT_SECS,
                 limits.total_wall_secs,
             )?;
-            crate::channel::render_invocation_v1(
-                prepared,
-                crate::channel::InvocationContextV1 {
-                    action_id: action_id.clone(),
-                    wake_id: action_id.clone(),
-                    round: round.clone(),
-                    task_id: "CONSULT".into(),
-                    attempt_id: "CONSULT-A0000".into(),
-                    review_output: None,
-                    orch_executable: orch_executable.clone(),
-                    deadline_secs,
-                },
-            )
+            let context = crate::channel::InvocationContextV1 {
+                action_id: action_id.clone(),
+                wake_id: action_id.clone(),
+                round: round.clone(),
+                task_id: "CONSULT".into(),
+                attempt_id: "CONSULT-A0000".into(),
+                review_output: None,
+                orch_executable: orch_executable.clone(),
+                deadline_secs,
+            };
+            match native_context.as_ref() {
+                Some(native) => {
+                    use std::os::unix::fs::PermissionsExt;
+                    let private_root = private_parent.join(&alias);
+                    fs::create_dir(&private_root)?;
+                    fs::set_permissions(&private_root, fs::Permissions::from_mode(0o700))?;
+                    crate::channel::render_native_role_v1(prepared, context, native, &private_root)
+                }
+                None => crate::channel::render_invocation_v1(prepared, context),
+            }
         });
         match rendered {
             Ok(rendered) => {
                 let driver = rendered.prepared().driver();
                 let effective_model = rendered.prepared().effective().model.clone();
                 let contract = rendered.prepared().driver_contract();
-                outcome.channel_facts = Some(channel_consult_facts(&rendered));
+                let mut facts = channel_consult_facts(&rendered);
+                if driver == crate::harness::HarnessId::OpenCode {
+                    if let Some(native) = native_context.as_ref() {
+                        let readiness =
+                            crate::native_discovery::opencode_local_readiness(native);
+                        facts["localReadiness"] = serde_json::to_value(&readiness)?;
+                        if let crate::native_discovery::OpenCodeReadiness::Unsafe { reason } =
+                            readiness
+                        {
+                            facts["stage"] = serde_json::json!("local-readiness-rejected");
+                            outcome.failure_class = Some(FailureClass::Permission);
+                            outcome.reason = Some(reason);
+                            outcome.channel_facts = Some(facts);
+                            archive_channel_consult_member(&skeleton, &outcome)?;
+                            if let Some(context) = role_context.as_mut() {
+                                (context.observer)(&outcome)?;
+                            }
+                            outcomes[index] = Some(outcome);
+                            continue;
+                        }
+                    }
+                }
+                outcome.channel_facts = Some(facts);
                 ready.push(ReadyConsultMemberV3 {
                     index,
                     alias,
@@ -1412,6 +1745,9 @@ fn run_channel_consultation_v3(root: &Path, args: &ConsultArgs) -> Result<Consul
                     attachment_manifest.sha256(),
                 ));
                 archive_channel_consult_member(&skeleton, &outcome)?;
+                if let Some(context) = role_context.as_mut() {
+                    (context.observer)(&outcome)?;
+                }
                 outcomes[index] = Some(outcome);
             }
         }
@@ -1424,12 +1760,23 @@ fn run_channel_consultation_v3(root: &Path, args: &ConsultArgs) -> Result<Consul
     }).collect::<Vec<_>>();
     let start_bytes = serde_json::to_vec(&serde_json::json!({"version":1,"consultationId":skeleton.id,
         "project":canonical_root,"head":fixed_head,"configDigest":snapshot.sha256(),"startedAt":now_rfc3339(),
-        "summary":crate::observation::safe_observation_text(&question.text).chars().take(240).collect::<String>(),"members":slots}))?;
+        "summary":crate::observation::safe_observation_text(&question.text).chars().take(240).collect::<String>(),"members":slots}),
+    )?;
     #[cfg(test)]
     if FAIL_OBSERVATION_START.with(|flag| flag.get()) {bail!("injected start publication failure");}
     write_new_regular(&skeleton.dir.join("start.json"), &start_bytes)?;
     let start_digest = sha256(&start_bytes);
 
+    let opencode_order = ready
+        .iter()
+        .filter(|member| member.driver == crate::harness::HarnessId::OpenCode)
+        .enumerate()
+        .map(|(ordinal, member)| (member.index, ordinal))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let opencode_gate = std::sync::Arc::new((
+        std::sync::Mutex::new((0usize, None::<Instant>)),
+        std::sync::Condvar::new(),
+    ));
     std::thread::scope(|scope| -> Result<()> {
         let (sender, receiver) = std::sync::mpsc::channel();
         for mut member in ready {
@@ -1437,8 +1784,43 @@ fn run_channel_consultation_v3(root: &Path, args: &ConsultArgs) -> Result<Consul
             let phase_dir = skeleton.dir.clone();
             let phase_digest = start_digest.clone();
             let consultation_id = skeleton.id.clone();
+            let opencode_ordinal = opencode_order.get(&member.index).copied();
+            let opencode_gate = opencode_gate.clone();
             scope.spawn(move || {
                     let started = Instant::now();
+                    if let Some(ordinal) = opencode_ordinal {
+                        let (lock, condition) = &*opencode_gate;
+                        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+                        while state.0 != ordinal {
+                            state = condition.wait(state).unwrap_or_else(|error| error.into_inner());
+                        }
+                        if let Some(previous) = state.1 {
+                            let minimum = previous + Duration::from_secs(1);
+                            while Instant::now() < minimum {
+                                let remaining = minimum.saturating_duration_since(Instant::now());
+                                let waited = condition
+                                    .wait_timeout(state, remaining)
+                                    .unwrap_or_else(|error| error.into_inner());
+                                state = waited.0;
+                            }
+                        }
+                    }
+                    let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let release_gate = {
+                        let gate = opencode_gate.clone();
+                        let released = released.clone();
+                        move || {
+                            if opencode_ordinal.is_some()
+                                && !released.swap(true, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                let (lock, condition) = &*gate;
+                                let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+                                state.1 = Some(Instant::now());
+                                state.0 += 1;
+                                condition.notify_all();
+                            }
+                        }
+                    };
                     let execution = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         let rendered = member
                             .rendered
@@ -1446,10 +1828,14 @@ fn run_channel_consultation_v3(root: &Path, args: &ConsultArgs) -> Result<Consul
                             .context("prepared consult member lost its render")?;
                         crate::channel::preflight_invocation_v1(rendered)
                             .and_then(|invocation| crate::channel::run_preflighted_observed(invocation, &mut |phase, pid| {
+                                if phase == "spawned" {
+                                    release_gate();
+                                }
                                 let marker=serde_json::json!({"version":1,"consultationId":consultation_id,"startDigest":phase_digest,"index":member.index,"actionId":member.action_id,"phase":phase,"observedAt":now_rfc3339(),"pid":pid});
                                 write_new_regular(&phase_dir.join(format!("{}.{phase}.json",member.index)), &serde_json::to_vec(&marker)?)
                             }))
                     }));
+                    release_gate();
                     let _ = sender.send((member, started.elapsed().as_secs(), execution));
             });
         }
@@ -1457,11 +1843,15 @@ fn run_channel_consultation_v3(root: &Path, args: &ConsultArgs) -> Result<Consul
         let mut first_error = None;
         for (member, duration_secs, execution) in receiver {
             let index = member.index;
-            let finished = finish_channel_consult_member_v3(&log_dir, member, duration_secs, execution)
-                .and_then(|outcome| {
-                    archive_channel_consult_member(&skeleton, &outcome)?;
-                    Ok(outcome)
-                });
+            let finished =
+                finish_channel_consult_member_v3(&log_dir, member, duration_secs, execution)
+                    .and_then(|outcome| {
+                        archive_channel_consult_member(&skeleton, &outcome)?;
+                        if let Some(context) = role_context.as_mut() {
+                            (context.observer)(&outcome)?;
+                        }
+                        Ok(outcome)
+                    });
             match finished {
                 Ok(outcome) => outcomes[index] = Some(outcome),
                 Err(error) if first_error.is_none() => first_error = Some(error),
@@ -1480,8 +1870,12 @@ fn run_channel_consultation_v3(root: &Path, args: &ConsultArgs) -> Result<Consul
             outcome.with_context(|| format!("consult member {index} 缺稳定结果槽"))
         })
         .collect::<Result<Vec<_>>>()?;
-    if members.iter().any(|member| member.channel_facts.as_ref()
-        .is_some_and(|facts| facts["stage"] == "unclosed")) {
+    if members.iter().any(|member| {
+        member
+            .channel_facts
+            .as_ref()
+            .is_some_and(|facts| facts["stage"] == "unclosed")
+    }) {
         bail!("consultation {} remains unclosed (HOLD); stable member artifacts are in {}; no summary/completion or GC authority",
             skeleton.id, skeleton.fusion_dir.display());
     }
@@ -1507,24 +1901,26 @@ fn run_channel_consultation_v3(root: &Path, args: &ConsultArgs) -> Result<Consul
         .iter()
         .filter(|member| member.status == MemberStatus::Ok)
         .count();
-    append_consultation_log(
-        root,
-        &serde_json::json!({
-            "ts": created_at,
-            "kind": "ConsultationCompleted",
-            "id": skeleton.id,
-            "round": current_round_for_log(root),
-            "questionPath": question.display_path,
-            "questionSha256": question.sha256,
-            "membersOk": members_ok,
-            "membersFailed": members.len() - members_ok,
-            "harnesses": explicit_members.as_slice(),
-            "summaryPath": root_relative(root, &summary_path),
-            "dir": root_relative(root, &skeleton.dir),
-            "invocation": "unified-channel-v1",
-            "attachmentManifestSha256": attachment_manifest.sha256(),
-        }),
-    )?;
+    if role_context.is_none() {
+        append_consultation_log(
+            root,
+            &serde_json::json!({
+                "ts": created_at,
+                "kind": "ConsultationCompleted",
+                "id": skeleton.id,
+                "round": current_round_for_log(root),
+                "questionPath": question.display_path,
+                "questionSha256": question.sha256,
+                "membersOk": members_ok,
+                "membersFailed": members.len() - members_ok,
+                "harnesses": explicit_members.as_slice(),
+                "summaryPath": root_relative(root, &summary_path),
+                "dir": root_relative(root, &skeleton.dir),
+                "invocation": "unified-channel-v1",
+                "attachmentManifestSha256": attachment_manifest.sha256(),
+            }),
+        )?;
+    }
     Ok(ConsultOutcome {
         id: skeleton.id,
         dir: skeleton.dir,
@@ -1634,8 +2030,16 @@ fn forbidden_artifact_patterns(root: &Path) -> Result<Vec<String>> {
     let path = root.join("coordination/PROJECT-BINDING.yaml");
     let source = match fs::read_to_string(&path) {
         Ok(source) => source,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !crate::has_selfhost_state(root)? => return Ok(Vec::new()),
-        Err(error) => return Err(error).with_context(|| format!("读取 PROJECT-BINDING 失败：{}", path.display())),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && !crate::has_selfhost_state(root)? =>
+        {
+            return Ok(Vec::new())
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取 PROJECT-BINDING 失败：{}", path.display()))
+        }
     };
     let value: serde_yaml::Value = serde_yaml::from_str(&source)
         .with_context(|| format!("解析 PROJECT-BINDING 失败：{}", path.display()))?;
@@ -2013,28 +2417,70 @@ mod tests {
         let status=std::process::Command::new("/bin/sh").args(["-c","exit 0"]).status().unwrap();
         let mut results=Vec::new();
         for case in 0..5 {
-            let path=root.join(format!("case-{case}"));fs::create_dir_all(&path).unwrap();
-            let raw=path.join("raw");fs::write(&raw,b"diagnostic").unwrap();
-            let output=ChannelExecution{process_id:1,status:Some(status),stdout:vec![],stderr:vec![],
-                reason:ChannelExitReason::Exited,hard_deadline_secs:30,first_frame_after_millis:None,
-                leader_exited_after_millis:Some(1),elapsed_millis:1,process_group_terminated:true,
-                phase_observation_v1:vec![],observation_errors:vec![],stdout_capture_path:Some(raw.clone()),stderr_capture_path:Some(raw),
-                stdout_overflow:case==1,stderr_overflow:case==2,stdout_eof_observed:case!=3,stderr_eof_observed:case!=4,
-                native_final:Some(serde_json::json!({"projectionStatus":"available","nativeTerminated":true,
-                    "final":{"text":text,"sha256":hex::encode(Sha256::digest(text.as_bytes()))}}))};
-            let driver=crate::harness::HarnessId::SmartClaw;
-            let mut outcome=MemberOutcome::new(case,format!("fixture-{case}"),MemberStatus::Failed);
-            outcome.channel_facts=Some(serde_json::json!({}));
-            let ready=ReadyConsultMemberV3{index:case,alias:format!("fixture-{case}"),action_id:format!("fixture-{case}"),
-                driver,effective_model:None,contract:driver.driver_contract(crate::harness::DriverAction::Consult).unwrap(),
-                rendered:None,outcome};
-            let result=finish_channel_consult_member_v3(&path,ready,1,Ok(Ok(output))).unwrap();
-            if case==0 {assert_eq!(result.status,MemberStatus::Ok,"{result:?}");assert_eq!(result.answer.as_deref(),Some(text));}
-            else {
-                assert_eq!(result.status,MemberStatus::Failed,"case {case}: {result:?}");
-                assert_eq!(result.failure_class,Some(FailureClass::ObservationFailed));assert!(result.answer.is_none());
-                assert_eq!(result.channel_facts.as_ref().unwrap()["stage"],"incomplete-capture");
-                assert_eq!(result.channel_facts.as_ref().unwrap()["terminal"]["turnEnded"],false);
+            let path = root.join(format!("case-{case}"));
+            fs::create_dir_all(&path).unwrap();
+            let raw = path.join("raw");
+            fs::write(&raw, b"diagnostic").unwrap();
+            let output = ChannelExecution {
+                process_id: 1,
+                status: Some(status),
+                stdout: vec![],
+                stderr: vec![],
+                reason: ChannelExitReason::Exited,
+                hard_deadline_secs: 30,
+                first_frame_after_millis: None,
+                leader_exited_after_millis: Some(1),
+                elapsed_millis: 1,
+                process_group_terminated: true,
+                phase_observation_v1: vec![],
+                observation_errors: vec![],
+                stdout_capture_path: Some(raw.clone()),
+                stderr_capture_path: Some(raw),
+                stdout_overflow: case == 1,
+                stderr_overflow: case == 2,
+                stdout_eof_observed: case != 3,
+                stderr_eof_observed: case != 4,
+                native_final: Some(
+                    serde_json::json!({"projectionStatus":"available","nativeTerminated":true,
+                    "final":{"text":text,"sha256":hex::encode(Sha256::digest(text.as_bytes()))}}),
+                ),
+            };
+            let driver = crate::harness::HarnessId::SmartClaw;
+            let mut outcome =
+                MemberOutcome::new(case, format!("fixture-{case}"), MemberStatus::Failed);
+            outcome.channel_facts = Some(serde_json::json!({}));
+            let ready = ReadyConsultMemberV3 {
+                index: case,
+                alias: format!("fixture-{case}"),
+                action_id: format!("fixture-{case}"),
+                driver,
+                effective_model: None,
+                contract: driver
+                    .driver_contract(crate::harness::DriverAction::Consult)
+                    .unwrap(),
+                rendered: None,
+                outcome,
+            };
+            let result = finish_channel_consult_member_v3(&path, ready, 1, Ok(Ok(output))).unwrap();
+            if case == 0 {
+                assert_eq!(result.status, MemberStatus::Ok, "{result:?}");
+                assert_eq!(result.answer.as_deref(), Some(text));
+            } else {
+                assert_eq!(
+                    result.status,
+                    MemberStatus::Failed,
+                    "case {case}: {result:?}"
+                );
+                assert_eq!(result.failure_class, Some(FailureClass::ObservationFailed));
+                assert!(result.answer.is_none());
+                assert_eq!(
+                    result.channel_facts.as_ref().unwrap()["stage"],
+                    "incomplete-capture"
+                );
+                assert_eq!(
+                    result.channel_facts.as_ref().unwrap()["terminal"]["turnEnded"],
+                    false
+                );
             }
             results.push(result);
         }
@@ -2075,47 +2521,121 @@ c.commit()
             let path = root.join(format!("case-{index}")); fs::create_dir_all(&path).unwrap();
             let action_id = format!("native-{index}"); let session = format!("orch-wake-{action_id}");
             let database = path.join("native.sqlite");
-            assert!(Command::new("/usr/bin/python3").args(["-I","-c",create]).arg(&database)
-                .arg(&session).arg(&root).arg(prompt).arg(final_text).arg(state)
-                .arg(has_final.to_string()).status().unwrap().success());
-            let child = Command::new("/bin/sh").args(["-c","printf '%s' '{\"type\":\"truncated'; exit \"$1\"","fixture"])
-                .arg(code.to_string()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).spawn().unwrap();
-            let pid = child.id(); let process = child.wait_with_output().unwrap();
-            unsafe extern "C" { fn killpg(group: i32, signal: i32) -> i32; }
-            assert_eq!(unsafe { killpg(pid as i32,0) }, -1);
-            assert_eq!(std::io::Error::last_os_error().raw_os_error(),Some(3));
-            let native = crate::channel::smartclaw::inspect_native_final(&root,&database,&session,&root,
-                &wanted,&process.stdout,true).unwrap();
-            let stdout_path = path.join("raw.stdout"); let stderr_path = path.join("raw.stderr");
-            fs::write(&stdout_path,&process.stdout).unwrap(); fs::write(&stderr_path,&process.stderr).unwrap();
-            let mut execution = ChannelExecution { process_id:pid,status:Some(process.status),stdout:process.stdout,
-                stderr:process.stderr,reason:ChannelExitReason::Exited,hard_deadline_secs:30,
-                first_frame_after_millis:None,leader_exited_after_millis:Some(1),elapsed_millis:1,
-                process_group_terminated:true,phase_observation_v1:vec![],observation_errors:vec![],stdout_capture_path:Some(stdout_path),
-                stderr_capture_path:Some(stderr_path),stdout_overflow:false,stderr_overflow:false,
-                stdout_eof_observed:true,stderr_eof_observed:true,native_final:Some(native) };
-            if index==0 {
+            assert!(Command::new("/usr/bin/python3")
+                .args(["-I", "-c", create])
+                .arg(&database)
+                .arg(&session)
+                .arg(&root)
+                .arg(prompt)
+                .arg(final_text)
+                .arg(state)
+                .arg(has_final.to_string())
+                .status()
+                .unwrap()
+                .success());
+            let child = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "printf '%s' '{\"type\":\"truncated'; exit \"$1\"",
+                    "fixture",
+                ])
+                .arg(code.to_string())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let process = child.wait_with_output().unwrap();
+            unsafe extern "C" {
+                fn killpg(group: i32, signal: i32) -> i32;
+            }
+            assert_eq!(unsafe { killpg(pid as i32, 0) }, -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(3));
+            let native = crate::channel::smartclaw::inspect_native_final(
+                &root,
+                &database,
+                &session,
+                &root,
+                &wanted,
+                &process.stdout,
+                true,
+            )
+            .unwrap();
+            let stdout_path = path.join("raw.stdout");
+            let stderr_path = path.join("raw.stderr");
+            fs::write(&stdout_path, &process.stdout).unwrap();
+            fs::write(&stderr_path, &process.stderr).unwrap();
+            let mut execution = ChannelExecution {
+                process_id: pid,
+                status: Some(process.status),
+                stdout: process.stdout,
+                stderr: process.stderr,
+                reason: ChannelExitReason::Exited,
+                hard_deadline_secs: 30,
+                first_frame_after_millis: None,
+                leader_exited_after_millis: Some(1),
+                elapsed_millis: 1,
+                process_group_terminated: true,
+                phase_observation_v1: vec![],
+                observation_errors: vec![],
+                stdout_capture_path: Some(stdout_path),
+                stderr_capture_path: Some(stderr_path),
+                stdout_overflow: false,
+                stderr_overflow: false,
+                stdout_eof_observed: true,
+                stderr_eof_observed: true,
+                native_final: Some(native),
+            };
+            if index == 0 {
                 for bad in 0..4 {
-                    execution.stdout_overflow=bad==0;execution.stderr_overflow=bad==1;
-                    execution.stdout_eof_observed=bad!=2;execution.stderr_eof_observed=bad!=3;
-                    let observed=crate::channel::inspect_smartclaw_capture(&root,&database,&session,&root,&wanted,&execution).unwrap();
-                    assert_eq!(observed["raw"]["streamClosed"],false,"case {bad}: {observed}");
-                    assert_eq!(observed["projectionStatus"],"unavailable");
+                    execution.stdout_overflow = bad == 0;
+                    execution.stderr_overflow = bad == 1;
+                    execution.stdout_eof_observed = bad != 2;
+                    execution.stderr_eof_observed = bad != 3;
+                    let observed = crate::channel::inspect_smartclaw_capture(
+                        &root, &database, &session, &root, &wanted, &execution,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        observed["raw"]["streamClosed"], false,
+                        "case {bad}: {observed}"
+                    );
+                    assert_eq!(observed["projectionStatus"], "unavailable");
                 }
                 execution.stdout_overflow=false;execution.stderr_overflow=false;
                 execution.stdout_eof_observed=true;execution.stderr_eof_observed=true;
             }
             let driver = crate::harness::HarnessId::SmartClaw;
-            let mut outcome = MemberOutcome::new(index,"native",MemberStatus::Failed);
-            outcome.channel_facts=Some(serde_json::json!({}));
-            let ready = ReadyConsultMemberV3 {index,alias:"native".into(),action_id,driver,effective_model:None,
-                contract:driver.driver_contract(crate::harness::DriverAction::Consult).unwrap(),rendered:None,outcome};
-            let log_dir=path.join("logs");fs::create_dir_all(&log_dir).unwrap();
-            let result=finish_channel_consult_member_v3(&log_dir,ready,1,Ok(Ok(execution))).unwrap();
-            assert_eq!(result.status,expected,"code={code} native={state}/{has_final} result={result:?}");
-            assert_eq!(result.exit_code,Some(code));
-            if expected==MemberStatus::Ok { assert_eq!(result.answer.as_deref(),Some(final_text)); }
-            if state=="running" { assert_eq!(result.channel_facts.unwrap()["stage"],"unclosed"); }
+            let mut outcome = MemberOutcome::new(index, "native", MemberStatus::Failed);
+            outcome.channel_facts = Some(serde_json::json!({}));
+            let ready = ReadyConsultMemberV3 {
+                index,
+                alias: "native".into(),
+                action_id,
+                driver,
+                effective_model: None,
+                contract: driver
+                    .driver_contract(crate::harness::DriverAction::Consult)
+                    .unwrap(),
+                rendered: None,
+                outcome,
+            };
+            let log_dir = path.join("logs");
+            fs::create_dir_all(&log_dir).unwrap();
+            let result =
+                finish_channel_consult_member_v3(&log_dir, ready, 1, Ok(Ok(execution))).unwrap();
+            assert_eq!(
+                result.status, expected,
+                "code={code} native={state}/{has_final} result={result:?}"
+            );
+            assert_eq!(result.exit_code, Some(code));
+            if expected == MemberStatus::Ok {
+                assert_eq!(result.answer.as_deref(), Some(final_text));
+            }
+            if state == "running" {
+                assert_eq!(result.channel_facts.unwrap()["stage"], "unclosed");
+            }
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -2137,6 +2657,7 @@ c.commit()
         ))
     }
 
+    #[cfg(feature = "selfhost")]
     fn event(kind: &str, actor: &str, payload: serde_json::Value) -> EventRecord {
         serde_json::from_value(serde_json::json!({
             "eventId": ulid::Ulid::new().to_string(),
@@ -2149,6 +2670,7 @@ c.commit()
         .unwrap()
     }
 
+    #[cfg(feature = "selfhost")]
     fn validation(revision: u32) -> EventRecord {
         event(
             "TaskValidated",
@@ -2157,6 +2679,7 @@ c.commit()
         )
     }
 
+    #[cfg(feature = "selfhost")]
     fn signoff(revision: u32) -> EventRecord {
         event(
             "PlanSignedOff",
@@ -2168,6 +2691,7 @@ c.commit()
         )
     }
 
+    #[cfg(feature = "selfhost")]
     fn write_root_ledger(root: &Path, events: &[EventRecord]) -> Vec<u8> {
         fs::create_dir_all(root.join("coordination/runtime")).unwrap();
         fs::create_dir_all(root.join("coordination/rounds/r90")).unwrap();
@@ -2181,6 +2705,7 @@ c.commit()
         bytes
     }
 
+    #[cfg(feature = "selfhost")]
     #[test]
     fn production_wrapper_covers_delivery_replan_close_and_no_round() {
         let none = temp_root("no-round");
@@ -2220,7 +2745,7 @@ c.commit()
     }
 
     #[test]
-    fn bad_ledger_refuses_and_refusal_only_appends_the_consult_log() {
+    fn bad_ledger_refuses() {
         let bad = temp_root("bad-ledger");
         fs::create_dir_all(bad.join("coordination/runtime")).unwrap();
         fs::create_dir_all(bad.join("coordination/rounds/r90")).unwrap();
@@ -2232,9 +2757,13 @@ c.commit()
         .unwrap();
         assert!(matches!(
             consultation_admitted(&bad).unwrap(),
-            GateDecision::Refuse { reason } if reason.contains("坏行")
+            GateDecision::Refuse { reason } if reason.contains(if cfg!(feature = "selfhost") { "坏行" } else { "selfhost state" })
         ));
+    }
 
+    #[cfg(feature = "selfhost")]
+    #[test]
+    fn refusal_only_appends_the_consult_log() {
         let root = temp_root("append");
         let ledger = write_root_ledger(&root, &[validation(1), signoff(1)]);
         let decision = consultation_admitted(&root).unwrap();
@@ -2432,7 +2961,6 @@ c.commit()
     }
 }
 
-
 pub const ANSWER_BODY_LIMIT: usize = 64 * 1024;
 
 /// Normalise the measured provider JSON-lines shapes into one answer contract.
@@ -2495,9 +3023,14 @@ pub fn extract_member_answer(raw: &str) -> ExtractedAnswer {
 #[cfg(not(feature = "selfhost"))]
 pub fn consultation_admitted(root: &Path) -> Result<GateDecision> {
     if crate::has_selfhost_state(root)? {
-        Ok(GateDecision::Refuse { reason: "project contains selfhost state; use an orch build with --features selfhost".to_owned() })
+        Ok(GateDecision::Refuse {
+            reason: "project contains selfhost state; use an orch build with --features selfhost"
+                .to_owned(),
+        })
     } else {
-        Ok(GateDecision::Admit { basis: "standalone Git project with local harness configuration".to_owned() })
+        Ok(GateDecision::Admit {
+            basis: "standalone Git project with local harness configuration".to_owned(),
+        })
     }
 }
 
@@ -2506,18 +3039,65 @@ std::thread_local! { static FAIL_OBSERVATION_START: std::cell::Cell<bool> = cons
 #[cfg(test)]
 mod observation_start_tests {
     use super::*;
-    use std::{process::Command,os::unix::fs::PermissionsExt};
+    use std::{os::unix::fs::PermissionsExt, process::Command};
     #[test]
     fn start_publication_failure_prevents_real_consult_fanout() {
-        let root=crate::util::test_scratch_dir("start-publication-failure");fs::create_dir_all(root.join(".orch")).unwrap();
-        fs::write(root.join(".gitignore"),".orch/\ncoordination/\n.cowork-temp/\n").unwrap();fs::write(root.join("question"),"fixture").unwrap();
-        for args in [vec!["init","-q"],vec!["add","question",".gitignore"],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-qm","base"]]{assert!(Command::new("git").arg("-C").arg(&root).args(args).status().unwrap().success())}
-        let exe=root.join("provider");fs::write(&exe,"#!/bin/sh\nprintf started > unexpected-child\n").unwrap();fs::set_permissions(&exe,fs::Permissions::from_mode(0o755)).unwrap();
+        let root = crate::util::test_scratch_dir("start-publication-failure");
+        fs::create_dir_all(root.join(".orch")).unwrap();
+        fs::write(
+            root.join(".gitignore"),
+            ".orch/\ncoordination/\n.cowork-temp/\n",
+        )
+        .unwrap();
+        fs::write(root.join("question"), "fixture").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "question", ".gitignore"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        ] {
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success())
+        }
+        let exe = root.join("provider");
+        fs::write(&exe, "#!/bin/sh\nprintf started > unexpected-child\n").unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(root.join(".orch/harnesses.yaml"),format!("version: 1\nharnesses:\n  one:\n    driver: claude\n    executable: {}\n    enabled: true\n    cwdPolicy: project-root\n",exe.display())).unwrap();
-        struct Reset;impl Drop for Reset{fn drop(&mut self){FAIL_OBSERVATION_START.with(|flag|flag.set(false));}}
-        let _reset=Reset;FAIL_OBSERVATION_START.with(|flag|flag.set(true));
-        let result=run_consultation(&root,&ConsultArgs{question:"question".into(),harnesses:vec!["one".into()],member_timeout_secs:Some(3),total_wall_secs:Some(5),..Default::default()});
-        assert!(result.unwrap_err().to_string().contains("start publication failure"));assert!(!root.join("unexpected-child").exists());
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FAIL_OBSERVATION_START.with(|flag| flag.set(false));
+            }
+        }
+        let _reset = Reset;
+        FAIL_OBSERVATION_START.with(|flag| flag.set(true));
+        let result = run_consultation(
+            &root,
+            &ConsultArgs {
+                question: "question".into(),
+                harnesses: vec!["one".into()],
+                member_timeout_secs: Some(3),
+                total_wall_secs: Some(5),
+                ..Default::default()
+            },
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("start publication failure"));
+        assert!(!root.join("unexpected-child").exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

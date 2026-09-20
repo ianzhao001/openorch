@@ -47,7 +47,7 @@ fn bytes_tree(root:&Path)->std::collections::BTreeMap<PathBuf,Vec<u8>>{let mut r
 #[test]
 fn refresh_and_detail_leave_every_project_byte_unchanged(){let f=Fixture::new();f.run();let before=bytes_tree(&f.root);let mut r=ObservationReader::open(&f.root).unwrap();for _ in 0..3{let s=r.refresh().unwrap();r.detail(&s.rows[0].id).unwrap();}drop(r);assert_eq!(before,bytes_tree(&f.root));}
 #[test]
-fn controls_and_ansi_split_credentials_are_never_displayed(){for value in ["sk-\x1b[0mSECRET", "Bearer se\x1b[1mcret", "API_KEY=abc\n", "x=1\nAPI_KEY=abc"]{assert_eq!(safe_observation_text(value),"[redacted]");}assert!(!safe_observation_text("中文\u{009b}\x1b]52;c;AAA\x07").chars().any(char::is_control));}
+fn controls_and_ansi_split_credentials_are_never_displayed(){for value in ["sk-\x1b[0mSECRET", "Bearer se\x1b[1mcret", "API_KEY=abc\n", "x=1\nAPI_KEY=abc"]{assert_eq!(safe_observation_text(value),"[redacted]");}assert!(!safe_observation_text("中文\u{009b}\x1b]52;c;AAA\x07").chars().any(char::is_control));let d=orch_host::consult::ChannelDiagnostic::provider_failure(Some("protocol"),Some("failed at /Users/private/secret"),None);assert_eq!(d.reason.as_deref(),Some("[redacted path]"));}
 #[test]
 fn public_observation_contract_has_substantive_docs(){let guide=include_str!("../../../docs/AI-MECHANICAL-GUIDE.md");for text in ["phaseObservationV1","start.json","ObservationReader","32 MiB","8 MiB","last observed"]{assert!(guide.contains(text),"missing {text}");}}
 
@@ -66,4 +66,12 @@ fn derived_capture_stability_cannot_override_contradictory_raw_facts(){
  let f=Fixture::new();let dir=f.run();let path=dir.join("fusion/0-one.manifest.json");let original:Value=serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();let mut r=ObservationReader::open(&f.root).unwrap();
  for(key,value)in [("processGroupTerminated",Value::from(false)),("stdoutEofObserved",Value::from(false)),("stderrEofObserved",Value::from(false)),("stdoutOverflow",Value::from(true)),("stderrOverflow",Value::from(true)),("observationErrors",serde_json::json!(["error"]))]{let mut v=original.clone();v["channelFacts"]["execution"][key]=value;rewrite(&path,&v);assert_ne!(r.refresh().unwrap().rows[0].result,"verified","{key}");}
  rewrite(&path,&original);assert_eq!(r.refresh().unwrap().rows[0].result,"verified");
+}
+
+#[test]
+fn legacy_all_missing_capture_facts_are_neutral_invalid_and_unreadable(){
+ let f=Fixture::new();let dir=f.run();let path=dir.join("fusion/0-one.manifest.json");let original:Value=serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();let mut legacy=original.clone();let execution=legacy["channelFacts"]["execution"].as_object_mut().unwrap();
+ for key in ["stdoutEofObserved","stderrEofObserved","stdoutOverflow","stderrOverflow"]{execution.remove(key);}
+ rewrite(&path,&legacy);let mut reader=ObservationReader::open(&f.root).unwrap();let snapshot=reader.refresh().unwrap();let row=&snapshot.rows[0];assert_eq!(row.result,"invalid");assert_eq!(row.channel_diagnostic().unwrap().code,orch_host::consult::DiagnosticCode::CaptureEvidenceMissing);assert!(reader.detail(&row.id).unwrap().text.is_none());
+ let mut partial=original.clone();partial["channelFacts"]["execution"].as_object_mut().unwrap().remove("stdoutEofObserved");rewrite(&path,&partial);let snapshot=reader.refresh().unwrap();assert_eq!(snapshot.rows[0].result,"invalid");assert_eq!(snapshot.rows[0].channel_diagnostic().unwrap().code,orch_host::consult::DiagnosticCode::ProviderFailure);
 }

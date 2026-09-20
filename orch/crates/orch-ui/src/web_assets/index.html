@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="orch-capability" content="__ORCH_CAPABILITY__">
-  <title>OpenOrch · Observation</title>
+  <title>OpenOrch · Local workspace</title>
   <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
@@ -31,11 +31,44 @@
     <button class="view active" data-view="home" type="button" data-i18n="tasks">Tasks</button>
     <button class="view" data-view="calls" type="button" data-i18n="calls">All calls</button>
     <button class="view" data-view="members" type="button" data-i18n="members">Members</button>
+    <button class="view" data-view="fusion" type="button" data-i18n="fusion">Fusion</button>
     <span class="read-status"><span id="status-dot" aria-hidden="true"></span><span id="read-status">Loading…</span></span>
   </nav>
 
   <main>
-    <section class="filters" aria-label="Filters">
+    <section id="fusion-workspace" class="fusion-workspace" aria-label="Fusion" hidden>
+      <div class="section-heading"><div><span class="eyebrow" data-f-i18n="eyebrow">EXPLICIT CONSULTATION</span><h1 data-f-i18n="title">Roles and Fusion</h1></div><div class="fusion-actions"><button id="fusion-native-refresh" class="quiet" type="button" data-f-i18n="refreshNative">Refresh native settings</button><button id="fusion-reload" class="quiet" type="button" data-f-i18n="reload">Reload saved roles</button><button id="fusion-save" type="button" data-f-i18n="save">Save roles</button></div></div>
+      <p id="fusion-note" class="notice" aria-live="polite"></p>
+      <p id="fusion-native-status" class="window-summary" aria-live="polite"></p>
+      <div class="fusion-layout">
+        <section class="fusion-panel"><div class="fusion-panel-head"><h2 data-f-i18n="library">Role library</h2><button id="fusion-add-role" class="quiet" type="button" data-f-i18n="addRole">Add role</button></div><div id="fusion-role-list" class="fusion-role-list"></div></section>
+        <section class="fusion-panel"><div class="fusion-panel-head"><h2 data-f-i18n="roleSettings">Role settings</h2><button id="fusion-delete-role" class="quiet danger" type="button" data-f-i18n="deleteRole">Delete role</button></div>
+          <div id="fusion-role-empty" class="empty" data-f-i18n="chooseRole">Add or choose a role.</div>
+          <div id="fusion-role-fields" class="fusion-form" hidden>
+            <label><span data-f-i18n="name">Name</span><input id="fusion-role-name" maxlength="256" autocomplete="off"></label>
+            <label><span data-f-i18n="harness">Native client</span><select id="fusion-role-harness"></select></label>
+            <p id="fusion-role-native" class="fusion-hint"></p>
+            <label class="fusion-wide"><span data-f-i18n="instructions">Perspective and instructions</span><textarea id="fusion-role-instructions" rows="5" maxlength="16384"></textarea></label>
+            <p class="fusion-wide fusion-hint" data-f-i18n="followHint">Leave a field blank to follow exposed native settings. Explicit values are kept unchanged.</p>
+            <label><span data-f-i18n="provider">Provider</span><input id="fusion-role-provider" list="fusion-provider-options" maxlength="512" autocomplete="off"><datalist id="fusion-provider-options"></datalist></label>
+            <label><span data-f-i18n="model">Model</span><input id="fusion-role-model" list="fusion-model-options" maxlength="512" autocomplete="off"><datalist id="fusion-model-options"></datalist></label>
+            <label><span data-f-i18n="effort">Effort / variant</span><input id="fusion-role-effort" list="fusion-effort-options" maxlength="512" autocomplete="off"><datalist id="fusion-effort-options"></datalist></label>
+            <label><span data-f-i18n="mode">Native mode / profile</span><input id="fusion-role-mode" maxlength="512" autocomplete="off"></label>
+            <button id="fusion-use-configured" class="quiet fusion-wide" type="button" data-f-i18n="useConfigured">Use captured project alias pins</button>
+            <details class="fusion-wide"><summary data-f-i18n="sources">Native configuration sources</summary><ul id="fusion-role-sources"></ul></details>
+          </div>
+        </section>
+      </div>
+      <section class="fusion-panel fusion-composition"><div class="fusion-panel-head"><h2 data-f-i18n="composition">Saved combination</h2><div class="fusion-actions"><button id="fusion-add-combination" class="quiet" type="button" data-f-i18n="newCombination">New combination</button><button id="fusion-delete-combination" class="quiet danger" type="button" data-f-i18n="deleteCombination">Delete combination</button></div></div>
+        <div class="fusion-form"><label><span data-f-i18n="combination">Combination</span><select id="fusion-combination"></select></label><label><span data-f-i18n="combinationName">Combination name</span><input id="fusion-combination-name" maxlength="256"></label><label><span data-f-i18n="addMember">Add consultation role</span><select id="fusion-add-member"></select></label><button id="fusion-add-member-button" class="quiet" type="button" data-f-i18n="add">Add</button></div>
+        <div id="fusion-members" class="fusion-members"></div>
+        <label class="fusion-synth-label"><span data-f-i18n="synthesizer">Synthesis role</span><select id="fusion-synthesizer"></select></label>
+        <p class="fusion-hint" data-f-i18n="combinationHint">Run 2–5 enabled roles in parallel, then synthesize once. Disabled roles stay in this combination.</p>
+      </section>
+      <section class="fusion-panel"><div class="fusion-panel-head"><h2 data-f-i18n="question">Consultation question</h2><button id="fusion-start" type="button" data-f-i18n="start">Start one Fusion</button></div><label class="fusion-question-label"><span class="sr-only" data-f-i18n="question">Consultation question</span><textarea id="fusion-question" rows="5" maxlength="131072"></textarea></label><p id="fusion-ready" class="fusion-hint"></p><p id="fusion-run-status" aria-live="polite"></p><div id="fusion-results" class="fusion-results"></div></section>
+      <section class="fusion-panel"><div class="fusion-panel-head"><h2 data-f-i18n="history">Fusion runs</h2></div><div id="fusion-history" class="fusion-history"></div></section>
+    </section>
+    <section id="observation-filters" class="filters" aria-label="Filters">
       <label class="search-wrap"><span class="sr-only" data-i18n="search">Search</span><input id="search" type="search" placeholder="Search ID, summary, member…" autocomplete="off"></label>
       <label><span data-i18n="result">Answer</span><select id="result-filter"><option value="">All</option><option>verified</option><option>invalid</option><option>failed</option><option>none</option><option>unknown</option><option>too-large</option></select></label>
       <label><span data-i18n="member">Member</span><select id="member-filter"><option value="">All</option></select></label>

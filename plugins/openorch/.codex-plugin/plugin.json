@@ -1,8 +1,10 @@
 {
   "name": "openorch",
-  "version": "0.1.0-alpha.9",
+  "version": "0.1.0-alpha.10",
   "description": "Consult your installed AI harnesses and combine their answers in Codex or DSH.",
-  "author": {"name": "ianzhao"},
+  "author": {
+    "name": "ianzhao"
+  },
   "repository": "https://github.com/ianzhao001/openorch",
   "homepage": "https://github.com/ianzhao001/openorch",
   "license": "MIT",
@@ -14,6 +16,10 @@
     "developerName": "ianzhao",
     "category": "Productivity",
     "capabilities": [],
-    "defaultPrompt": ["Set up OpenOrch for this project.", "Use OpenOrch to consult my default advisor.", "Use OpenOrch fusion and summarize the disagreements."]
+    "defaultPrompt": [
+      "Set up OpenOrch for this project.",
+      "Use OpenOrch to consult my default advisor.",
+      "Use OpenOrch fusion and summarize the disagreements."
+    ]
   }
 }

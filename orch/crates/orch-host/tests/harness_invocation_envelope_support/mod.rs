@@ -342,6 +342,7 @@ fn base_command(root: &Path, wrapper: &str, capture: &Path) -> Command {
         .env("B294_ZSTD", find_executable("zstd"))
         .env("ORCH_DSH_ZSTD_BIN", find_executable("zstd"))
         .env("DSH_HOME", root.join("dsh-home"))
+        .env_remove("ORCH_PI_PROJECT_ROOT")
         .env_remove("ORCH_DSH_PRESET")
         .env_remove("ORCH_DSH_PROFILE")
         .env("ORCH_ZCODE_CONFIG", write_zcode_config(root))

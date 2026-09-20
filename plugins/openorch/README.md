@@ -10,7 +10,7 @@ Git projects.
 ## 安装 / Install
 
 下载 [OpenOrch Release](https://github.com/ianzhao001/openorch/releases) 中的完整
-Apple Silicon macOS 插件归档并解压。插件版本为 `0.1.0-alpha.9`，核心版本仍是
+Apple Silicon macOS 插件归档并解压。插件版本为 `0.1.0-alpha.10`，核心版本仍是
 `orch 0.1.0`。源码仓本身不含运行核心，不能代替完整 Release 安装包。
 
 Download and extract the complete Apple Silicon macOS plugin archive. It includes
@@ -146,3 +146,5 @@ Product symlinks, dirty product bytes and a nonempty/symlink destination are ref
 before publication. It writes only local artifacts and a relative SHA-256 inventory;
 it never initializes Git or pushes refs. Maintainers publish from an independent
 public checkout with exact old-ref checks, then verify public downloads and installs.
+
+WebUI source now supports explicit finite Fusion and read-only Native Discovery. See the public README for build instructions and boundaries.

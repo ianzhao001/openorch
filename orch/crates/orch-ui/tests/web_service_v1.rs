@@ -292,6 +292,43 @@ fn verified_multiline_and_tamper_over_actual_http() {
     assert_ne!(d["data"]["row"]["result"], "verified");
 }
 #[test]
+fn colon_qualified_selfhost_review_reads_over_actual_http() {
+    let f = Fixture::new();
+    let round = f.0.join("coordination/rounds/r90");
+    fs::create_dir_all(&round).unwrap();
+    fs::write(f.0.join("review.md"), "answer").unwrap();
+    let tuple = json!({"provider":null,"model":"fixture","effort":null,"mode":null});
+    let binding = json!({"driver":"smartclaw","harness":"smartclaw","fixedHead":"a".repeat(40),"invocationCwd":f.0,"observationSource":"fixture","cwdSelection":"project-root","configDigest":"a".repeat(64),"requestDigest":"b".repeat(64),"attachmentManifestSha256":"c".repeat(64),"commandDigest":"d".repeat(64),"executableIdentityDigest":"e".repeat(64),"requestedTuple":tuple.clone(),"effectiveTuple":tuple});
+    let wake = "00000001-1111-4111-8111-111111111111";
+    let wake_event = "01M2JKYB6NPJZWC7Q15EEKZBYJ";
+    let requested = "00000000000000000000000002";
+    let terminal = "00000000000000000000000003";
+    let event = |id: &str, kind: &str, payload: Value| json!({"eventId":id,"ts":"2026-09-15T13:26:16Z","round":"r90","taskId":"B362","actor":"runtime:orch","type":kind,"payload":payload});
+    let mut issued = binding.clone();
+    issued["method"] = "unified-channel-v1".into();
+    issued["wakeId"] = wake.into();
+    issued["attemptId"] = "B362-A0001".into();
+    issued["action"] = "review".into();
+    let events = vec![
+        event(wake_event, "WakeIssued", issued),
+        event(requested, "ReviewRequested", json!({"wakeId":wake,"attemptId":"B362-A0001","reviewedHead":"a".repeat(40),"harness":"smartclaw"})),
+        event(terminal, "ManagedWakeTerminated", json!({"wakeId":wake,"agent":"smartclaw","state":"answered","turnEnded":true,"terminalSeen":true,"managedScopeTerminated":true,"mechanicalTerminalAbsent":false,"channelBinding":binding})),
+        event("00000000000000000000000004", "ReviewDelivered", json!({"wakeId":wake,"attemptId":"B362-A0001","harness":"smartclaw","reviewedHead":"a".repeat(40),"requestEventId":requested,"terminalEventId":terminal,"path":"review.md","sha256":"0db52f4076c082518412afd3dd3576e2cb0c63703fd7fed5e23ade60efef31d9","bytes":6,"verdict":"PASS"})),
+    ];
+    fs::write(round.join("events.jsonl"), events.iter().map(|v| format!("{v}\n")).collect::<String>()).unwrap();
+    let s = WebServer::start(&f.0, 0).unwrap();
+    let snapshot: Value = serde_json::from_str(&http(&s, "GET", &snapshot(&s), "", &[], true).2).unwrap();
+    let expected = format!("selfhost:r90:{wake_event}");
+    assert!(snapshot["data"]["rows"].as_array().unwrap().iter().any(|row| row["id"] == expected && row["result"] == "verified"));
+    let path = format!("/api/v1/projects/{}/detail?id=selfhost%3Ar90%3A{wake_event}", s.initial_project());
+    let (code, _, body) = http(&s, "GET", &path, "", &[], true);
+    assert_eq!(code, 200);
+    let detail: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(detail["data"]["row"]["id"], expected);
+    assert_eq!(detail["data"]["row"]["result"], "verified");
+    assert_eq!(detail["data"]["text"], "answer");
+}
+#[test]
 fn refresh_failure_has_no_false_generation() {
     let f = Fixture::new();
     let s = WebServer::start(&f.0, 0).unwrap();

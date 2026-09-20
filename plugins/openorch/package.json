@@ -1,11 +1,32 @@
 {
   "name": "openorch",
-  "version": "0.1.0-alpha.9",
+  "version": "0.1.0-alpha.10",
   "description": "OpenOrch shared skill and local runtime for Codex and DSH Web",
   "license": "MIT",
   "type": "module",
-  "exports": {".": "./dsh-entry.mjs", "./package.json": "./package.json"},
-  "dsh": {"bundle": {"patch": "./cordis.patch.yml"}},
-  "files": [".codex-plugin", "dsh-entry.mjs", "cordis.patch.yml", "skills", "scripts", "runtime", "HELPER.md", "README.md", "LICENSE", "catalog.json", "AGENTS.md"],
-  "dependencies": {"@deepseek-ai/dsh-skill-filesystem": "0.1.2-rc.1"}
+  "exports": {
+    ".": "./dsh-entry.mjs",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    ".codex-plugin",
+    "dsh-entry.mjs",
+    "cordis.patch.yml",
+    "skills",
+    "scripts",
+    "runtime",
+    "HELPER.md",
+    "README.md",
+    "LICENSE",
+    "catalog.json",
+    "AGENTS.md"
+  ],
+  "dependencies": {
+    "@deepseek-ai/dsh-skill-filesystem": "0.1.2-rc.1"
+  }
 }

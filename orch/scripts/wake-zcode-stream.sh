@@ -31,10 +31,16 @@ msg="$1"
 
 config_path="${ORCH_ZCODE_CONFIG:-$HOME/.zcode/cli/config.json}"
 rollout_dir="${ORCH_ZCODE_ROLLOUT_DIR:-$HOME/.zcode/cli/rollout}"
-[ -d "$rollout_dir" ] || { echo "[wake-zcode-stream] roll-out 目录不可读: $rollout_dir" >&2; exit 65; }
+if [ -z "${ORCH_FUSION_PRIVATE_ROOT:-}" ]; then
+  [ -d "$rollout_dir" ] || { echo "[wake-zcode-stream] roll-out 目录不可读: $rollout_dir" >&2; exit 65; }
+fi
 
 MSG="$msg" ROLL_DIR="$rollout_dir" ZCONFIG="$config_path" python3 - <<'PY'
 import glob
+import datetime
+import re
+import stat
+import threading
 import hashlib
 import json
 import os
@@ -218,15 +224,159 @@ def is_b228_local_stub(bundle, provider, model, effort):
     return digest == B228_LOCAL_STUB_SHA256
 
 
+# Inserted into the code-owned ZCode wrapper; only local native evidence is read.
+def bounded_native_bytes(path, limit=2 * 1024 * 1024):
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+        raise ValueError("native file must be bounded and regular")
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        data = handle.read(limit + 1)
+        after = os.fstat(handle.fileno())
+    named = os.lstat(path)
+    identity = lambda m: (m.st_dev, m.st_ino, m.st_size, m.st_mtime_ns, m.st_mode)
+    if len(data) > limit or identity(before) != identity(opened) or identity(opened) != identity(after) or identity(after) != identity(named):
+        raise ValueError("native file changed during read")
+    return data
+
+
+def prepare_fusion_settings(config):
+    private = os.environ.get("ORCH_FUSION_PRIVATE_ROOT")
+    if not private:
+        return None
+    if not consult_mode or os.environ.get("ORCH_FUSION_ROLE") != "1":
+        fail_closed("private role settings require a Fusion Consult envelope")
+    try:
+        listing = subprocess.check_output(["git", "-C", workdir, "worktree", "list", "--porcelain", "-z"], timeout=5)
+        first = listing.split(b"\0", 1)[0]
+        if not first.startswith(b"worktree "):
+            raise ValueError("missing primary Git root")
+        main = os.path.realpath(first[len(b"worktree "):].decode("utf-8"))
+        expected = os.path.join(main, ".orch", "fusion-runs")
+        if not os.path.isabs(private) or os.path.realpath(private) != private or os.path.commonpath([private, expected]) != expected:
+            raise ValueError("private settings root is outside this project's Fusion runs")
+        cursor = private
+        while cursor != main:
+            if not stat.S_ISDIR(os.lstat(cursor).st_mode):
+                raise ValueError("private settings ancestor is not a real directory")
+            cursor = os.path.dirname(cursor)
+        if os.listdir(private):
+            raise ValueError("private settings root is not empty")
+        top = subprocess.check_output(["git", "-C", workdir, "rev-parse", "--show-toplevel"], text=True, timeout=5).strip()
+        ancestors = []
+        cursor = os.path.realpath(workdir)
+        top = os.path.realpath(top)
+        while True:
+            ancestors.append(cursor)
+            if cursor == top:
+                break
+            parent = os.path.dirname(cursor)
+            if parent == cursor:
+                raise ValueError("invocation cwd is outside Git root")
+            cursor = parent
+        for directory in reversed(ancestors):
+            for name in ("zcode.json", os.path.join(".zcode", "config.json")):
+                candidate = os.path.join(directory, name)
+                if not os.path.lexists(candidate):
+                    continue
+                project_config = json.loads(bounded_native_bytes(candidate))
+                if not isinstance(project_config, dict) or any(key in project_config for key in ("model", "provider", "modelCatalog")):
+                    raise ValueError("project model/provider override is not modeled for a private role")
+        os.umask(0o077)
+        if isinstance(config.get("model"), dict):
+            config["model"]["main"] = provider + "/" + model
+        else:
+            config["model"] = provider + "/" + model
+        model_config = config["provider"][provider]["models"][model]
+        reasoning = model_config["reasoning"]
+        if effort not in reasoning.get("levels", []):
+            raise ValueError("selected effort is absent from the native model")
+        reasoning["defaultLevel"] = effort
+        settings_path = os.path.join(private, "settings.json")
+        data = (json.dumps(config, ensure_ascii=False) + "\n").encode("utf-8")
+        fd = os.open(settings_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+            identity = os.fstat(handle.fileno())
+        storage = os.path.join(private, "storage")
+        os.makedirs(os.path.join(storage, "cli", "db"), mode=0o700)
+        native_rollout = os.path.join(storage, "cli", "rollout")
+        os.mkdir(native_rollout, 0o700)
+        print(json.dumps({"type":"zcode.private-settings","path":settings_path,"dev":identity.st_dev,"ino":identity.st_ino,"sha256":hashlib.sha256(data).hexdigest()}, separators=(",", ":")), flush=True)
+        return {"settings":settings_path,"storage":storage,"db":os.path.join(storage,"cli","db","db.sqlite"),"rollout":native_rollout}
+    except Exception:
+        fail_closed("private role settings or higher-priority project configuration could not be verified")
+
+
+def native_timestamp_ns(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return int(parsed.timestamp() * 1000000000) if parsed.tzinfo is not None else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def exact_consult_pin(terminal, child_start_ns, child_end_ns):
+    session = terminal.get("sessionId")
+    trace = terminal.get("traceId")
+    if not isinstance(session, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", session):
+        return False
+    if not isinstance(trace, str) or not trace.strip() or len(trace) > 256:
+        return False
+    try:
+        path = os.path.join(rollout_dir, "model-io-" + session + ".jsonl")
+        data = bounded_native_bytes(path, 16 * 1024 * 1024)
+        metadata = os.lstat(path)
+        if metadata.st_nlink != 1 or metadata.st_mtime_ns + 5000000000 < child_start_ns or metadata.st_mtime_ns > child_end_ns + 5000000000:
+            return False
+        if not data.endswith(b"\n"):
+            return False
+        records = [json.loads(line) for line in data.splitlines() if line.strip()]
+    except Exception:
+        return False
+    rows = [r for r in records if isinstance(r, dict) and r.get("querySource") == "main_turn" and r.get("traceId") == trace]
+    if not rows:
+        return False
+    turns = set()
+    matches = 0
+    response_model = None
+    for row in rows:
+        if row.get("type") != "model_io" or row.get("sessionId") != session:
+            return False
+        turn = row.get("turnId")
+        if not isinstance(turn, str) or not turn:
+            return False
+        turns.add(turn)
+        start, end = native_timestamp_ns(row.get("startedAt")), native_timestamp_ns(row.get("completedAt"))
+        if start is None or end is None or start > end or start + 5000000000 < child_start_ns or end > child_end_ns + 5000000000:
+            return False
+        selected = row.get("model") or {}
+        if selected.get("providerId") != provider or selected.get("modelId") != model or selected.get("variant") != effort:
+            return False
+        response = row.get("response") or {}
+        if row.get("error") is None and isinstance(response.get("modelId"), str) and response.get("modelId") and response.get("text") == terminal.get("response"):
+            matches += 1
+            response_model = response["modelId"]
+    if len(turns) != 1 or matches != 1:
+        return False
+    return {"provider":provider,"model":model,"effort":effort,"responseModel":response_model,
+            "sessionId":session,"traceId":trace,"turnId":next(iter(turns)),"sourceSha256":hashlib.sha256(data).hexdigest(),"sourceBytes":len(data)}
+
+
 rollout_dir = os.environ["ROLL_DIR"]
 config_path = os.environ["ZCONFIG"]
 synthetic_b228_fixture = is_b228_local_stub(bundle, provider, model, effort)
+private_settings = None
 if not synthetic_b228_fixture:
     if not all(nonempty_string(value) for value in (provider, model, effort)):
         fail_closed("provider/model/effort must be non-empty exact strings")
     try:
-        with open(config_path, "r", encoding="utf-8") as config_file:
-            config = json.load(config_file)
+        config = json.loads(bounded_native_bytes(config_path))
     except Exception as exc:
         fail_closed("config.json is unreadable or invalid JSON: %s" % exc)
     if not isinstance(config, dict):
@@ -237,6 +387,9 @@ if not synthetic_b228_fixture:
     provider_config = providers.get(provider)
     if not isinstance(provider_config, dict):
         fail_closed("configured provider differs from signed provider")
+    private_settings = prepare_fusion_settings(config)
+    if private_settings:
+        rollout_dir = private_settings["rollout"]
     if configured_main_model(config.get("model")) != "%s/%s" % (provider, model):
         fail_closed("configured main model differs from signed provider/model")
     models = provider_config.get("models")
@@ -276,6 +429,13 @@ argv = ([bundle] if envelope_mode else ["node", bundle]) + [
 ]
 if consult_mode:
     argv.extend(["--mode", "plan"])
+child_env = os.environ.copy()
+if private_settings:
+    argv.extend(["--settings", private_settings["settings"]])
+    for key in ("ZCODE_MODEL", "ZCODE_BASE_URL", "ZCODE_STORAGE_DIR", "ZCODE_SESSION_DB", "ZCODE_SESSION_DB_PATH"):
+        child_env.pop(key, None)
+    child_env["ZCODE_STORAGE_DIR"] = private_settings["storage"]
+    child_env["ZCODE_SESSION_DB_PATH"] = private_settings["db"]
 max_frame_bytes = 64 * 1024
 deadline = time.time() + timeout
 script_started = time.time()
@@ -286,19 +446,44 @@ for path in glob.glob(os.path.join(rollout_dir, "model-io-*.jsonl")):
     stat = os.stat(path)
     baseline_sessions[path] = (stat.st_size, stat.st_mtime)
 
+child_started_ns = time.time_ns()
 try:
     process = subprocess.Popen(
         argv,
         cwd=workdir,
         stdout=subprocess.PIPE,
         stderr=None,
-        text=True,
-        bufsize=1,
+        env=child_env,
+        bufsize=0,
     )
 except Exception as exc:
     diag(f"zcode 启动失败: {exc}")
     sys.exit(3)
 
+# Drain while the child is running: waiting for exit before reading can deadlock
+# a valid large native JSON terminal on the pipe capacity. Never retain excess.
+stdout_parts = []
+stdout_state = {"bytes": 0, "overflow": False, "eof": False, "error": False}
+NATIVE_STDOUT_LIMIT = 8 * 1024 * 1024
+
+def drain_native_stdout():
+    try:
+        while True:
+            chunk = process.stdout.read(65536)
+            if not chunk:
+                stdout_state["eof"] = True
+                break
+            remaining = max(0, NATIVE_STDOUT_LIMIT - stdout_state["bytes"])
+            if remaining:
+                stdout_parts.append(chunk[:remaining])
+            stdout_state["bytes"] += len(chunk)
+            if stdout_state["bytes"] > NATIVE_STDOUT_LIMIT:
+                stdout_state["overflow"] = True
+    except Exception:
+        stdout_state["error"] = True
+
+stdout_reader = threading.Thread(target=drain_native_stdout, daemon=True)
+stdout_reader.start()
 states = {}
 seen_turn_started = False
 timed_out = False
@@ -453,9 +638,23 @@ try:
         time.sleep(0.05)
 
 finally:
-    output, _ = process.communicate()
+    if process.poll() is None:
+        process.kill()
+    process.wait()
+    stdout_reader.join(timeout=2)
 
-out = output or ""
+child_ended_ns = time.time_ns()
+if stdout_reader.is_alive() or not stdout_state["eof"] or stdout_state["overflow"] or stdout_state["error"]:
+    diag("native stdout was not complete and bounded exit=71")
+    sys.exit(71)
+if timed_out:
+    diag("native deadline reached; no consult answer exit=72")
+    sys.exit(72)
+try:
+    out = b"".join(stdout_parts).decode("utf-8")
+except UnicodeDecodeError:
+    diag("native stdout is not complete UTF-8 exit=71")
+    sys.exit(71)
 terminal = None
 terminal_candidates = 0
 malformed_native_stdout = False
@@ -505,6 +704,7 @@ if consult_mode and terminal_candidates > 1:
 session_id = terminal.get("sessionId") if terminal else None
 usage = terminal.get("usage") if terminal else None
 if terminal is not None:
+    pin_evidence = None
     response = terminal.get("response")
     response_sha256 = (
         hashlib.sha256(response.encode("utf-8")).hexdigest()
@@ -516,6 +716,13 @@ if terminal is not None:
     ):
         diag("native terminal has no complete bound consult text exit=71")
         sys.exit(71)
+    # Native role overrides additionally require the exact model-IO receipt.
+    # Legacy CLI Consult retains its existing prelaunch pin and terminal contract.
+    if consult_mode and os.environ.get("ORCH_FUSION_ROLE") == "1" and not synthetic_b228_fixture:
+        pin_evidence = exact_consult_pin(terminal, child_started_ns, child_ended_ns)
+        if not pin_evidence:
+            diag("exact native main-turn provider/model/effort/response proof is absent or mismatched exit=74")
+            sys.exit(74)
     projection = terminal.get("projection")
     context_window = (
         projection.get("contextWindow") if isinstance(projection, dict) else None
@@ -535,6 +742,7 @@ if terminal is not None:
     }
     if consult_mode:
         terminal_frame["finalText"] = response
+        terminal_frame["pinEvidence"] = pin_evidence
     if not synthetic_b228_fixture:
         terminal_frame.update({"provider": provider, "model": model, "effort": effort})
     print(json.dumps(terminal_frame, ensure_ascii=False, separators=(",", ":")), flush=True)

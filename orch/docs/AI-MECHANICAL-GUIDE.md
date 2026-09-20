@@ -21,7 +21,7 @@ scope: portable-mechanical-contract
 直接 managed 调用沿用控制 descriptor：v2 保存脱敏 requested/effective tuple、固定摘要和路径；v1 仍可读取。完整 LF-framed 控制记录不得超过 64 KiB，启动前按同一序列化格式核验；这是本地产物表示边界，不是 provider/model 的能力上限。缺绑定、未知版本或越界路径拒绝控制请求。
 
 默认构建公开 6 叶：guide、doctor、harness list/lint、wake、consult；selfhost 构建追加任务机械，
-共 30 叶。默认 CLI 单包构建不编译任务/轮次/账本 writer。orch-ui 保留，只读功能和测试不变，
+共 30 叶。默认 CLI 单包构建不编译任务/轮次/账本 writer。orch-ui 保留既有观察功能与测试，并提供显式 Fusion 入口，
 其 host 依赖显式启用 selfhost；工作区缺省成员为 CLI。以下任务链、租约、WAL 与签核规则仅适用于
 selfhost，实际可调用表面以当前构建的 help/guide --check 为准。
 
@@ -1216,20 +1216,22 @@ Every untrusted rendered/copied field uses safe_observation_text before clipping
 
 The terminal guard is armed immediately after raw mode succeeds, before screen/backend setup. Normal, initialization/body/drawing/event errors and Rust unwind independently attempt cursor/screen restoration and disable raw mode. Rust abort, SIGKILL and external terminal destruction cannot be promised destructor recovery. Real owned PTY verification must compare termios and actual cursor/alternate-screen sequences, including both input/output TTY combinations; synthetic Buffer tests alone do not prove terminal recovery.
 
-## Local Web observation service (r90)
+## Local Web observation and explicit Fusion service (r91)
 
 The `orch-ui::web::WebServer` library is the service foundation for the separate
 `orch-web` frontend entry. It is not a new default CLI command. It binds only
 `127.0.0.1`; port zero retains an OS-selected listener without a rebind race.
-Drop closes its own listener and joins its runtime thread. It never controls a
-provider, edits project files, collects reports, reconciles or garbage-collects.
+Drop closes its own listener and joins its runtime thread. Observation endpoints
+remain read-only. Explicit Fusion POST endpoints save the project role library or
+launch finite consultations; they never collect, reconcile or garbage-collect tasks.
+Shutdown waits for already-owned bounded Fusion jobs rather than replaying them.
 
 GET `/api/v1/projects` lists session-only opaque project IDs. POST to that route
 with JSON `root` validates an exact committed Git root and reads its first
 snapshot before registration. Subdirectories, non-projects and missing commits
 are rejected; failed registration preserves the existing registry. The maximum
 is 16 roots, no eviction; registering the same canonical root is idempotent.
-Git HEAD may advance after registration. Request bodies are limited to8192bytes,
+Git HEAD may advance after registration. Project-registration bodies are limited to8192bytes,
 paths to4096bytes. GET `/api/v1/projects/{id}/snapshot` and
 `/api/v1/projects/{id}/detail?id=...` accept only registered project IDs; invocation
 IDs are opaque lookups, never file paths. There is no arbitrary file endpoint.
@@ -1245,10 +1247,14 @@ read this user's files. Do not put capabilities in logs or URLs.
 
 The envelope contains serverInstanceId, projectId, snapshotGeneration and data
 or a fixed safe error. Each project has its own monotonically increasing
-snapshotGeneration, advanced only after a successful observation/detail read.
-Errors retain that generation and never claim fresh data. Clients must reject
-stale project/request/generation responses, retain old snapshots with an honest
-last-success time on read failure, and hide old answer text until revalidation.
+snapshotGeneration, advanced after a successful observation/detail or Fusion operation.
+Errors retain that generation and never claim fresh data. Snapshot and detail reads
+have independent client request identities: polling cannot cancel a matching detail,
+and an error is owned by the local request token rather than pretending it is a
+successful project/generation envelope. Clients reject stale project/selection replies,
+retain old snapshots with an honest last-success time on read failure, and retain a
+displayed answer only while a later accepted snapshot still classifies the same ID as
+verified.
 At most eight observation jobs may run or wait for a reader; overload is503busy.
 Source reads run off the async reactor and readers are serialized. Errors are
 400bad_project/bad_invocation,403forbidden,404not_found,409registry_full,
@@ -1289,7 +1295,7 @@ choice. SIGINT or SIGTERM closes only this owned service. Invalid arguments,
 roots or occupied ports fail without leaving a daemon.
 
 The page is fully embedded: no CDN, remote font or runtime package installation.
-Its three views are Tasks, All calls and Members. The task view groups only
+Its observation views are Tasks, All calls and Members; Fusion is a separate editing and consultation view. The task view groups only
 explicit round/task relationships; unassociated Fusion and standalone calls
 remain separate. Text, task, task state, result, member, purpose and time filters
 intersect before grouping. Both task and unassociated sections share the newest
@@ -1299,10 +1305,16 @@ last. Task state, last observed call phase, native terminal and answer validity
 are displayed independently and never form a completion percentage.
 
 Refresh runs about every2seconds. A failed read keeps the last snapshot with its
-last-success time and error; old answer text stays hidden until the selected
-invocation is revalidated. Server instance, project epoch, request sequence,
-snapshot generation and selected ID reject late replies after project, selection
-or server changes. The reader preserves pixel scroll across accepted refreshes.
+last-success time and error. Selecting a member does not prefetch its answer; opening
+the reader makes exactly one bounded detail request. Snapshot and detail sequences are
+independent, while server instance, project epoch and selected ID still reject late
+replies after project, selection or server changes. Closing, replacing or switching
+the reader aborts its owned request; a browser-side12second deadline and explicit
+not-found/read-failed/busy/server-timeout/forbidden/invalid-response/client-timeout
+states ensure current requests cannot remain indefinitely loading. Accepted background
+snapshots preserve reader text and copy state only for the same still-verified ID, and
+clear both immediately when the ID disappears or loses verification. The reader
+preserves pixel scroll across accepted refreshes.
 
 Theme supports system/light/dark and language supports Chinese/English. These
 two non-sensitive values use validated host-only cookies so they survive the
@@ -1317,3 +1329,156 @@ style attributes and images are discarded (image alt text remains plain text).
 Only absolute HTTP/HTTPS links survive, with `noopener noreferrer`; the page
 never loads answer images or other external resources. The bundled Marked
 license is shipped next to the module.
+
+## Native discovery and local Fusion role library (r91)
+
+`orch_host::native_discovery` captures installed clients and configured aliases
+without sending a model prompt. Driver action support and native catalog status
+are separate facts: a client can expose a model catalog while its registered
+channel does not implement Consult. Disabled aliases are not queried. Existing
+alias resolution still enforces its original enabled/action/tuple checks;
+metadata inspection does not grant invocation permission.
+
+Sources are explicit: native configuration, native catalog cache, a bounded
+native command, a client-bundled catalog, help-derived choices or captured
+non-secret environment overrides. Model/provider/effort IDs remain opaque; no
+model-version list is embedded in the UI-facing data. Missing defaults and
+unavailable authentication/catalogs remain unknown or unavailable, not inferred
+from historical conversations. A catalog is not proof of account entitlement.
+
+The reader covers Codex native bundled catalog and configuration; Claude
+user/project/local `model` and `effortLevel`; CodeBuddy `reasoningEffort` and
+help-derived choices; Pi settings, custom models and native catalog cache;
+OpenCode/MiMo native model listings and JSON/JSONC configuration; ZCode's
+provider/model/reasoning table; DSH's actual profile-selected settings and mode; Cursor
+and AGY native model-list commands where available. SmartClaw has no modeled
+catalog or per-call model override in the current channel and remains explicit
+about that limitation. Native caps and canonical aliases remain client-owned.
+For ambiguous Claude alias-specific effort settings the projection leaves the
+value unresolved instead of copying a version-dependent canonical model table.
+Within a known layer, model-specific effort wins that layer's top-level value;
+higher-priority layers win lower layers. Session overrides remain distinct.
+
+Queries have no interactive stdin or inference prompt. Captured native files
+and accepted query responses are limited to 2 MiB, with a 10 second command observation bound
+and bounded owned-session cleanup. Raw verbose provider options and credentials
+never enter the serialized projection. OpenCode/MiMo query data/cache/state are
+isolated from their real mutable databases. Query caches use an owned local
+`.orch/native-discovery/` namespace; only exact owned, ended query directories
+are reclaimed, and uncertain scopes are retained. Opening discovery may create
+local cache/ignore metadata, but never changes native client settings or login.
+File-only inspection and an absent role-library read create no role state.
+
+`orch_host::fusion_roles` stores a version1 envelope containing the revisioned
+configuration in `.orch/fusion.json`, shared through the canonical primary Git
+worktree. Roles contain ID, display name, instructions, a discovered harness
+reference and optional fixed provider/model/effort/mode fields. An absent fixed
+field follows the captured native value. Combinations retain member order,
+disabled members and an optional synthesizer; incomplete drafts may be saved.
+This library does not start a provider or implement a background scheduler.
+
+Saving uses a local exclusive lock, expected-revision compare-and-swap and an
+atomic file replacement. Role IDs/references and size limits are validated;
+symlink/nonregular sources and stale writers are rejected. Nonblocking file opens
+reject FIFO inputs without waiting for a writer. There are at most32
+roles and16 combinations, with16KiB of instructions per role and a1MiB file
+limit. Bare repositories are not writable role stores. If needed, only the
+exact Fusion/cache paths are appended to Git's local `info/exclude`; existing
+ignore content and tracked project files are preserved. Native executable
+paths, argv, environment and credentials are not role-editable fields.
+
+The existing `testExclusive` script also runs the complete default-feature
+`orch-host --lib` suite, independently of workspace selfhost feature unification.
+This adds regression coverage without adding a public CLI command or changing
+ProjectBinding's command names, timeouts or schema.
+
+
+## Finite Fusion roles and Web execution (r91)
+
+The Fusion view edits up to32 reusable project roles and16 saved combinations.
+Add/delete/edit roles, order and enable/disable members, choose one synthesis role,
+and save before starting. Two to five enabled distinct roles consult in parallel;
+the same harness may serve several roles. Exactly one synthesis follows verified
+answers. Zero verified answers skips synthesis. A failed synthesis retains member
+answers. An unclosed process scope means HOLD and prevents synthesis or a new run.
+There is no scheduler, automatic retry, replacement member or restart execution.
+
+Blank provider/model/effort/mode fields follow native values exposed by the fresh
+launch scan. Explicit opaque IDs pass through without model-version allowlists.
+The UI refreshes metadata without overwriting edit drafts and offers a separate
+explicit import of configured alias model parameters. Unknown defaults stay unknown;
+Pi, ZCode and DSH require provider/model/effort, so missing values must be entered.
+Consultation support, installed availability and catalog/auth status are separate;
+a discovered model is not account qualification. Missing/disabled clients fail honestly.
+
+GET/POST `/api/v1/projects/{id}/fusion/config` reads/saves the library; POST takes
+`{expectedRevision,config}` and rejects stale revisions with409. GET discovery
+reads metadata state; POST `.../fusion/discovery` with `{}` starts one bounded scan.
+Metadata commands never receive inference prompts; the asynchronous scan status
+avoids the10second HTTP handler deadline. POST `.../fusion/runs` takes
+`{requestId,combinationId,question}`. The browser sends `X-Orch-Config-Revision`
+to bind the reviewed role revision. Matching request IDs return the existing run,
+including after restart; conflicting payloads return409. GET runs lists at most50
+summaries from a bounded512-entry enumeration; GET `.../runs/{requestId}` validates
+the stored completion and answer digests. All routes retain capability, Host,
+Origin, Fetch-Site and safe response encoding. Fusion JSON bodies are bounded2MiB;
+question128KiB, role instruction16KiB and full synthesis input1MiB are enforced.
+
+Reservation captures roles, order, question, project and exact HEAD; each phase
+uses that same HEAD and captured native tuple/config snapshot. Later role edits do
+not change a run. Captured HOME, PATH and relevant native config-path overrides
+are forwarded through an internal Consult-only seam; browsers cannot supply
+executables, arbitrary argv, environment or credentials. Existing CLI YAML tuple
+validation and existing CLI consult behavior remain intact. Claude/CodeBuddy use
+plan and read tools, Codex read-only sandbox with approvals disabled, Cursor ask
+(or explicit plan), Pi read tools, and OpenCode/MiMo plan. OpenCode/MiMo plan is a
+native action policy, not an OS sandbox. Existing native authentication and history
+remain available. Requested tuples and observed channel facts are displayed separately.
+
+Artifacts live in ignored `.orch/fusion-runs` at the primary Git root. Immutable
+request/config snapshots and phase manifests bind answers; detail reads allow512KiB
+per answer and2MiB total, withholding tampered or oversized text. An unfinished run
+without its original engine is HOLD, never replayed. Browser disconnect does not
+cancel the finite job. Known ended failures can be followed by a new explicit run.
+Known secret patterns are rejected in questions/instructions and synthesis input;
+this policy does not claim to recognize every secret. Use native credential stores.
+
+Fusion roles using ZCode Consult use a private0600 settings copy plus private storage/session DB,
+retaining native provider definitions while selecting the requested model/effort.
+Relevant higher-priority project model overrides are rejected; ambient model/base-URL
+and DB overrides cannot defeat the private selection. The common native `model_io`
+main-turn receipt must bind session/trace/turn, provider/model/variant and exact final
+text. Canonical response model IDs may differ from configured opaque IDs and are
+recorded separately. Native receipt reads are bounded/no-follow/fresh; stdout drains
+concurrently with an8MiB cap and requires actual EOF. After ended scope and archive,
+only the exact owned unchanged private settings file is removed; unknown lifecycle
+or replacement retains it. Global settings and session stores are not rewritten.
+The additional main-turn receipt binding belongs to the code-owned Fusion role
+path; existing CLI Consult retains its prelaunch settings-pin and complete native
+terminal checks, without requiring a newly shaped receipt from legacy clients.
+
+The UI preserves drafts by project, rejects stale responses, retains CAS-conflicted
+edits and retries ambiguous submissions with the same request ID. It shows per-role
+progress, verified Markdown answers, one synthesis and local history. Role deletion
+repairs combination references. Themes, Chinese/English, keyboard controls and safe
+Markdown handling apply to Fusion as well as observation views.
+
+Each member and synthesis wave has a code-owned 900-second hard ceiling. Structured
+`ChannelDiagnostic` facts are additive: failure class, stage, elapsed/deadline, exit,
+terminal state, observed model and overflow flags remain absent when they were not
+recorded. Diagnostic reasons pass the credential-aware ANSI/control sanitizer and a
+UTF-8-safe 2 KiB bound; raw streams and private absolute paths are never diagnostics.
+Historical schema-3 answers that otherwise bind correctly but omit all four EOF and
+overflow facts together remain `invalid` and unreadable. The Web UI labels them as
+historical-unverified and keeps them in the existing invalid filter without red
+failure priority; partial omissions, contradictions, tampering and unsafe paths keep
+normal needs-attention behavior.
+
+Before a Web Fusion OpenCode role starts, orch reads only the captured HOME/XDG data
+and state roots. It canonicalizes existing roots, rejects symlinks, non-directories,
+wrong ownership and permission-bit-proven non-writability, and does not create probe
+files, open SQLite, edit settings or run a client. Missing or ambiguous state is
+reported as indeterminate—not as proof of login, provider balance or future success.
+A definitive unsafe result fails only that role. Within a role wave, OpenCode starts
+are kept in stable member order at least one second apart; other drivers retain
+parallel launch and no member is retried automatically.

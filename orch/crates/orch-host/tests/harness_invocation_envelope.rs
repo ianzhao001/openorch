@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 //! B294 冻结契约 · 统一调用信封（runtime → wrapper），DSH 真正拿到 pin
 //!
-//! 本文件一旦落位即**永久冻结**（AGENTS.md 铁律 10）。补充测试放 writeSet 内其它落点。
+//! B357 evolves this Recorded test under schema3; historical B294 source remains unchanged.
 //!
 //! ## 判据纪律
 //!
@@ -408,4 +408,22 @@ fn every_public_item_added_by_this_card_carries_its_own_doc() {
             line.trim_start()
         );
     }
+}
+
+/// A Pi-hosted caller must not redirect the fixture wrapper to its own package.
+#[test]
+fn caller_pi_project_root_does_not_pollute_wrapper_fixture() {
+    const CHILD: &str = "B357_POLLUTED_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        assert_eq!(std::env::var("ORCH_PI_PROJECT_ROOT").unwrap(), "/b357/nonexistent-native-project");
+        all_three_wrappers_receive_the_same_envelope();
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "caller_pi_project_root_does_not_pollute_wrapper_fixture", "--nocapture"])
+        .env(CHILD, "1")
+        .env("ORCH_PI_PROJECT_ROOT", "/b357/nonexistent-native-project")
+        .output().unwrap();
+    assert!(output.status.success(), "polluted child failed: {} {}",
+        String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
 }

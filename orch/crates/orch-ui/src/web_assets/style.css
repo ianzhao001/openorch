@@ -116,3 +116,48 @@ body.drawer-open .card-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); 
 @media (max-width: 1100px) { .card-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } body.drawer-open .card-grid { grid-template-columns: 1fr; } .filters { grid-template-columns: 1fr 1fr; } .search-wrap { grid-column: 1 / -1; } }
 @media (max-width: 680px) { .topbar { position: static; align-items: flex-start; flex-direction: column; } .header-actions { margin-left: 0; justify-content: flex-start; width: 100%; } .compact-field { flex: 1; min-width: 130px; } .compact-field select { min-width: 0; width: 100%; } .read-status { display: none; } .filters { grid-template-columns: 1fr; } .search-wrap { grid-column: auto; } .card-grid { grid-template-columns: 1fr; } main { padding-bottom: 40px; } .drawer { width: 100vw; } .reader { padding: 16px; } .reader-head { top: -16px; align-items: flex-start; flex-wrap: wrap; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .001ms !important; animation-duration: .001ms !important; } }
+
+.fusion-workspace { display: grid; gap: 18px; }
+.fusion-workspace .section-heading { margin-bottom: 0; align-items: center; }
+.fusion-actions, .fusion-panel-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.fusion-panel-head { justify-content: space-between; margin-bottom: 16px; }
+.fusion-panel-head h2 { margin: 0; font-size: 17px; }
+.fusion-layout { display: grid; grid-template-columns: minmax(210px, 280px) minmax(0, 1fr); gap: 18px; align-items: start; }
+.fusion-panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px; min-width: 0; }
+.fusion-role-list, .fusion-results, .fusion-history { display: grid; gap: 10px; }
+.fusion-role-list button { display: grid; gap: 5px; text-align: left; background: var(--surface-2); color: var(--text); border: 1px solid transparent; width: 100%; overflow-wrap: anywhere; }
+.fusion-role-list button.active { border-color: var(--accent); background: var(--accent-soft); }
+.fusion-role-list small, .fusion-hint { color: var(--muted); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.fusion-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.fusion-form label, .fusion-synth-label { display: grid; gap: 7px; min-width: 0; }
+.fusion-form input, .fusion-form select, .fusion-form textarea, .fusion-question-label textarea { width: 100%; min-width: 0; }
+.fusion-wide { grid-column: 1 / -1; }
+.fusion-form textarea, .fusion-question-label textarea { resize: vertical; min-height: 110px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--text); padding: 12px; font: inherit; line-height: 1.6; }
+.fusion-form details { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.fusion-form summary { cursor: pointer; }
+.fusion-synth-label { max-width: 540px; margin-top: 18px; }
+.fusion-member { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.fusion-member label { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 140px; }
+.fusion-member input[type="checkbox"] { width: 18px; height: 18px; min-width: 18px; }
+.fusion-member button { padding: 6px 12px; min-height: 44px; min-width: 44px; }
+.fusion-result { border: 1px solid var(--line); border-radius: 12px; padding: 18px; overflow-wrap: anywhere; }
+.fusion-result h3 { margin: 0 0 10px; font-size: 16px; }
+.fusion-result .markdown { max-height: 540px; overflow: auto; }
+.fusion-result.synthesis { border-color: var(--accent); background: var(--accent-soft); }
+.fusion-history button { text-align: left; background: var(--surface-2); color: var(--text); border: 1px solid var(--line); }
+.fusion-workspace button.danger { color: var(--danger); }
+.fusion-workspace button:disabled { cursor: not-allowed; opacity: .5; }
+.fusion-workspace [hidden] { display: none !important; }
+@media (max-width: 760px) {
+  .fusion-layout, .fusion-form { grid-template-columns: minmax(0, 1fr); }
+  .fusion-panel { padding: 16px; }
+  .fusion-workspace .section-heading { align-items: flex-start; gap: 12px; flex-direction: column; }
+  .fusion-actions { width: 100%; }
+  .fusion-actions button { flex: 1; }
+}
+
+#fusion-workspace[hidden], #observation-filters[hidden], #cards[hidden], #window-summary[hidden] { display: none !important; }
+.fusion-member label { min-height: 44px; overflow-wrap: anywhere; }
+.fusion-history button { overflow-wrap: anywhere; }
+
+#fusion-note.fusion-note-neutral { border-color: var(--line); color: var(--muted); background: var(--surface); }

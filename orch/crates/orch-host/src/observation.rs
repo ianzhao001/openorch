@@ -91,6 +91,30 @@ pub struct InvocationObservation {
     /// Local degradation reasons.
     pub diagnostics: Vec<String>,
 }
+impl InvocationObservation {
+    /// Decode the optional additive channel diagnostic without changing the
+    /// source-compatible public row constructor used by existing consumers.
+    pub fn channel_diagnostic(&self) -> Option<crate::consult::ChannelDiagnostic> {
+        serde_json::from_value(self.parameters.get("channelDiagnostic")?.clone()).ok()
+    }
+
+    fn set_channel_diagnostic(
+        &mut self,
+        diagnostic: Option<crate::consult::ChannelDiagnostic>,
+    ) {
+        let Some(object) = self.parameters.as_object_mut() else {
+            return;
+        };
+        match diagnostic.and_then(|value| serde_json::to_value(value).ok()) {
+            Some(value) => {
+                object.insert("channelDiagnostic".into(), value);
+            }
+            None => {
+                object.remove("channelDiagnostic");
+            }
+        }
+    }
+}
 /// A consultation roster and its independent phase/result counts.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FusionObservation {
@@ -268,6 +292,26 @@ fn safe_value(value: &Value) -> Value {
 
 fn string(v: &Value, k: &str) -> Option<String> {
     v.get(k)?.as_str().map(safe_observation_text)
+}
+fn manifest_diagnostic(m: &Value, f: &Value) -> crate::consult::ChannelDiagnostic {
+    let mut diagnostic = crate::consult::ChannelDiagnostic::provider_failure(
+        m["failureClass"].as_str(),
+        m["reason"].as_str(),
+        f["stage"].as_str(),
+    );
+    diagnostic.duration_secs = m["durationSecs"].as_u64();
+    diagnostic.deadline_secs = f["deadlineSecs"].as_u64();
+    diagnostic.exit_code = m["exitCode"]
+        .as_i64()
+        .or_else(|| f["execution"]["exitCode"].as_i64())
+        .and_then(|value| i32::try_from(value).ok());
+    diagnostic.terminal_status = f["terminal"]["status"]
+        .as_str()
+        .map(safe_observation_text);
+    diagnostic.observed_model = m["observedModel"].as_str().map(safe_observation_text);
+    diagnostic.stdout_overflow = f["execution"]["stdoutOverflow"].as_bool();
+    diagnostic.stderr_overflow = f["execution"]["stderrOverflow"].as_bool();
+    diagnostic
 }
 fn hex(s: &str, n: usize) -> bool {
     s.len() == n
@@ -845,10 +889,20 @@ impl ObservationReader {
         }
         .into();
         row.result = "failed".into();
+        row.set_channel_diagnostic(Some(manifest_diagnostic(m, f)));
         if m["status"] != "ok" {
             return;
         }
         row.result = "invalid".into();
+        let capture = &f["execution"];
+        let capture_all_missing = [
+            "stdoutEofObserved",
+            "stderrEofObserved",
+            "stdoutOverflow",
+            "stderrOverflow",
+        ]
+        .iter()
+        .all(|key| capture.get(*key).is_none());
         let Ok(inv) = serde_json::from_value::<crate::consult::ConsultMemberManifestV3>(
             m["invocation"].clone(),
         ) else {
@@ -874,10 +928,6 @@ impl ObservationReader {
             || f["terminal"]["turnEnded"] != true
             || f["execution"]["rawCaptureStable"] != true
             || f["execution"]["processGroupTerminated"] != true
-            || f["execution"]["stdoutEofObserved"] != true
-            || f["execution"]["stderrEofObserved"] != true
-            || f["execution"]["stdoutOverflow"] != false
-            || f["execution"]["stderrOverflow"] != false
             || !f["execution"]["observationErrors"]
                 .as_array()
                 .is_some_and(|e| e.is_empty())
@@ -918,7 +968,21 @@ impl ObservationReader {
                 return;
             }
         }
+        if capture_all_missing {
+            row.set_channel_diagnostic(Some(
+                crate::consult::ChannelDiagnostic::capture_evidence_missing(),
+            ));
+            return;
+        }
+        if capture["stdoutEofObserved"] != true
+            || capture["stderrEofObserved"] != true
+            || capture["stdoutOverflow"] != false
+            || capture["stderrOverflow"] != false
+        {
+            return;
+        }
         row.result = "verified".into();
+        row.set_channel_diagnostic(None);
         self.bodies.insert(row.id.clone(), (body, actual.clone()));
     }
     fn rounds(&mut self, budget: &mut Budget, out: &mut ProjectObservation) -> Vec<String> {
