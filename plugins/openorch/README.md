@@ -80,7 +80,7 @@ independent model diversity. Native clients may incur their normal usage costs.
 | Plugin hosts | Codex Desktop and DSH Web |
 | Consult targets | Codex, Claude, OpenCode, Cursor, MiMo, CodeBuddy, SmartClaw, DSH, Pi, ZCode, subject to actual discovery/configuration |
 | Unsupported Consult targets | AGY |
-| Core surfaces | Default CLI 6 commands; selfhost CLI 30; read-only `orch-tui` / `orch-web` source binaries |
+| Core surfaces | Default CLI 6 commands; selfhost CLI 30; read-only `orch-tui`; explicit finite Fusion in `orch-web` |
 
 DSH 既可作为插件宿主，也可作为 Consult 目标；Pi、ZCode 同样受支持。宿主集成与目标通道
 能力仍需分别核验，并以运行时发现、原生终态和项目历史证据为准。
@@ -91,13 +91,13 @@ DSH 既可作为插件宿主，也可作为 Consult 目标；Pi、ZCode 同样�
 ```sh
 cargo build -p orch-ui --bin orch-tui --locked --manifest-path orch/Cargo.toml
 orch/target/debug/orch-tui --root /absolute/project
-cargo run -p orch-ui --bin orch-web --all-features -- --root /exact/git/root
+cargo run --locked --manifest-path orch/Cargo.toml -p orch-ui --bin orch-web --all-features -- --root /exact/git/root
 ```
 
-它以只读方式每两秒刷新已捕获的 invocation 观察，明确区分来源时间、陈旧、终态与未知，
+终端面板以只读方式每两秒刷新已捕获的 invocation 观察，明确区分来源时间、陈旧、终态与未知，
 并对展示/复制内容做安全裁剪；非 TTY、参数错误或初始化失败均不会伪装成成功。
 
-`orch-web` 是仅绑定 `127.0.0.1` 的本机浏览器观察面板。启动 capability、精确同源检查、无 CORS、严格响应安全头和 opaque ID API 共同限制浏览器访问；它没有任意文件接口。它不会调用 provider、编辑项目、启动、取消、收取、reconcile 或 GC 调用，答案 Markdown 被视为不可信内容并在本地净化，页面不加载外部资源。
+`orch-web` 是仅绑定 `127.0.0.1` 的本机浏览器观察面板。启动 capability、精确同源检查、无 CORS、严格响应安全头和 opaque ID API 共同限制浏览器访问；它没有任意文件接口。观察接口保持只读；用户可显式保存项目本地角色/组合并启动有限 Fusion 咨询，但不会收取、reconcile 或 GC 调用，答案 Markdown 被视为不可信内容并在本地净化，页面不加载外部资源。
 
 Missing clients, unsupported members, failed/partial calls and empty or tool-only
 answers remain visible. Do not treat a process exit or partial text as success.

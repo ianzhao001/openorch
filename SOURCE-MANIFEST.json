@@ -461,7 +461,7 @@
     "plugins/openorch/LICENSE": "0d38c12fa2fb8d746ce55df9a8b61909478bbaf5972a1c7c7bc43d4811ed97e8",
     "plugins/openorch/PUBLIC-CHANGELOG.md": "3dcd17bb14ee72d6035be97ed0e3ea7f1a71680758196daa1aea4c5614de3c99",
     "plugins/openorch/PUBLIC-README.md": "c74d3a85d40dd6eab3b262279c99ff3b2a012b2e9e8dea2940631e6c84f0adba",
-    "plugins/openorch/README.md": "552401f1c7609e05f698d2e16f57583c60094d1287718feb0e397ae7d71aa10c",
+    "plugins/openorch/README.md": "b8eda58e2f10b5e1abbdfeb8887e3385243a4400bdc906953b3d7dcd9f539ef0",
     "plugins/openorch/catalog.json": "c085d3de1cf58b11d03ba49eac52cc9d934cddc454f8b5d53f96c91a18747918",
     "plugins/openorch/cordis.patch.yml": "59142f11ace9d516b3e3dfdff9cbd8259995e637525ca90ce9c397c58d984a33",
     "plugins/openorch/dsh-entry.mjs": "32eee284687b6b40c296efee0eba92f06d7738e3e59902da72a153eaa10562bc",
