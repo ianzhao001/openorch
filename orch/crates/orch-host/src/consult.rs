@@ -746,7 +746,7 @@ pub fn consultation_admitted(root: &Path) -> Result<GateDecision> {
 /// Protocol events are never written, and a failed member remains one indexed
 /// result instead of erasing valid siblings.
 pub fn run_consultation(root: &Path, args: &ConsultArgs) -> Result<ConsultOutcome> {
-    run_channel_consultation_v3(root, args)
+    crate::fusion_run::FusionEngine::new().run_cli(root, args)
 }
 
 fn channel_tuple_json(tuple: &crate::channel::InvocationTuple) -> serde_json::Value {
@@ -1140,6 +1140,7 @@ fn channel_consult_terminal_evidence_v1(
 
 #[derive(Debug)]
 struct ReadyConsultMemberV3 {
+    acp_request: Option<orch_core::acp::AcpRequest>,
     index: usize,
     alias: String,
     action_id: String,
@@ -1209,6 +1210,7 @@ fn finish_channel_consult_member_v3(
     execution: std::thread::Result<Result<crate::channel::ChannelExecution>>,
 ) -> Result<MemberOutcome> {
     let ReadyConsultMemberV3 {
+        acp_request,
         index,
         alias,
         action_id,
@@ -1321,13 +1323,28 @@ fn finish_channel_consult_member_v3(
         return Ok(outcome);
     }
 
-    let mut answer = extract_member_answer(&stdout);
+    let acp_answer=if let Some(request)=acp_request.as_ref() {
+        match crate::channel::acp::envelope(&output.stdout,request) {
+            Ok(orch_core::acp::AcpEnvelope::Completed{answer})=>Some(answer),
+            Ok(orch_core::acp::AcpEnvelope::Rejected{failure})=>{
+                outcome.failure_class=Some(FailureClass::Protocol);outcome.reason=Some(failure.code.clone());
+                if let Some(facts)=outcome.channel_facts.as_mut(){facts["stage"]=serde_json::json!("acp-rejected");facts["acp"]=serde_json::to_value(&failure)?;facts["terminal"]=serde_json::json!({"status":"failed","turnEnded":false,"managedScopeTerminated":true});}
+                return Ok(outcome);
+            }
+            Err(_)=>{outcome.failure_class=Some(FailureClass::Protocol);outcome.reason=Some("invalid or mismatched ACP envelope".into());return Ok(outcome);}
+        }
+    } else {None};
+    let strict_acp_authoritative=acp_answer.is_some() && output.reason==crate::channel::ChannelExitReason::Exited && output.exit_code()==Some(0);
+    let mut answer = if acp_answer.is_some(){ExtractedAnswer{text:String::new(),extraction:AnswerExtraction::Structured}}else{extract_member_answer(&stdout)};
     let native_answer_authoritative = driver == crate::harness::HarnessId::SmartClaw
         && output.native_final_text().is_some()
         && output.reason == crate::channel::ChannelExitReason::Exited
         && (output.exit_code() == Some(0) || crate::harness::wrapper_exit_is_transport_eof(output.exit_code()));
-    let evidence = adapter::extract_execution_evidence(driver.as_str(), &stdout_path);
-    let terminal_result = if driver == crate::harness::HarnessId::SmartClaw {
+    let evidence = acp_answer.is_none().then(||adapter::extract_execution_evidence(driver.as_str(), &stdout_path));
+    let terminal_result = if let Some(acp)=&acp_answer {
+        if let Some(facts)=outcome.channel_facts.as_mut(){facts["acp"]=acp.evidence.clone();facts["acp"]["selectedModel"]=serde_json::json!(acp.selected_model);facts["acp"]["agentVersion"]=serde_json::json!(acp.agent_version);}
+        Ok(ChannelConsultTerminalEvidenceV1{turn_ended:true,final_text:Some(acp.text.clone()),final_text_sha256:Some(sha256(acp.text.as_bytes())),usage:None,exact_reason:Some("acp-v1-end-turn".into())})
+    } else if driver == crate::harness::HarnessId::SmartClaw {
         // The raw payload concatenates process text. It is preserved in raw
         // captures/logs and is never substituted for a missing native final.
         answer = ExtractedAnswer {
@@ -1392,8 +1409,8 @@ fn finish_channel_consult_member_v3(
     outcome.usage = terminal_evidence
         .usage
         .clone()
-        .or_else(|| evidence.usage.clone());
-    let observed = evidence.observed_model.clone();
+        .or_else(|| evidence.as_ref().and_then(|e|e.usage.clone()));
+    let observed = acp_answer.as_ref().map(|a|a.model.clone()).or_else(||evidence.as_ref().and_then(|e|e.observed_model.clone()));
     outcome.observed_model = observed.clone();
     let model_match = match (observed.as_deref(), effective_model.as_deref()) {
         (Some(observed), Some(effective)) if crate::probe::model_matches(observed, effective) => {
@@ -1472,10 +1489,10 @@ fn finish_channel_consult_member_v3(
     if let Some(facts) = outcome.channel_facts.as_mut() {
         facts["stage"] = serde_json::json!("completed");
         facts["observedTuple"] = serde_json::json!({
-            "provider": serde_json::Value::Null,
+            "provider": acp_answer.as_ref().and_then(|a|a.provider.clone()),
             "model": observed,
-            "effort": serde_json::Value::Null,
-            "mode": serde_json::Value::Null,
+            "effort": acp_answer.as_ref().and_then(|a|a.effort.clone()),
+            "mode": acp_answer.as_ref().map(|a|a.mode.clone()),
             "modelMatch": model_match,
         });
         facts["receipt"] = serde_json::json!({
@@ -1489,7 +1506,7 @@ fn finish_channel_consult_member_v3(
         });
         facts["terminal"] = serde_json::json!({
             "source": contract.terminal.as_str(),
-            "answerAuthority": if native_answer_authoritative { "bound-native-final" } else { "driver-terminal" },
+            "answerAuthority": if acp_answer.is_some() { "bound-acp-final" } else if native_answer_authoritative { "bound-native-final" } else { "driver-terminal" },
             "status": if terminal.mechanical_terminal_absent {
                 "unsupported"
             } else {
@@ -1516,7 +1533,7 @@ fn finish_channel_consult_member_v3(
             }
             .into(),
         );
-    } else if native_answer_authoritative
+    } else if (native_answer_authoritative || strict_acp_authoritative)
         && !model_mismatch
         && validity == ConsultAnswerValidityV3::Valid
     {
@@ -1549,6 +1566,9 @@ pub(crate) struct RoleWaveV1<'a> {
     pub prompts: std::collections::BTreeMap<String, String>,
     pub skeleton: ConsultationSkeleton,
     pub native_context: crate::native_discovery::DiscoveryContext,
+    pub inputs: CapturedConsultInputs,
+    pub native_role: bool,
+    pub legacy_log: bool,
     pub observer: &'a mut dyn FnMut(&MemberOutcome) -> Result<()>,
 }
 
@@ -1557,18 +1577,11 @@ pub(crate) fn run_role_wave(
     args: &ConsultArgs,
     context: RoleWaveV1<'_>,
 ) -> Result<ConsultOutcome> {
-    run_channel_consultation_inner(root, args, Some(context))
+    run_channel_consultation_inner(root, args, context)
 }
 
-fn run_channel_consultation_v3(root: &Path, args: &ConsultArgs) -> Result<ConsultOutcome> {
-    run_channel_consultation_inner(root, args, None)
-}
-
-fn run_channel_consultation_inner(
-    root: &Path,
-    args: &ConsultArgs,
-    mut role_context: Option<RoleWaveV1<'_>>,
-) -> Result<ConsultOutcome> {
+/// Shared phase admission; a refusal preserves the legacy single log record.
+pub(crate) fn require_consultation_admission(root: &Path) -> Result<()> {
     let decision = consultation_admitted(root)?;
     if let GateDecision::Refuse { reason } = &decision {
         #[cfg(feature = "selfhost")]
@@ -1576,58 +1589,41 @@ fn run_channel_consultation_inner(
             .with_context(|| format!("记录 consultation refusal 失败（{reason}）"))?;
         bail!(reason.clone());
     }
-    let explicit_members = ExplicitConsultMembers::new(args.harnesses.clone())?;
-    let limits = ConsultLimits {
+    Ok(())
+}
+/// Validate CLI/member limits through the existing workload policy.
+pub(crate) fn validate_cli_limits(args: &ConsultArgs) -> Result<ConsultLimits> {
+    ExplicitConsultMembers::new(args.harnesses.clone())?;
+    ConsultLimits {
         per_member_timeout_secs: args
             .member_timeout_secs
             .unwrap_or(CHANNEL_V3_MEMBER_TIMEOUT_SECS),
         total_wall_secs: args.total_wall_secs.unwrap_or(CHANNEL_V3_TOTAL_WALL_SECS),
         max_members: CHANNEL_V3_MAX_MEMBERS,
     }
-    .validate("schema 3 channel consult limits")?;
+    .validate("schema 3 channel consult limits")
+}
+
+fn run_channel_consultation_inner(
+    root: &Path,
+    args: &ConsultArgs,
+    role_context: RoleWaveV1<'_>,
+) -> Result<ConsultOutcome> {
+    require_consultation_admission(root)?;
+    let explicit_members = ExplicitConsultMembers::new(args.harnesses.clone())?;
+    let limits = validate_cli_limits(args)?;
 
     let canonical_root = fs::canonicalize(root)?;
     let observed_head = crate::gitx::rev_parse(&canonical_root, "HEAD^{commit}")?;
-    let fixed_head = role_context
-        .as_ref()
-        .map(|c| c.fixed_head.clone())
-        .unwrap_or_else(|| observed_head.clone());
-    if fixed_head != observed_head {
-        bail!("fusion_head_changed");
-    }
-    let mut manifest_paths = Vec::with_capacity(args.attachments.len() + 1);
-    manifest_paths.push(if args.question.is_absolute() {
-        args.question.clone()
-    } else {
-        canonical_root.join(&args.question)
-    });
-    manifest_paths.extend(args.attachments.iter().map(|path| {
-        if path.is_absolute() {
-            path.clone()
-        } else {
-            canonical_root.join(path)
-        }
-    }));
-    let manifest_refs = manifest_paths
-        .iter()
-        .map(PathBuf::as_path)
-        .collect::<Vec<_>>();
-    let attachment_manifest = crate::channel::capture_attachment_manifest_v1(&manifest_refs)?;
-    let forbidden = forbidden_artifact_patterns(root)?;
-    let (question, attachments) =
-        project_channel_consult_inputs(&canonical_root, &attachment_manifest, &forbidden)?;
+    let fixed_head = role_context.fixed_head.clone();
+    if fixed_head != observed_head { bail!("fusion_head_changed"); }
+    let CapturedConsultInputs { question, attachments, manifest: attachment_manifest } = role_context.inputs.clone();
     let prompt = build_fusion_prompt(&question.text, &attachments);
     let orch_executable = std::env::current_exe().context("解析当前 orch executable 失败")?;
     let round = current_round_for_log(root).unwrap_or_else(|| "manual".to_string());
-    let snapshot = match role_context.as_ref() {
-        Some(context) => context.snapshot.clone(),
-        None => crate::harness_config::load_harness_config_snapshot(root)?,
-    };
-    let native_context = role_context.as_ref().map(|c| c.native_context.clone());
-    let skeleton = match role_context.as_ref() {
-        Some(context) => context.skeleton.clone(),
-        None => create_consultation_skeleton(root)?,
-    };
+    let snapshot = role_context.snapshot.clone();
+    let native_context = Some(role_context.native_context.clone());
+    let skeleton = role_context.skeleton.clone();
     archive_request(&skeleton, &question, &attachments)?;
     let log_dir = skeleton.dir.join("adapter-logs");
     fs::create_dir_all(&log_dir)?;
@@ -1646,13 +1642,8 @@ fn run_channel_consultation_inner(
         let mut outcome = MemberOutcome::new(index, alias.clone(), MemberStatus::Failed);
         outcome.worktree = Some(canonical_root.clone());
         let action_id = format!("{}-{index}-{alias}", skeleton.id);
-        let member_prompt = match role_context.as_ref() {
-            Some(context) => context
-                .prompts
-                .get(&alias)
-                .cloned()
-                .context("role prompt is absent")?,
-            None => prompt.clone(),
+        let member_prompt = if role_context.legacy_log { prompt.clone() } else {
+            role_context.prompts.get(&alias).cloned().context("missing_role_prompt")?
         };
         reject_secret_lines("complete role prompt", &args.question, &member_prompt)?;
         let rendered = crate::channel::prepare_invocation(
@@ -1689,7 +1680,11 @@ fn run_channel_consultation_inner(
                     let private_root = private_parent.join(&alias);
                     fs::create_dir(&private_root)?;
                     fs::set_permissions(&private_root, fs::Permissions::from_mode(0o700))?;
-                    crate::channel::render_native_role_v1(prepared, context, native, &private_root)
+                    if role_context.native_role {
+                        crate::channel::render_native_role_v1(prepared, context, native, &private_root)
+                    } else {
+                        crate::channel::render_captured_cli_v1(prepared, context, native, &private_root)
+                    }
                 }
                 None => crate::channel::render_invocation_v1(prepared, context),
             }
@@ -1700,7 +1695,7 @@ fn run_channel_consultation_inner(
                 let effective_model = rendered.prepared().effective().model.clone();
                 let contract = rendered.prepared().driver_contract();
                 let mut facts = channel_consult_facts(&rendered);
-                if driver == crate::harness::HarnessId::OpenCode {
+                if role_context.native_role && driver == crate::harness::HarnessId::OpenCode {
                     if let Some(native) = native_context.as_ref() {
                         let readiness =
                             crate::native_discovery::opencode_local_readiness(native);
@@ -1713,9 +1708,7 @@ fn run_channel_consultation_inner(
                             outcome.reason = Some(reason);
                             outcome.channel_facts = Some(facts);
                             archive_channel_consult_member(&skeleton, &outcome)?;
-                            if let Some(context) = role_context.as_mut() {
-                                (context.observer)(&outcome)?;
-                            }
+                            (role_context.observer)(&outcome)?;
                             outcomes[index] = Some(outcome);
                             continue;
                         }
@@ -1723,6 +1716,7 @@ fn run_channel_consultation_inner(
                 }
                 outcome.channel_facts = Some(facts);
                 ready.push(ReadyConsultMemberV3 {
+                    acp_request: rendered.acp_request().cloned(),
                     index,
                     alias,
                     action_id,
@@ -1745,9 +1739,7 @@ fn run_channel_consultation_inner(
                     attachment_manifest.sha256(),
                 ));
                 archive_channel_consult_member(&skeleton, &outcome)?;
-                if let Some(context) = role_context.as_mut() {
-                    (context.observer)(&outcome)?;
-                }
+                (role_context.observer)(&outcome)?;
                 outcomes[index] = Some(outcome);
             }
         }
@@ -1763,7 +1755,7 @@ fn run_channel_consultation_inner(
         "summary":crate::observation::safe_observation_text(&question.text).chars().take(240).collect::<String>(),"members":slots}),
     )?;
     #[cfg(test)]
-    if FAIL_OBSERVATION_START.with(|flag| flag.get()) {bail!("injected start publication failure");}
+    if FAIL_OBSERVATION_START.get_or_init(Default::default).lock().unwrap().contains(&canonical_root) {bail!("injected start publication failure");}
     write_new_regular(&skeleton.dir.join("start.json"), &start_bytes)?;
     let start_digest = sha256(&start_bytes);
 
@@ -1847,9 +1839,7 @@ fn run_channel_consultation_inner(
                 finish_channel_consult_member_v3(&log_dir, member, duration_secs, execution)
                     .and_then(|outcome| {
                         archive_channel_consult_member(&skeleton, &outcome)?;
-                        if let Some(context) = role_context.as_mut() {
-                            (context.observer)(&outcome)?;
-                        }
+                        (role_context.observer)(&outcome)?;
                         Ok(outcome)
                     });
             match finished {
@@ -1901,7 +1891,7 @@ fn run_channel_consultation_inner(
         .iter()
         .filter(|member| member.status == MemberStatus::Ok)
         .count();
-    if role_context.is_none() {
+    if role_context.legacy_log {
         append_consultation_log(
             root,
             &serde_json::json!({
@@ -1929,20 +1919,55 @@ fn run_channel_consultation_inner(
     })
 }
 
-#[derive(Debug)]
-struct LoadedQuestion {
-    display_path: String,
-    bytes: Vec<u8>,
-    text: String,
-    sha256: String,
+#[derive(Debug, Clone)]
+pub(crate) struct LoadedQuestion {
+    pub(crate) display_path: String,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) text: String,
+    pub(crate) sha256: String,
 }
 
-#[derive(Debug)]
-struct LoadedAttachment {
-    relative_path: String,
-    bytes: Vec<u8>,
-    text: String,
-    sha256: String,
+#[derive(Debug, Clone)]
+/// Immutable project text admitted by the shared consultation input policy.
+pub(crate) struct LoadedAttachment {
+    /// Normalized project-relative source path.
+    pub(crate) relative_path: String,
+    /// Exact identity-checked source bytes.
+    pub(crate) bytes: Vec<u8>,
+    /// UTF-8 view of the same bytes.
+    pub(crate) text: String,
+    /// SHA-256 of the captured bytes.
+    pub(crate) sha256: String,
+}
+
+/// Complete immutable input context shared by CLI and role execution.
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedConsultInputs {
+    pub question: LoadedQuestion,
+    pub attachments: Vec<LoadedAttachment>,
+    pub manifest: crate::channel::AttachmentManifestV1,
+}
+/// Capture an explicit CLI source set once before reservation or model execution.
+pub(crate) fn capture_cli_inputs(root: &Path, args: &ConsultArgs) -> Result<CapturedConsultInputs> {
+    let path = |p: &PathBuf| if p.is_absolute() { p.clone() } else { root.join(p) };
+    let paths = std::iter::once(path(&args.question)).chain(args.attachments.iter().map(path)).collect::<Vec<_>>();
+    let refs = paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+    let manifest = crate::channel::capture_attachment_manifest_v1(&refs)?;
+    captured_inputs(root, manifest)
+}
+/// Reuse already admitted literal/derived bytes without a second file capture.
+pub(crate) fn capture_literal_inputs(root: &Path, path: &Path, text: &str) -> Result<CapturedConsultInputs> {
+    let manifest = crate::channel::manifest_from_captured_text(path, text.as_bytes().to_vec())?;
+    let (question, attachments) = project_channel_consult_inputs(root, &manifest, &[])?;
+    Ok(CapturedConsultInputs { question, attachments, manifest })
+}
+fn captured_inputs(root: &Path, manifest: crate::channel::AttachmentManifestV1) -> Result<CapturedConsultInputs> {
+    let (question, attachments) = project_channel_consult_inputs(root, &manifest, &forbidden_artifact_patterns(root)?)?;
+    Ok(CapturedConsultInputs { question, attachments, manifest })
+}
+/// Apply the existing secret-line rule before a literal question is persisted.
+pub(crate) fn validate_question_before_reservation(text: &str) -> Result<()> {
+    reject_secret_lines("question", Path::new("<literal-question>"), text)
 }
 
 fn project_channel_consult_inputs(
@@ -1972,6 +1997,24 @@ fn project_channel_consult_inputs(
         sha256: question_entry.sha256().to_string(),
     };
 
+    let attachments = project_attachment_entries(canonical_root, attachment_entries, forbidden)?;
+    Ok((question, attachments))
+}
+
+/// Capture attachments through the same no-symlink, stable-file snapshot and
+/// project binding/duplicate/UTF-8/secret policy used by CLI consultation.
+pub(crate) fn load_shared_attachments(root: &Path, paths: &[PathBuf]) -> Result<Vec<LoadedAttachment>> {
+    if paths.is_empty() { return Ok(Vec::new()); }
+    let refs = paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+    let manifest = crate::channel::capture_attachment_manifest_v1(&refs)?;
+    project_attachment_entries(root, manifest.entries(), &forbidden_artifact_patterns(root)?)
+}
+
+fn project_attachment_entries(
+    canonical_root: &Path,
+    attachment_entries: &[crate::channel::AttachmentSnapshotV1],
+    forbidden: &[String],
+) -> Result<Vec<LoadedAttachment>> {
     let mut seen = HashSet::new();
     let mut attachments = Vec::with_capacity(attachment_entries.len());
     for entry in attachment_entries {
@@ -2010,7 +2053,7 @@ fn project_channel_consult_inputs(
             sha256: entry.sha256().to_string(),
         });
     }
-    Ok((question, attachments))
+    Ok(attachments)
 }
 
 fn reject_secret_lines(kind: &str, path: &Path, text: &str) -> Result<()> {
@@ -2279,28 +2322,26 @@ fn now_rfc3339() -> String {
 /// Create only the successful-consultation artifact skeleton. Refusal paths
 /// must never call this function.
 pub fn create_consultation_skeleton(root: &Path) -> Result<ConsultationSkeleton> {
-    let id = ulid::Ulid::new().to_string();
-    let dir = root.join(CONSULTATIONS_PATH).join(&id);
-    let request_dir = dir.join("request");
-    let fusion_dir = dir.join("fusion");
-    fs::create_dir_all(&request_dir).with_context(|| {
-        format!(
-            "创建 consultation request 目录失败: {}",
-            request_dir.display()
-        )
-    })?;
-    fs::create_dir_all(&fusion_dir).with_context(|| {
-        format!(
-            "创建 consultation fusion 目录失败: {}",
-            fusion_dir.display()
-        )
-    })?;
-    Ok(ConsultationSkeleton {
-        id,
-        dir,
-        request_dir,
-        fusion_dir,
-    })
+    // The public legacy helper also serves callers creating a new artifact root.
+    // Shared admission uses the stricter already-existing-root helper below.
+    fs::create_dir_all(root)?;
+    create_consultation_skeleton_for_id(root, &ulid::Ulid::new().to_string())
+}
+/// Preserve the legacy artifact layout under the shared, already reserved ID.
+pub(crate) fn create_consultation_skeleton_for_id(root: &Path, id: &str) -> Result<ConsultationSkeleton> {
+    use std::os::unix::fs::DirBuilderExt;
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') { bail!("invalid_consultation_id"); }
+    let root = fs::canonicalize(root)?;
+    let dir = root.join(CONSULTATIONS_PATH).join(id);
+    let request_dir = dir.join("request"); let fusion_dir = dir.join("fusion");
+    for path in [root.join("coordination"), root.join(CONSULTATIONS_PATH), dir.clone(), request_dir.clone(), fusion_dir.clone()] {
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => {}, Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}, Err(error) => return Err(error.into()),
+        }
+        let metadata=fs::symlink_metadata(&path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() { bail!("unsafe_consultation_directory"); }
+    }
+    Ok(ConsultationSkeleton { id: id.into(), dir, request_dir, fusion_dir })
 }
 
 /// Append one JSON value as exactly one redacted JSONL record. The log file
@@ -2450,6 +2491,7 @@ mod tests {
                 MemberOutcome::new(case, format!("fixture-{case}"), MemberStatus::Failed);
             outcome.channel_facts = Some(serde_json::json!({}));
             let ready = ReadyConsultMemberV3 {
+                acp_request: None,
                 index: case,
                 alias: format!("fixture-{case}"),
                 action_id: format!("fixture-{case}"),
@@ -2610,6 +2652,7 @@ c.commit()
             let mut outcome = MemberOutcome::new(index, "native", MemberStatus::Failed);
             outcome.channel_facts = Some(serde_json::json!({}));
             let ready = ReadyConsultMemberV3 {
+                acp_request: None,
                 index,
                 alias: "native".into(),
                 action_id,
@@ -3035,7 +3078,7 @@ pub fn consultation_admitted(root: &Path) -> Result<GateDecision> {
 }
 
 #[cfg(test)]
-std::thread_local! { static FAIL_OBSERVATION_START: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+static FAIL_OBSERVATION_START: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>> = std::sync::OnceLock::new();
 #[cfg(test)]
 mod observation_start_tests {
     use super::*;
@@ -3075,14 +3118,14 @@ mod observation_start_tests {
         fs::write(&exe, "#!/bin/sh\nprintf started > unexpected-child\n").unwrap();
         fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(root.join(".orch/harnesses.yaml"),format!("version: 1\nharnesses:\n  one:\n    driver: claude\n    executable: {}\n    enabled: true\n    cwdPolicy: project-root\n",exe.display())).unwrap();
-        struct Reset;
+        struct Reset(PathBuf);
         impl Drop for Reset {
             fn drop(&mut self) {
-                FAIL_OBSERVATION_START.with(|flag| flag.set(false));
+                FAIL_OBSERVATION_START.get_or_init(Default::default).lock().unwrap().remove(&self.0);
             }
         }
-        let _reset = Reset;
-        FAIL_OBSERVATION_START.with(|flag| flag.set(true));
+        let _reset = Reset(fs::canonicalize(&root).unwrap());
+        FAIL_OBSERVATION_START.get_or_init(Default::default).lock().unwrap().insert(_reset.0.clone());
         let result = run_consultation(
             &root,
             &ConsultArgs {
@@ -3098,6 +3141,25 @@ mod observation_start_tests {
             .to_string()
             .contains("start publication failure"));
         assert!(!root.join("unexpected-child").exists());
+        let runs=crate::fusion_run::FusionEngine::new().list(&root).unwrap();
+        assert_eq!(runs.len(),1);
+        assert_eq!(runs[0].phase,"hold");
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod captured_input_policy_tests {
+    use super::*;
+    #[test]
+    fn derived_admitted_bytes_do_not_reload_source_policy() {
+        let root=crate::util::test_scratch_dir("derived-input-policy");
+        fs::create_dir_all(root.join("coordination")).unwrap();
+        fs::write(root.join("coordination/PROJECT-BINDING.yaml"),"data: [invalid").unwrap();
+        let path=root.join("captured.md");
+        assert!(capture_literal_inputs(&root,&path,"Previously admitted facts.").is_ok());
+        assert!(capture_literal_inputs(&root,&path,"OPENAI_API_KEY=sk-test-secret-material-do-not-store").is_err());
+        fs::write(&path,"New source facts.").unwrap();
+        assert!(capture_cli_inputs(&root,&ConsultArgs {question:path,..Default::default()}).is_err());
     }
 }

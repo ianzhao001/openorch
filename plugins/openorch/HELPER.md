@@ -1,48 +1,43 @@
-# OpenOrch helper
+# OpenOrch setup and consultation
 
-The Python 3 standard-library helper configures personal defaults and delegates
-to the installed `runtime/orch`. It adds no core commands and starts no daemon.
-Install the complete release bundle; the source checkout alone has no runtime.
+The installed Python helper verifies the packaged runtime and forwards literal
+arguments to Rust. Rust owns profile validation, defaults, project setup and
+consultation. Validation uses the same harness parser as CLI/MCP/Web; it creates
+no disposable Git clone. No daemon or background scheduler is added.
 
-The shared skill resolves this helper from its installed package. Codex uses
-its native plugin installation; DSH Web uses a separate filesystem-skill provider
-with package-relative resources. See [README.md](README.md) for native install,
-update and unregister operations. The setup inspection commands have no helper
-timeout; actual consultation deadlines remain owned by the core/native channel.
+Install the complete local release bundle. Source files alone have no runtime.
+Codex can use the packaged MCP server; DSH Web retains its existing skill/helper
+entry. This release does not claim DSH MCP integration.
 
-## Commands
+## Existing helper commands
 
 Run `python3 /absolute/plugin/scripts/openorch.py --help`.
-Each command also accepts `--help`. Global `--config-dir ABSOLUTE_DIRECTORY`
-selects a separate personal profile; the default is `~/.config/openorch`.
+Global `--config-dir ABS` goes before the action. Otherwise Rust uses
+`OPENORCH_CONFIG_DIR`, when explicitly set for this process, or
+`~/.config/openorch`. This does not change native client defaults.
 
-| Command | Purpose |
+| Action | Behavior |
 | --- | --- |
-| `discover --project PATH` | Find installed native clients and ask the core which support consultation; no model calls. |
-| `configure --project PATH --input PROFILE_JSON` | Validate and save chosen defaults. Add `--replace-profile` to explicitly update an existing profile. |
-| `attach --project PATH` | Create only a missing project configuration from the personal profile. |
-| `doctor --project PATH` | Verify the bundled runtime and inspect project configuration through the core. |
-| `run --project PATH --mode single --question-file FILE` | Consult the saved single member. |
-| `run --project PATH --mode fusion --question-file FILE` | Consult the saved fusion group. |
+| `discover --project PATH` | List installed executable candidates and core consultation capabilities; no model call or login claim. |
+| `configure --project PATH --input PROFILE_JSON` | Validate explicit choices and create a private personal profile. |
+| `configure ... --replace-profile` | Back up and explicitly replace only the personal profile. Existing project configuration stays unchanged. |
+| `attach --project PATH` | Initialize only missing project configuration and register this exact worktree for MCP. |
+| `doctor --project PATH` | Inspect configuration and optional saved defaults without inference. |
+| `run --project PATH --mode single --question-file FILE` | Consult one saved or explicitly selected member. |
+| `run --project PATH --mode fusion --question-file FILE` | Consult two to five distinct explicit members. The host synthesizes their answers. |
 
-Repeat `--harness ALIAS` on `run` to select members for that invocation.
-Aliases follow the core grammar: an ASCII letter or digit first, then ASCII
-letters, digits, dashes, underscores or dots (for example `advisor.primary`).
-Single requires one member; fusion requires two to five distinct members.
-Repeat `--attach PROJECT_TEXT_FILE` for text context. Relative attachments are
-resolved against the target worktree; the core validates paths and size limits.
-Do not interpret raw process output or an exit code alone as a valid answer:
-read the core's final summary, per-member outcomes, and artifact locations.
+Repeated `--harness ALIAS` overrides members for this invocation only. Repeated
+`--attach PROJECT_TEXT_FILE` supplies project-local text; relative attachments
+are resolved against the target worktree. Questions are UTF-8 literal files and
+are never passed to a shell. No member, provider, model or effort is silently
+substituted. Native consultation deadlines remain owned by the shared core.
 
-## Configure once, reuse across projects
+## Personal profile and recovery
 
-Discovery finds executable paths. It does not prove login, model availability,
-credentials, or successful answers. Select only native clients already installed
-and logged in, and choose model settings supported by those clients.
-The helper never substitutes a different provider or model.
-
-An example personal profile follows. Replace the executable and model settings
-with the actual local choices before saving; do not copy credentials.
+A profile contains exactly `version`, `harnesses` and `defaults`. The harness map
+uses the existing core schema, including supported `defaults`, action overrides
+and the opt-in `consult.acp` block. Executable paths must be absolute. Credentials
+belong in their existing secure sources; `credentialEnv` is a variable name.
 
 ```json
 {
@@ -55,89 +50,104 @@ with the actual local choices before saving; do not copy credentials.
       "cwdPolicy": "project-root"
     }
   },
-  "defaults": {
-    "single": "advisor",
-    "fusion": []
-  }
+  "defaults": {"single": "advisor", "fusion": []}
 }
 ```
 
-The `harnesses` object uses the core's version 1 schema, including supported
-`defaults` and action-specific `consult` settings. Unknown fields, raw argv/env,
-invalid paths, unsupported defaults, and malformed profiles are rejected by
-the helper or core. The single default must exist. Fusion may remain empty
-until two to five supported aliases have been chosen. Empty fusion cannot run.
+Choose actual installed clients and model settings before saving. The example
+does not certify a provider/model combination. The single default must exist;
+fusion is empty or contains two to five distinct supported aliases. An empty
+fusion cannot run. Unknown fields, unsafe paths and unsupported defaults fail.
 
-Validation uses a temporary local shared clone with no checkout. It invokes
-only local core configuration/discovery commands and removes that clone when
-finished. It does not run providers or change the user's Git configuration.
-The profile is published atomically with mode 0600. Existing profiles require
-explicit `--replace-profile`; replacement does not update existing projects.
+Files are private (0600), with short setup locks and complete atomic publication.
+Explicit replacement first saves and verifies the previous snapshot. It then
+uses atomic exchange to retain the actual overwritten file as well, closing the
+last-check/replacement race. The JSON result identifies `backup` and
+`snapshotBackup`. Existing files are never overwritten during first creation.
+If atomic exchange is unavailable, replacement refuses without a rename fallback.
 
-## Project state and invocation
+To restore a reviewed backup through the same validation, run:
 
-Projects require Git and an existing commit. An uncommitted or dirty worktree is
-allowed. OpenOrch never creates the project's first commit.
-The core configuration contains only `version` and `harnesses`, stored at
-`.orch/harnesses.yaml` in the main repository. JSON is valid YAML input here.
-Linked worktrees share that configuration through the Git common directory.
+```sh
+python3 /absolute/plugin/scripts/openorch.py --config-dir /absolute/personal-dir configure --project /absolute/project --input /absolute/backup.json --replace-profile
+```
 
-Existing project configuration is validated and its bytes are preserved, even
-when personal defaults change. To revise it, explicitly edit that project file
-and validate it with `doctor`; OpenOrch does not merge or overwrite it silently.
-A short local lock and atomic no-clobber publication serialize initial setup.
-Symlink configuration files and symlink directory components are rejected.
+The current profile is backed up again; old backups remain. If a concurrent edit
+or directory-sync error occurs after exchange, the error identifies the retained
+actual old file and the earlier snapshot. Inspect these paths before retrying:
+an error does not claim that publication was rolled back. No automatic rollback
+can overwrite a concurrent editor's changes.
 
-Only generated paths are appended to Git's local `info/exclude`:
-`.orch/`, `coordination/consultations/`, and `.cowork-temp/channel-capture/`.
-Tracked `.gitignore`, Git configuration, and project source files are untouched.
+## Project configuration and authorization
 
-Single and fusion both invoke the existing core `consult` command with explicit
-members. The helper replaces its process with the core, preserving signals,
-stdout/stderr and exit status. The working directory and `--root` are the user's
-actual target worktree, including when it is dirty or linked. UTF-8 question
-bytes are staged to a unique local ignored request file and passed by literal
-argv. Question text is never interpreted by a shell. Explicit members override
-only this invocation; no member is dropped or substituted. Unsupported explicit
-members reach the core's actual validation and per-member failure handling.
+The target must be an existing non-bare Git worktree with a commit. Dirty and
+linked worktrees are supported. `.orch/harnesses.yaml` belongs to the core's
+shared primary-repository configuration location. Existing bytes are validated
+and retained exactly; changing the personal profile does not rewrite projects.
 
-## Runtime and capabilities
+Only generated paths are appended to local Git `info/exclude`: `.orch/`,
+`coordination/consultations/`, and `.cowork-temp/channel-capture/`. Tracked
+`.gitignore`, Git configuration and project source are untouched. If later
+initial publication fails, these generated ignore entries may already exist;
+the error says so and an existing target is not overwritten.
 
-Before every operation the helper verifies `runtime/manifest.json` version 1.
-It must list exactly `orch` and the four scripts
-`wake-multica.sh`, `wake-dsh-stream.sh`, `wake-pi-stream.sh`,
-`wake-zcode-stream.sh` beneath `runtime/scripts/`.
-Each entry contains `sha256` and `bytes`. Every resource must be an ordinary
-file, and `orch guide --check` must report the default six-command surface.
-Missing, changed or symlinked resources fail before an invocation. Reinstall
-the complete version; a development checkout is not an integrity fallback.
-Checksums detect local changes, not publisher identity or reproducible builds.
+`attach` also registers the canonical requested worktree and its local directory
+identity in private `projects.json`, at most32 projects. Registration does not
+implicitly authorize sibling worktrees or the current directory. A replaced or
+removed directory fails registry validation. Explicitly reattach the intended
+worktree; review stale registrations when moving projects. A running MCP process
+keeps its startup allowlist, so restart it after changing registration.
 
-The current core supports consultation for Codex, Claude, OpenCode, Cursor,
-MiMo, CodeBuddy, SmartClaw, DSH, Pi and ZCode, subject to actual configuration
-discovery. AGY is not a consultation target in this core release. DSH Web can
-host this plugin and DSH can also be a target; host integration and target
-capabilities are separate. Runtime discovery is the final authority.
+## Codex MCP
 
-The source checkout also contains an independent read-only `orch-tui` binary for
-captured invocation observations. It is not part of the default six-command
-prebuilt runtime and never starts, cancels, collects, reconciles or garbage-
-collects an invocation.
+The package declares exactly four tools: `list_harnesses`, `consult`, `get_run`,
+`read_answer`. The launcher verifies all runtime resources before replacing itself
+with `orch-mcp`; stdout is reserved for protocol frames. Setup first, then restart
+the host/server to load the registered projects. An empty registration fails
+closed. It never infers access from the host's working directory.
 
-It also contains a source-built loopback-only `orch-web` frontend. It serves
-read-only observation data only from `127.0.0.1`, never opens arbitrary project
-files, and is not included in the prebuilt runtime.
+For an explicit host configuration, launch either:
 
-## Errors and recovery
+```sh
+/absolute/plugin/runtime/orch-mcp --project /absolute/worktree
+/absolute/plugin/runtime/orch-mcp --projects-file /absolute/personal-dir/projects.json
+```
 
-Helper setup/validation errors print an actionable message to stderr and return
-2. CLI syntax errors also return 2. Once the core starts, its own documented
-exit status and evidence are preserved. A failed member is not a successful
-fusion result. Read the complete core artifacts before drawing conclusions.
+These selectors cannot be mixed. Without arguments, the packaged plugin reads
+the shared personal registry selected above. No tool accepts commands or arbitrary
+environment values. Each call names an allowed project. `consult` takes a request
+key, question, explicit ordered role members and optional attachments. Same key
+and input returns the original run; changed input conflicts. No automatic retry,
+model fallback or synthesis member is added. The host plans, chooses and combines.
 
-For missing login, use the native client's own login flow. For invalid
-configuration, correct the selected profile or existing project file explicitly.
-For a symlink conflict, choose an ordinary owned directory. If a first project
-validation fails, the helper preserves its newly created configuration for
-diagnosis; no provider has run at that point. Configuration files may contain
-local paths and model selections: keep them local and out of published bundles.
+`get_run` returns metadata and diagnostic state, with at most30 seconds of bounded
+waiting. Use `read_answer` for verified UTF-8 pages, retaining the full-answer
+SHA-256 for continuation. Read every complete member answer before synthesizing.
+Tool-only output, missing trusted termination, wrong identity or changed answer
+bytes are not successful answers. Shutdown stops admission and drains bounded
+work; host exit does not promise continued background execution.
+
+## Runtime and qualification
+
+The complete inventory contains `orch`, `orch-mcp`, `orch-acp` and four wrappers
+under `runtime/scripts/`: `wake-multica.sh`, `wake-dsh-stream.sh`,
+`wake-pi-stream.sh`, `wake-zcode-stream.sh`. Every entry has a byte count and
+SHA-256 and must be an ordinary executable. All three binaries report version
+0.1.0; `orch guide --check` verifies the six public leaves. Missing, modified,
+symlinked or non-executable resources refuse before invocation. Checksums detect
+changes; they do not attest publisher identity.
+
+Build the default CLI separately from protocol binaries. It has no UI, protocol
+SDK or Tokio dependency. Its private helper entry retains normal project-mode,
+stale-binary and consultation admission checks. Setup errors return2; once an
+actual consultation starts its existing CLI outcome/partial-success semantics
+remain authoritative.
+
+ACP is explicitly selected per Consult profile. Existing native backends remain
+available by explicit configuration; a failed ACP request never switches backend.
+OpenCode and Claude have recorded real DeepSeek Flash/max qualifications. Codex
+ACP1.12.0 with native0.155.1 cannot negotiate the requested effort=max and refuses
+before Prompt; it is not certified for that tuple. AGY keeps its existing high
+model selection and does not support Consult or ACP. DSH, Pi and ZCode retain
+native compatibility consultation channels subject to discovery. Discovery,
+requested settings and actual model evidence are distinct.

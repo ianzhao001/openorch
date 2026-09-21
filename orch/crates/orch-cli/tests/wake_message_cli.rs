@@ -172,6 +172,15 @@ fn write_fake_harness(root: &Path, alias: &str) {
         b"#!/bin/sh\nprintf '%s\\n' '{\"type\":\"step_start\",\"sessionID\":\"session-alpha\",\"part\":{\"type\":\"step-start\",\"modelID\":\"model-a\"}}'\nprintf '%s\\n' '{\"type\":\"text\",\"part\":{\"text\":\"done\"}}'\nprintf '%s\\n' '{\"type\":\"step_finish\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}'\n/bin/sleep 8\n",
     )
     .unwrap();
+    // Darwin /bin/sh is a system shell dispatcher. Message-source tests use
+    // a concrete interpreter; delayed-exec identity is covered independently.
+    #[cfg(target_os = "macos")]
+    {
+        let original = fs::read(&executable).unwrap();
+        let mut stable = b"#!/bin/bash\n".to_vec();
+        stable.extend_from_slice(original.strip_prefix(b"#!/bin/sh\n").unwrap());
+        fs::write(&executable, stable).unwrap();
+    }
     let mut permissions = fs::metadata(&executable).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&executable, permissions).unwrap();

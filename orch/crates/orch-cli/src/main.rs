@@ -35,10 +35,36 @@ struct Cli {
 
 #[derive(Subcommand)]
 #[command(disable_help_subcommand = true)]
+enum OpenOrchCmd {
+    Discover,
+    Doctor,
+    Attach,
+    Configure {
+        #[arg(long)] input: PathBuf,
+        #[arg(long)] replace_profile: bool,
+    },
+    Run {
+        #[arg(long, value_parser=["single","fusion"])] mode: String,
+        #[arg(long)] question_file: PathBuf,
+        #[arg(long="harness")] harnesses: Vec<String>,
+        #[arg(long="attach")] attachments: Vec<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+#[command(disable_help_subcommand = true)]
 enum Cmd {
     /// Internal one-shot detached provider owner. Launch spec is inherited on stdin.
     #[command(name = "__wake-supervise", hide = true)]
     WakeSupervise,
+    /// Internal package helper; ordinary project, staleness and admission guards apply.
+    #[command(name = "__openorch", hide = true)]
+    OpenOrch {
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[command(subcommand)]
+        action: OpenOrchCmd,
+    },
     /// 检查 Git 与本机 harness 配置；selfhost 项目另核账本与运行环境
     Doctor,
     #[cfg(feature = "selfhost")]
@@ -526,6 +552,8 @@ fn enforce_actorless_write_generation(root: &std::path::Path, command: &Cmd) -> 
 fn command_effect_policy(command: &Cmd) -> CommandEffectPolicy {
     use CommandEffectPolicy::*;
     match command {
+        Cmd::OpenOrch { action: OpenOrchCmd::Discover | OpenOrchCmd::Doctor, .. } => ReadOnly,
+        Cmd::OpenOrch { .. } => PlanConsultation,
         Cmd::Sites {
             action:
                 SitesCmd::Cache {
@@ -767,6 +795,7 @@ fn compiled_build_stamp() -> orch_host::staleness::BuildStamp {
 /// value-level flags that decide whether a particular invocation writes.
 fn staleness_command_is_read_only(command: &Cmd) -> bool {
     match command {
+        Cmd::OpenOrch { action: OpenOrchCmd::Discover | OpenOrchCmd::Doctor, .. } => true,
         Cmd::Sites {
             action:
                 SitesCmd::Cache {
@@ -871,7 +900,8 @@ fn command_task(command: &Cmd) -> Option<&str> {
         | Cmd::Round {
             action: RoundCmd::SeedVerified { task, .. },
         } => Some(task),
-        Cmd::WakeSupervise
+        Cmd::OpenOrch { .. }
+        | Cmd::WakeSupervise
         | Cmd::Doctor
         | Cmd::StallCheck
         | Cmd::Ledger { .. }
@@ -904,7 +934,7 @@ fn validate_full_sha_syntax(value: &str, flag: &str) -> Result<()> {
 
 fn preflight_cli_command(root: &std::path::Path, command: &Cmd) -> Result<()> {
     if !orch_host::has_selfhost_state(root)?
-        && matches!(command, Cmd::Wake { .. } | Cmd::Consult { .. })
+        && matches!(command, Cmd::Wake { .. } | Cmd::Consult { .. } | Cmd::OpenOrch { .. })
     {
         return validate_standalone_flags(command);
     }
@@ -1029,6 +1059,7 @@ fn preflight_cli_command(root: &std::path::Path, command: &Cmd) -> Result<()> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let helper_setup=matches!(&cli.cmd,Cmd::OpenOrch{action,..} if !matches!(action,OpenOrchCmd::Run{..}));
     let root = match fs::canonicalize(&cli.root) {
         Ok(p) => p,
         Err(e) => {
@@ -1036,6 +1067,14 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Normalize helper projects before existing guards so nested paths cannot
+    // hide selfhost markers or compiled-input drift from normal preflight.
+    let root = if matches!(&cli.cmd, Cmd::OpenOrch { .. }) {
+        match orch_host::openorch_helper::canonical_project(&root) {
+            Ok(project) => project,
+            Err(error) => { eprintln!("orch: {error:#}"); return ExitCode::from(2); }
+        }
+    } else { root };
     // The detached owner is deliberately independent of the active round and
     // build-tip preflight. Its complete authority is the typed one-shot stdin
     // document; running ordinary preflight here could abandon a live child.
@@ -1046,14 +1085,14 @@ fn main() -> ExitCode {
         )
         .map(|_| ExitCode::SUCCESS)
         .unwrap_or_else(|error| {
-            let code = cli_error_exit_code(&error);
+            let code = if helper_setup {2} else {cli_error_exit_code(&error)};
             eprintln!("orch: wake supervisor failed: {error:#}");
             ExitCode::from(code)
         });
     }
     if let Err(error) = enforce_build_project_mode(&root, &cli.cmd) {
         eprintln!("orch: {error:#}");
-        return ExitCode::from(cli_error_exit_code(&error));
+        return ExitCode::from(if helper_setup {2} else {cli_error_exit_code(&error)});
     }
     // Orphan-control must remain reachable after round close and across an
     // ordinary stale-binary/active-round preflight. Its authority is only the
@@ -1127,7 +1166,7 @@ fn main() -> ExitCode {
                 ),
             };
             return result.unwrap_or_else(|error| {
-                let code = cli_error_exit_code(&error);
+                let code = if helper_setup {2} else {cli_error_exit_code(&error)};
                 eprintln!("orch: {error:#}");
                 ExitCode::from(code)
             });
@@ -1135,16 +1174,17 @@ fn main() -> ExitCode {
     }
     #[cfg(feature = "selfhost")]
     if let Err(error) = enforce_binary_staleness(&root, &cli.cmd, cli.allow_stale_binary) {
-        let code = cli_error_exit_code(&error);
+        let code = if helper_setup {2} else {cli_error_exit_code(&error)};
         eprintln!("orch: {error:#}");
         return ExitCode::from(code);
     }
     if let Err(error) = preflight_cli_command(&root, &cli.cmd) {
-        let code = cli_error_exit_code(&error);
+        let code = if helper_setup {2} else {cli_error_exit_code(&error)};
         eprintln!("orch: {error:#}");
         return ExitCode::from(code);
     }
     let result = match cli.cmd {
+        Cmd::OpenOrch { config_dir, action } => cmd_openorch(&root,config_dir,action),
         Cmd::WakeSupervise => {
             unreachable!("hidden wake runtime returned before ordinary dispatch")
         }
@@ -1274,7 +1314,7 @@ fn main() -> ExitCode {
     result.unwrap_or_else(|e| {
         // Typed command disposition wins over a nested ActionRejection; without
         // either, the only honest default is EffectUnknown(5).
-        let code = cli_error_exit_code(&e);
+        let code = if helper_setup {2} else {cli_error_exit_code(&e)};
         eprintln!("orch: {e:#}");
         ExitCode::from(code)
     })
@@ -2018,6 +2058,24 @@ fn cmd_plan(root: &std::path::Path) -> Result<ExitCode> {
         println!("    {} · {}", skipped.rule, skipped.reason);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_openorch(root: &std::path::Path, directory: Option<PathBuf>, action: OpenOrchCmd) -> Result<ExitCode> {
+    use orch_host::openorch_helper as helper;
+    let directory=match helper::resolve_config_dir(directory) {Ok(path)=>path,Err(error)=>{eprintln!("OpenOrch: {error:#}");return Ok(ExitCode::from(2));}};
+    let absolute=|path:PathBuf|->Result<PathBuf>{Ok(if path.is_absolute(){path}else{std::env::current_dir()?.join(path)})};
+    let value=match action {
+        OpenOrchCmd::Discover=>helper::discover_clients(root)?,
+        OpenOrchCmd::Doctor=>helper::doctor(root,&directory)?,
+        OpenOrchCmd::Attach=>helper::attach_project(root,&directory)?,
+        OpenOrchCmd::Configure{input,replace_profile}=>helper::configure_profile(root,&directory,&absolute(input)?,replace_profile)?,
+        OpenOrchCmd::Run{mode,question_file,harnesses,attachments}=>{
+            let preparation=(||->Result<orch_host::consult::ConsultArgs>{helper::prepare_consultation(root,&directory,&mode,&absolute(question_file)?,&harnesses,&attachments)})();
+            let args=match preparation {Ok(args)=>args,Err(error)=>{eprintln!("OpenOrch: {error:#}");return Ok(ExitCode::from(2));}};
+            return cmd_consult(root,args.question,args.harnesses,args.attachments,args.member_timeout_secs,args.total_wall_secs);
+        }
+    };
+    println!("{}",serde_json::to_string_pretty(&value)?);Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_consult(
@@ -4330,7 +4388,7 @@ mod retired_writer_surface_tests {
     use super::*;
 
     #[test]
-    fn only_managed_supervisor_is_hidden_and_no_command_aliases_exist() {
+    fn only_managed_internal_entries_are_hidden_and_no_command_aliases_exist() {
         fn walk(command: &clap::Command, prefix: &str, hidden: &mut Vec<String>) {
             for child in command.get_subcommands() {
                 let path = if prefix.is_empty() {
@@ -4351,9 +4409,10 @@ mod retired_writer_surface_tests {
         }
         let mut hidden = Vec::new();
         walk(&Cli::command(), "", &mut hidden);
+        hidden.sort();
         assert_eq!(
             hidden,
-            ["__wake-supervise"],
+            ["__openorch", "__wake-supervise"],
             "unexpected hidden runtime entry"
         );
     }
@@ -4363,7 +4422,7 @@ fn enforce_build_project_mode(root: &std::path::Path, command: &Cmd) -> Result<(
     if !cfg!(feature = "selfhost")
         && matches!(
             command,
-            Cmd::Wake { .. } | Cmd::Consult { .. } | Cmd::Doctor
+            Cmd::Wake { .. } | Cmd::Consult { .. } | Cmd::Doctor | Cmd::OpenOrch { .. }
         )
         && orch_host::has_selfhost_state(root)?
     {

@@ -1,8 +1,8 @@
 //! Git-ignored harness configuration and token-free capability discovery.
 //!
 //! Configuration selects a code-owned driver and supplies only local pins. It
-//! never carries argv, environment, transport, receipt, terminal, or control
-//! truth. A caller loads one immutable snapshot and passes that snapshot through
+//! never carries argv, environment values, receipt, terminal, or control
+//! truth. Consult can opt into a code-owned ACP backend with a typed launch profile. A caller loads one immutable snapshot and passes that snapshot through
 //! the rest of an action.
 
 use std::collections::BTreeMap;
@@ -177,9 +177,40 @@ impl HarnessInvocationLimits {
     }
 }
 
+/// Optional consult-only ACP launch profile. No commands, argv or environment values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all="camelCase", deny_unknown_fields)]
+pub struct AcpConfig {
+    /// External adapter entry, absent for built-in OpenCode ACP.
+    pub adapter: Option<PathBuf>,
+    /// Explicit Node executable when the adapter entry is JavaScript.
+    pub node: Option<PathBuf>,
+    /// Exact expected native agentInfo version.
+    pub agent_version: String,
+    /// Optional credential environment reference; never a credential value.
+    pub credential_env: Option<String>,
+    #[serde(skip)]
+    pub(crate) native_route: Option<crate::native_discovery::NativeProviderRoute>,
+    /// Missing routing after capture is a refusal, not permission to rediscover.
+    #[serde(skip)]
+    pub(crate) native_route_captured: bool,
+}
+impl AcpConfig {
+    fn validate(&self)->Result<()> {
+        if self.agent_version.trim().is_empty() || self.agent_version.len()>128 || self.agent_version.chars().any(char::is_control) {bail!("invalid ACP agentVersion");}
+        for path in self.adapter.iter().chain(self.node.iter()) {if !path.is_absolute() || path.components().any(|c|matches!(c,std::path::Component::ParentDir|std::path::Component::CurDir)){bail!("ACP paths must be absolute and normalized");}}
+        if self.credential_env.as_deref().is_some_and(|key|!safe_credential_reference(key)) {bail!("invalid ACP credentialEnv reference");}Ok(())
+    }
+}
+/// Credential references cannot name loader, command, home or path environment variables.
+pub(crate) fn safe_credential_reference(key:&str)->bool {
+    key.len()<=128 && key.bytes().all(|b|b.is_ascii_uppercase()||b.is_ascii_digit()||b==b'_')
+        && (key.ends_with("API_KEY")||key.ends_with("AUTH_TOKEN")||key.ends_with("ACCESS_TOKEN"))
+}
 /// One action-specific alias resolved entirely from an immutable snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedHarness {
+    acp: Option<AcpConfig>,
     alias: String,
     driver: HarnessId,
     executable: PathBuf,
@@ -191,6 +222,8 @@ pub struct ResolvedHarness {
 }
 
 impl ResolvedHarness {
+    /// Captured consult-only ACP profile, absent for every legacy action.
+    pub fn acp(&self)->Option<&AcpConfig> {self.acp.as_ref()}
     /// Configured alias used to select this invocation.
     pub fn alias(&self) -> &str {
         &self.alias
@@ -337,6 +370,7 @@ impl HarnessConfigSnapshot {
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("解析 harness alias {alias:?} driver 失败"))?;
         Ok(ResolvedHarness {
+            acp: entry.action_override(action).and_then(|a|a.acp.clone()),
             alias: alias.to_string(),
             driver,
             executable: entry.executable.clone(),
@@ -400,6 +434,8 @@ impl HarnessConfigSnapshot {
                 executable_availability: inspect_executable(&executable),
             });
             let limits = entry.invocation_limits(HarnessAction::Consult);
+            let mut acp=entry.consult.as_ref().and_then(|a|a.acp.clone());
+            if let Some(profile)=&mut acp {profile.native_route=row.native.provider_route.clone();profile.native_route_captured=true;}
             entry.enabled = row.enabled && row.availability == "supported";
             entry.defaults = HarnessTuple {
                 provider: tuple.provider.clone(),
@@ -410,6 +446,7 @@ impl HarnessConfigSnapshot {
             entry.execute = None;
             entry.review = None;
             entry.consult = Some(HarnessActionOverride {
+                acp,
                 tuple: HarnessTuple::default(),
                 limits,
             });
@@ -423,7 +460,9 @@ impl HarnessConfigSnapshot {
                 serde_json::json!({
                     "alias": alias, "driver": entry.driver, "executable": entry.executable,
                     "enabled": entry.enabled, "cwdPolicy": format!("{:?}", entry.cwd_policy),
-                    "limits": entry.invocation_limits(HarnessAction::Consult)
+                    "limits": entry.invocation_limits(HarnessAction::Consult),
+                    "acp": entry.consult.as_ref().and_then(|a|a.acp.as_ref()),
+                    "nativeProviderRoute": entry.consult.as_ref().and_then(|a|a.acp.as_ref()).and_then(|a|a.native_route.as_ref())
                 })
             })
             .collect::<Vec<_>>();
@@ -443,6 +482,20 @@ impl HarnessConfigSnapshot {
             source_bytes: bytes.into(),
             entries,
         })
+    }
+
+    /// Attach captured native routing while preserving the original CLI config bytes,
+    /// aliases, availability, tuple semantics and source digest. Request/command
+    /// identities separately bind the supplemental route before execution.
+    pub(crate) fn with_consult_native_routes(&self, scan: &crate::native_discovery::DiscoverySnapshot) -> Self {
+        let mut snapshot=self.clone();
+        for (alias, entry) in &mut snapshot.entries {
+            if let Some(profile)=entry.consult.as_mut().and_then(|a|a.acp.as_mut()) {
+                profile.native_route=scan.harnesses.iter().find(|row|row.alias.as_ref()==Some(alias)).and_then(|row|row.native.provider_route.clone());
+                profile.native_route_captured=true;
+            }
+        }
+        snapshot
     }
 
     /// Return every alias independently without starting a process or probing a token.
@@ -522,6 +575,7 @@ impl HarnessEntry {
 
 #[derive(Debug, Clone)]
 struct HarnessActionOverride {
+    acp: Option<AcpConfig>,
     tuple: HarnessTuple,
     limits: HarnessInvocationLimits,
 }
@@ -559,6 +613,8 @@ struct HarnessTupleFile {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HarnessActionFile {
+    #[serde(default, deserialize_with = "present_option")]
+    acp: Option<AcpConfig>,
     provider: Option<String>,
     model: Option<String>,
     effort: Option<String>,
@@ -591,6 +647,10 @@ fn validate_action(
     alias: &str,
     action: &str,
 ) -> Result<HarnessActionOverride> {
+    if let Some(acp)=&file.acp {
+        if action!="consult" {bail!("ACP is supported only for consult");}
+        acp.validate()?;
+    }
     let raw = file.limits.unwrap_or_default();
     if raw.max_prompt_bytes == Some(0) || raw.timeout_seconds == Some(0) {
         bail!("harness {alias} {action}.limits values must be positive");
@@ -606,6 +666,7 @@ fn validate_action(
         action,
     )?;
     Ok(HarnessActionOverride {
+        acp: file.acp,
         tuple,
         limits: HarnessInvocationLimits {
             max_prompt_bytes: raw.max_prompt_bytes,
@@ -811,6 +872,14 @@ fn availability_for(entry: &HarnessEntry, action: Option<HarnessAction>) -> Harn
                 driver.as_str(),
                 action.as_str()
             ));
+        }
+        if action==HarnessAction::Consult {
+            if let Some(acp)=entry.consult.as_ref().and_then(|a|a.acp.as_ref()) {
+                if !matches!(driver,HarnessId::OpenCode|HarnessId::Codex|HarnessId::Claude){return HarnessAvailability::Unsupported("ACP driver unsupported".into());}
+                if driver!=HarnessId::OpenCode && acp.adapter.is_none(){return HarnessAvailability::Unsupported("ACP adapter required".into());}
+                if driver==HarnessId::OpenCode && (acp.adapter.is_some() || acp.node.is_some()){return HarnessAvailability::Unsupported("OpenCode ACP requires its built-in executable".into());}
+                if acp.adapter.as_ref().is_some_and(|p|!p.is_file()) || acp.node.as_ref().is_some_and(|p|!matches!(inspect_executable(p),HarnessAvailability::Supported)){return HarnessAvailability::Unsupported("ACP adapter or Node unavailable".into());}
+            }
         }
         if let Some(reason) = unsupported_tuple_reason(driver, &entry.effective_tuple(action)) {
             return HarnessAvailability::Unsupported(reason);

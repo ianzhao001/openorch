@@ -114,14 +114,13 @@ fn binding_runner_allowlist_and_ignore_markers_are_exact() {
         .iter()
         .map(|value| value.as_str().expect("testExclusive argv must be strings"))
         .collect::<Vec<_>>();
-    assert_eq!(
-        argv,
-        [
-            "/bin/sh",
-            "orch/scripts/test-exclusive.sh",
-            "/Users/admin/.cargo/bin/cargo",
-        ]
-    );
+    let declared_cargo = binding["commands"]["seedTargets"]["argv"][0]
+        .as_str().expect("project seed tool must be declared");
+    assert_eq!(argv, ["/bin/sh", "orch/scripts/test-exclusive.sh", declared_cargo]);
+    assert_eq!(Path::new(declared_cargo).file_name().and_then(|s| s.to_str()), Some("cargo"));
+    for gate in ["testFast", "check", "checkDefault", "buildDefault", "buildSelfhost"] {
+        assert_eq!(binding["commands"][gate]["argv"][0].as_str(), Some(declared_cargo), "gate must use the same explicitly bound tool: {gate}");
+    }
     assert!(Path::new(argv[2]).is_absolute());
     assert_eq!(exclusive["timeoutSeconds"].as_u64(), Some(1200));
     for gate in ["fast", "merge"] {

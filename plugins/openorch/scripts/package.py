@@ -18,7 +18,7 @@ sys.dont_write_bytecode = True
 from install import (ASSETS, PLUGIN, SEMVER, InstallError, absolute, check_path,
                      command, digest, files_under, read_file, require, verify_bundle)
 
-SOURCE_FILES = (".codex-plugin/plugin.json", "package.json", "cordis.patch.yml",
+SOURCE_FILES = (".codex-plugin/plugin.json", ".mcp.json", "scripts/openorch-mcp.py", "package.json", "cordis.patch.yml",
                 "dsh-entry.mjs", "skills/openorch/SKILL.md", "scripts/openorch.py",
                 "scripts/install.py", "scripts/package.py", "HELPER.md", "README.md",
                 "LICENSE", "catalog.json", "AGENTS.md")
@@ -41,6 +41,10 @@ def collect(source, runtime, version):
     binary = runtime / "orch"
     require(os.access(binary, os.X_OK), "Supplied runtime/orch must be executable.")
     resources = {name: read_file(runtime / name) for name in ASSETS}
+    for name in ASSETS:
+        require(os.access(runtime / name, os.X_OK), "Runtime resource must be executable: " + name)
+    for name in ("orch-mcp", "orch-acp"):
+        require(command(runtime / name, "--version", timeout=30).strip() == name + " 0.1.0", "Unexpected protocol runtime version: " + name)
     require(re.search(r"\bcommands=6\b", command(binary, "guide", "--check", timeout=30)), "Supply the default six-command core, not a selfhost build.")
     require(command(binary, "--version", timeout=30).strip() == "orch 0.1.0", "Expected orch 0.1.0 runtime.")
     for name, data in resources.items():
@@ -76,7 +80,7 @@ def build(source, runtime, output, version):
             path = staging / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
-            path.chmod(0o755 if name.endswith((".py", ".sh")) or name == PLUGIN + "runtime/orch" else 0o644)
+            path.chmod(0o755 if name.endswith((".py", ".sh")) or name in {PLUGIN + "runtime/" + binary for binary in ("orch", "orch-mcp", "orch-acp")} else 0o644)
         manifest = {"schemaVersion": 1, "name": "openorch", "version": version, "platform": "darwin-arm64",
                     "runtimeVersion": "0.1.0", "files": {name: digest(data) for name, data in sorted(selected.items())}}
         (staging / "manifest.json").write_bytes(json_bytes(manifest))
@@ -100,7 +104,7 @@ def build(source, runtime, output, version):
 def main():
     """Build from explicit source/runtime inputs and report validation failures as exit 2."""
     parser = argparse.ArgumentParser(description="Build a self-contained OpenOrch release directory and .tar.gz archive.")
-    parser.add_argument("--runtime-dir", required=True, help="Directory containing default orch and four scripts/ resources")
+    parser.add_argument("--runtime-dir", required=True, help="Directory containing default orch, orch-mcp, orch-acp and four scripts/ resources")
     parser.add_argument("--output", required=True, help="New distribution directory; its adjacent .tar.gz must also be absent")
     parser.add_argument("--version", required=True, help="Strict plugin semver; core remains orch 0.1.0")
     args = parser.parse_args()

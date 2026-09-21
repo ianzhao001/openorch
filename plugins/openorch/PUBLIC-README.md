@@ -6,7 +6,7 @@ OpenOrch connects installed AI harnesses to Codex Desktop and DSH Web through on
 shared skill and a bundled local runtime. Choose your own clients/models, consult
 one or several members, and let the current host synthesize their original answers.
 
-Plugin release: `v0.1.0-alpha.10` · core executable: `orch 0.1.0`.
+Local candidate: `v0.1.0-alpha.11` (not remotely published by this change) · runtime binaries: `0.1.0`.
 
 ## 中文
 
@@ -17,13 +17,7 @@ DSH 插件管理还使用其正常的 Node.js/pnpm 环境，并从官方包源�
 完整 Release 包已包含运行核心，使用者不需要 Rust，也不需要任何私有仓库。
 
 ```sh
-release=v0.1.0-alpha.10
-bundle=openorch-$release-darwin-arm64
-base=https://github.com/ianzhao001/openorch/releases/download/$release
-curl -fLO "$base/$bundle.tar.gz"
-curl -fLO "$base/$bundle.tar.gz.sha256"
-shasum -a 256 -c "$bundle.tar.gz.sha256"
-tar -xzf "$bundle.tar.gz"
+bundle=/absolute/path/to/openorch-v0.1.0-alpha.11-darwin-arm64
 python3 "$bundle/install.py" --host both
 ```
 
@@ -63,19 +57,12 @@ Codex 安装后打开新任务使用 OpenOrch。DSH Web 新会话选择包含 Sk
 | 插件宿主 | Codex Desktop、DSH Web |
 | Consult 目标 | Codex、Claude、OpenCode、Cursor、MiMo、CodeBuddy、SmartClaw、DSH、Pi、ZCode；以本机实际发现结果为准 |
 | 当前不支持的 Consult 目标 | AGY |
-| 命令面 | 默认6个叶命令；可选 selfhost 30个；只读 `orch-tui` 与支持显式 Fusion 的 `orch-web` 源码二进制 |
+| 命令面 | 默认6个叶命令；可选 selfhost 30个；既有 `orch-ui` 保留 |
 
-DSH 既是宿主，也可作为 Consult 目标；Pi、ZCode 同样受支持。宿主集成与目标通道能力
-仍需分开判断，并以运行时发现、原生终态和项目历史证据为准。
+DSH 作为宿主可调用其它受支持通道；宿主集成与目标通道能力分开判断。
 本插件不扩展执行/审查动作支持，不新增后台 scheduler、自动接替或自动重试。
 缺少客户端、未登录、unsupported、partial、空答或 tool-only 结果都会保留为实际状态，
 不会以进程退出0或文件出现冒充有效答卷，也不会偷偷替换模型。
-
-### Web Fusion 与本机发现
-
-WebUI 可保存项目本地角色/组合，并由用户显式启动有限咨询；每次固定 HEAD、问题、角色顺序及原生配置快照。本机 Native Discovery 只读检查客户端配置和模型目录，不发送推理请求、不修改凭据。未知原生终态保持 HOLD，历史缺少完整流闭合证据的答卷显示为 `historical-unverified`。
-
-详情读取与后台轮询分离，具有独立取消和 12 秒浏览器超时；OpenCode 启动前进行本机只读就绪检查，同通道启动间隔至少一秒。这些边界不引入自动重试、模型替补或调度器。
 
 ### 更新与卸载
 
@@ -93,9 +80,9 @@ python3 /path/to/release/install.py --host dsh --uninstall
 
 ### 运行时来源与源码
 
-本次运行核心从固定产品源码构建，Release 的 `PROVENANCE.json` 记录源码输入、工具链、
-构建参数、二进制/四资源的校验值及公开 tag 对照；不能把旧版证明当作本版证明。
-全包 `manifest.json` 与包内五文件 `runtime/manifest.json` 用于检测字节变化。
+本地候选从固定产品源码构建，包内 `runtime/provenance.json` 记录源码提交、工具链与
+构建参数；本次没有远端发布或公开 tag 对应声明，不能借用旧版的资格证明。
+全包 `manifest.json` 与包内七资源 `runtime/manifest.json` 用于检测字节变化。
 核心是 macOS ad-hoc 签名，没有 Apple Developer ID 签名或 notarization；不宣称
 可复现构建或不存在的 GitHub attestation。验证示例：
 
@@ -105,7 +92,7 @@ codesign --verify --strict "$bundle/plugins/openorch/runtime/orch"
 "$bundle/plugins/openorch/runtime/orch" guide --check
 ```
 
-发布验证使用 Rust 1.97.1；暂未声明 MSRV。构建核心可运行：
+发布验证使用 Rust 1.98.0；暂未声明 MSRV。构建核心可运行：
 
 ```sh
 cargo build --release -p orch-cli --no-default-features \
@@ -117,20 +104,6 @@ cargo build --release -p orch-cli --no-default-features \
 默认产品面包含 `guide`、`doctor`、`harness list`、`harness lint`、`wake`、`consult`；
 完整参数以安装核心的 help/guide 为准。
 
-源码还提供独立的只读 `orch-tui` 终端面板和 loopback-only `orch-web` WebUI；预编译默认 runtime 不包含它们。构建和运行：
-
-```sh
-cargo build -p orch-ui --bin orch-tui --locked --manifest-path orch/Cargo.toml
-orch/target/debug/orch-tui --root /absolute/project
-cargo run --locked --manifest-path orch/Cargo.toml -p orch-ui --bin orch-web --all-features -- --root /exact/git/root
-```
-
-终端面板每两秒刷新已捕获的 invocation 观察，不启动、取消、收取、reconcile 或 GC 调用，也不消费
-planner 答卷；来源时间、陈旧、原生终态和未知总量会分别显示。所有展示与复制内容经过安全
-裁剪，非 TTY、参数错误或初始化失败不会伪装成成功。
-
-`orch-web` 只绑定 `127.0.0.1`，使用启动时生成的 capability、同源校验、无 CORS 和严格安全响应头；没有任意文件接口。它的观察接口为只读；用户可另行保存项目本地 Fusion 角色与组合，并显式启动有限咨询，页面资源全部随源码提供，不加载 CDN、远程字体或答卷图片。WebUI 对任务/未关联调用使用共享 30 卡窗口，失败/无效只在窗口内优先；主题和语言偏好只保存非敏感 cookie。
-
 `SOURCE-MANIFEST.json` 只列导出的相对路径与SHA-256。公开树不包含私有历史、roster、
 本机配置或原生转写；`coordination/scripts/wake-multica.sh` 是唯一公开的 coordination 资源。
 产品仍为 alpha，仅验证 Apple Silicon macOS。许可证为 [MIT](LICENSE)。
@@ -139,7 +112,7 @@ planner 答卷；来源时间、陈旧、原生终态和未知总量会分别显
 
 ### Install and use
 
-Use the complete [Release](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.10)
+Use the complete local candidate bundle
 archive on Apple Silicon macOS. Python3.9+, Git and the native Codex/DSH client are
 required. DSH uses its normal Node.js/pnpm environment and fetches the declared
 filesystem-skill dependency. The bundle includes the runtime; Rust and the private
@@ -160,20 +133,26 @@ login. Save one single advisor and optionally two to five fusion aliases. The
 mode0600 personal profile is reused across projects; existing project configuration
 is preserved. Dirty/linked worktrees work, and no initial Git commit is created.
 
+### Codex host coordination
+
+The release includes its published collaboration policy at
+`plugins/openorch/AGENTS.md`. In Codex Desktop, use Codex-native delegation,
+messaging, and waits to coordinate bounded local implementation work. OpenOrch
+is only the explicit cross-harness consultation and fusion layer: it does not
+duplicate Codex's task queue, background scheduler, automatic takeover, or retry
+behavior. Each subtask has one execution owner, and the current host keeps
+native-subagent results separate from OpenOrch consultation evidence.
+
 Ask “Use OpenOrch to consult my default advisor about …” or “Use OpenOrch fusion
 about …”. The host reads complete member outcomes and synthesizes conclusions,
 disagreements, failures and original-answer links. Aliases can share a backend;
 member count does not prove model diversity. Native client usage costs still apply.
 
-Current Consult targets are Codex, Claude, OpenCode, Cursor, MiMo, CodeBuddy,
-SmartClaw, DSH, Pi and ZCode, subject to runtime discovery. AGY is an unsupported
-Consult target in this core. DSH Web can host the plugin and DSH can also be a
-target. Execution/review capabilities and the default6/selfhost30 boundaries are
-unchanged. There is no added daemon, scheduler, automatic takeover or retry.
-
-The source provides a read-only `orch-tui` and a localhost `orch-web`; neither is shipped in the prebuilt runtime. Build the TUI with `cargo build -p orch-ui --bin orch-tui --locked --manifest-path orch/Cargo.toml`, or run the WebUI with `cargo run --locked --manifest-path orch/Cargo.toml -p orch-ui --bin orch-web --all-features -- --root /exact/git/root`.
-
-WebUI observation reads remain read-only. Explicit Fusion actions save project-local roles/groups and launch finite consultations with fixed HEAD, question, ordered roles and native configuration snapshots. Native Discovery reads installed client settings/model catalogs without inference requests or credential changes. There is no scheduler, retry or substitute model. Localhost binding, startup capability and exact same-origin checks protect the API; Fusion never collects, reconciles or garbage-collects tasks. Unknown native completion stays HOLD, and incomplete historical evidence is shown as `historical-unverified`, not a verified answer. Detail reads survive background polling, have independent cancellation and a 12-second client timeout. OpenCode readiness is checked before launch, with one-second spacing between same-driver launches.
+Current Consult targets are Codex, Claude, OpenCode, Cursor, MiMo, CodeBuddy and
+SmartClaw, with native compatibility channels for DSH, Pi and ZCode, subject to
+runtime discovery. AGY Consult is unsupported. DSH Web can still host the plugin and invoke supported
+targets. Execution/review capabilities and the default6/selfhost30/UI boundaries
+are unchanged. There is no added daemon, scheduler, automatic takeover or retry.
 
 ### Update, remove and verify
 
@@ -184,12 +163,12 @@ version payloads, personal settings, project configuration and evidence remain.
 Another host may still reference an older payload. Resolve a reported native
 dependency/login/conflict through its normal workflow, then rerun the affected host.
 
-The complete bundle and five runtime resources have separate integrity inventories.
-Release `PROVENANCE.json` identifies fixed production inputs, compiler/build details,
-artifact checksums and the public-tag comparison. It does not reuse an older
-release's source-equality claim. The core is ad-hoc signed, not Developer ID signed
+The complete bundle and seven runtime resources have separate integrity inventories.
+The bundled `runtime/provenance.json` identifies fixed local source inputs and
+compiler/build details. This local candidate makes no remote-release/public-tag
+claim and does not reuse an older release's source-equality claim. The core is ad-hoc signed, not Developer ID signed
 or notarized; no reproducible-build or unavailable attestation claim is made.
-Build-from-source commands and signature checks appear above; Rust1.97.1 was used,
+Build-from-source commands and signature checks appear above; Rust1.98.0 was used,
 and no MSRV is declared.
 
 The public snapshot includes product sources and their relative-path SHA-256
@@ -197,3 +176,32 @@ inventory, not private history, machine configuration, roster, transcripts or th
 full private selfhost test history. See the [plugin README](plugins/openorch/README.md),
 [helper reference](plugins/openorch/HELPER.md), [changelog](CHANGELOG.md) and
 [MIT license](LICENSE).
+
+
+## Local MCP / ACP candidate
+
+`0.1.0-alpha.11` is a local candidate; this change does not publish a remote release.
+Use the verified local bundle. Codex receives four MCP tools through a package-local
+stdio server; DSH retains the shared skill/helper entry and has no MCP claim.
+Rust now owns personal configuration, default selection and setup through the
+same parser and consultation lifecycle as CLI/Web. Python is a verified launcher.
+
+Run the installed helper's `configure` and `attach` for the intended Git worktree,
+then restart the host to load its explicit private project registry. The current
+directory never grants MCP access. Existing project bytes and native model defaults
+are retained. Explicit profile updates return verified snapshot/actual-old-file
+backup paths; recovery and all helper options are documented in [HELPER.md](HELPER.md).
+
+Package runtime inputs must include all three binaries and four wrappers. Build
+CLI separately from protocol binaries to preserve dependency isolation:
+
+```sh
+cargo build --locked --manifest-path orch/Cargo.toml -p orch-cli --no-default-features --release
+cargo build --locked --manifest-path orch/Cargo.toml -p orch-mcp -p orch-acp --release
+```
+
+MCP consultations require explicit members and verified answer pagination. No
+implicit synthesizer, retry, model fallback or detached scheduler is added.
+Recorded native qualification accepts OpenCode/Claude DeepSeek Flash/max; Codex
+ACP1.12.0/native0.155.1 refuses unsupported effort=max before Prompt. AGY Consult
+and ACP remain unavailable. Actual runtime discovery/evidence remain authoritative.

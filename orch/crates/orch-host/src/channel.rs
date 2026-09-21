@@ -28,6 +28,7 @@ use crate::harness_config::{
 };
 
 pub(crate) mod managed;
+pub(crate) mod acp;
 pub(crate) mod process;
 /// Shared rich-message input and the hidden managed-supervisor entry.
 pub use managed::{
@@ -271,6 +272,18 @@ pub fn capture_attachment_manifest_v1(paths: &[&Path]) -> Result<AttachmentManif
         });
     }
 
+    captured_manifest(entries)
+}
+
+/// Build a derived manifest from bytes already admitted by the shared input policy.
+/// This never reopens a mutable source file; paths remain part of its identity.
+pub(crate) fn manifest_from_captured_text(path: &Path, bytes: Vec<u8>) -> Result<AttachmentManifestV1> {
+    validate_absolute_lexical_path(path, "captured input")?;
+    captured_manifest(vec![AttachmentSnapshotV1 {
+        path: path.to_path_buf(), sha256: hex::encode(Sha256::digest(&bytes)), bytes: Arc::from(bytes),
+    }])
+}
+fn captured_manifest(entries: Vec<AttachmentSnapshotV1>) -> Result<AttachmentManifestV1> {
     let mut digest = Sha256::new();
     digest.update(b"orch-attachment-manifest-v1\0");
     update_len(&mut digest, entries.len());
@@ -353,6 +366,7 @@ impl RequestedInvocation {
 /// Fully prepared immutable action input shared by every later channel phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedInvocation {
+    acp: Option<crate::harness_config::AcpConfig>,
     alias: String,
     driver: HarnessId,
     executable: PathBuf,
@@ -497,8 +511,10 @@ pub struct InvocationContextV1 {
 }
 
 /// Code-owned final command rendered from one prepared invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RenderedInvocationV1 {
+    acp_request: Option<orch_core::acp::AcpRequest>,
+    extra_assets: Vec<ExecutableIdentityV1>,
     prepared: PreparedInvocation,
     context: InvocationContextV1,
     argv: Vec<String>,
@@ -508,7 +524,14 @@ pub struct RenderedInvocationV1 {
     command_digest: String,
 }
 
+impl std::fmt::Debug for RenderedInvocationV1 {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        f.debug_struct("RenderedInvocationV1").field("program",&self.argv.first()).field("argument_count",&self.argv.len()).field("environment_keys",&self.env.keys().collect::<Vec<_>>()).field("command_digest",&self.command_digest).finish_non_exhaustive()
+    }
+}
 impl RenderedInvocationV1 {
+    /// Host-owned ACP request, unavailable to raw MCP arguments.
+    pub(crate) fn acp_request(&self)->Option<&orch_core::acp::AcpRequest> {self.acp_request.as_ref()}
     /// Immutable prepared request consumed by this render.
     pub fn prepared(&self) -> &PreparedInvocation {
         &self.prepared
@@ -596,7 +619,7 @@ pub fn render_invocation_v1(
     prepared: PreparedInvocation,
     context: InvocationContextV1,
 ) -> Result<RenderedInvocationV1> {
-    render_invocation_inner(prepared, context, None, None)
+    render_invocation_inner(prepared, context, None, None, false)
 }
 
 // Only the trusted finite Fusion caller can forward a captured native config
@@ -611,7 +634,20 @@ pub(crate) fn render_native_role_v1(
         bail!("native role rendering is Consult-only");
     }
     require_canonical_exact_directory(private_root, "native role private root")?;
-    render_invocation_inner(prepared, context, Some(native), Some(private_root))
+    render_invocation_inner(prepared, context, Some(native), Some(private_root), true)
+}
+
+/// Use one captured environment while retaining the existing CLI launch policy.
+pub(crate) fn render_captured_cli_v1(
+    prepared: PreparedInvocation, context: InvocationContextV1,
+    native: &crate::native_discovery::DiscoveryContext, private_root: &Path,
+) -> Result<RenderedInvocationV1> {
+    if prepared.requested().action != InvocationAction::Consult { bail!("captured CLI rendering is Consult-only"); }
+    require_canonical_exact_directory(private_root, "CLI private root")?;
+    // Explicit plan is the shared, implemented readonly policy; valid legacy
+    // None/auto choices keep their existing launch contract.
+    let readonly = prepared.driver()==HarnessId::Claude && prepared.effective().mode.as_deref()==Some("plan");
+    render_invocation_inner(prepared, context, Some(native), Some(private_root), readonly)
 }
 
 fn render_invocation_inner(
@@ -619,8 +655,10 @@ fn render_invocation_inner(
     context: InvocationContextV1,
     native: Option<&crate::native_discovery::DiscoveryContext>,
     private_root: Option<&Path>,
+    native_role: bool,
 ) -> Result<RenderedInvocationV1> {
     validate_context(&prepared, &context)?;
+    if prepared.acp.is_some() {return acp::render(prepared,context,native,private_root);}
     let mut env = controlled_operational_environment(prepared.driver())?;
     let contract = prepared.driver_contract();
     let (program, wrapper_path, wrapper_identity) = match contract.wrapper {
@@ -641,16 +679,16 @@ fn render_invocation_inner(
     if let Some(wrapper) = wrapper_path {
         argv.push(path_text(&wrapper, "driver wrapper")?);
         argv.push(prepared.prompt().to_string());
-        render_wrapper_environment(&prepared, &context, &mut env, native.is_some())?;
+        render_wrapper_environment(&prepared, &context, &mut env, native_role)?;
     } else {
         argv.extend(render_direct_arguments(
             &prepared,
             &context,
-            native.is_some(),
+            native_role,
         )?);
     }
     if let Some(native) = native {
-        env.insert("ORCH_FUSION_ROLE".into(), "1".into());
+        if native_role { env.insert("ORCH_FUSION_ROLE".into(), "1".into()); }
         if !native.home.is_absolute() {
             bail!("native HOME must be absolute");
         }
@@ -676,7 +714,7 @@ fn render_invocation_inner(
                 env.insert((*key).into(), value.clone());
             }
         }
-        if prepared.driver() == HarnessId::ZCode {
+        if native_role && prepared.driver() == HarnessId::ZCode {
             env.insert(
                 "ORCH_FUSION_PRIVATE_ROOT".into(),
                 path_text(
@@ -695,6 +733,8 @@ fn render_invocation_inner(
         wrapper_identity.as_ref(),
     );
     Ok(RenderedInvocationV1 {
+        acp_request: None,
+        extra_assets: Vec::new(),
         prepared,
         context,
         argv,
@@ -708,6 +748,7 @@ fn render_invocation_inner(
 /// Revalidate every live filesystem/Git fact without rereading config or attachment bytes.
 pub fn preflight_invocation_v1(rendered: RenderedInvocationV1) -> Result<PreflightedInvocationV1> {
     let prepared = rendered.prepared();
+    for asset in &rendered.extra_assets {if capture_file_identity(asset.configured_path(),false)?!=*asset {bail!("ACP launch asset identity changed before spawn");}}
     if capture_executable_identity(prepared.executable())? != *prepared.executable_identity() {
         bail!("configured harness executable identity 漂移 before spawn");
     }
@@ -1997,7 +2038,7 @@ pub fn prepare_invocation(
 
     let resolved = snapshot.resolve(&request.alias, request.action.config_action())?;
     resolved.limits().validate_prompt(&request.prompt)?;
-    let driver_contract = resolved
+    let mut driver_contract = resolved
         .driver()
         .driver_contract(request.action.driver_action())
         .with_context(|| {
@@ -2022,12 +2063,25 @@ pub fn prepare_invocation(
     }
 
     let tuple = tuple_from_resolved(&resolved);
+    let mut effective=tuple.clone();
+    if let Some(profile)=resolved.acp() {
+        if profile.native_route_captured && resolved.driver()!=HarnessId::OpenCode && effective.provider.is_some() && profile.native_route.is_none() {
+            bail!("acp_provider_route_unverified");
+        }
+        let mode=if resolved.driver()==HarnessId::Codex {"read-only"} else {"plan"};
+        if effective.mode.as_deref().is_some_and(|m|m!=mode){bail!("ACP consult requires readonly mode");}
+        effective.mode=Some(mode.into());
+        if effective.model.as_deref().is_none_or(|m|m.trim().is_empty()){bail!("ACP consult requires an explicit resolved model");}
+        driver_contract.wrapper=None;
+        driver_contract.terminal=crate::harness::CapabilitySource::Derived;
+        driver_contract.observation_source="acp-v1-stdio";
+    }
     let executable_identity = capture_executable_identity(resolved.executable())?;
     let requested = RequestedInvocation {
         action: request.action,
         tuple: tuple.clone(),
     };
-    let request_digest = request_digest(
+    let mut request_digest = request_digest(
         snapshot,
         &request,
         &resolved,
@@ -2037,8 +2091,15 @@ pub fn prepare_invocation(
         cwd_selection,
         &cwd,
     );
+    if let Some(profile)=resolved.acp().filter(|p|p.native_route_captured) {
+        let mut digest=Sha256::new();digest.update(b"orch-captured-native-route-v1\0");
+        update_bytes(&mut digest, request_digest.as_bytes());
+        update_bytes(&mut digest, &serde_json::to_vec(&profile.native_route)?);
+        request_digest=hex::encode(digest.finalize());
+    }
 
     Ok(PreparedInvocation {
+        acp: resolved.acp().cloned(),
         alias: request.alias,
         driver: resolved.driver(),
         executable: resolved.executable().to_path_buf(),
@@ -2053,7 +2114,7 @@ pub fn prepare_invocation(
         config_source: snapshot.source_path().to_path_buf(),
         request_digest,
         requested,
-        effective: tuple,
+        effective,
         limits: resolved.limits().clone(),
         driver_contract,
         executable_identity,

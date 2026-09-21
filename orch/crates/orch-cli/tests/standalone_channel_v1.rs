@@ -17,7 +17,9 @@ impl Fixture {
         fs::write(root.join(".gitignore"), ".orch/harnesses.yaml\ncoordination/\n.cowork-temp/\n").unwrap();
         fs::write(root.join("question.md"), "Read only. Return the fixture answer.\n").unwrap();
         let executable = root.join(driver);
-        fs::write(&executable, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
+        // The fixture needs a stable shell owner, not Darwin's intermediate /bin/sh selector.
+        let interpreter = if cfg!(target_os = "macos") { "/bin/bash" } else { "/bin/sh" };
+        fs::write(&executable, format!("#!{interpreter}\nset -eu\n{body}\n")).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(root.join(".orch/harnesses.yaml"), format!(
             "version: 1\nharnesses:\n  mock:\n    driver: {driver}\n    executable: {}\n    enabled: true\n    cwdPolicy: project-root\n", executable.display())).unwrap();
@@ -31,6 +33,17 @@ impl Fixture {
     fn command(&self, args: &[&str]) -> std::process::Output {
         let mut command = fixture_orch_command();
         command.arg("--root").arg(&self.root).args(args).output().unwrap()
+    }
+    fn supervisor_errors(&self) -> Vec<String> {
+        // Preserve only bounded code-owned errors, not control tokens or launch environments.
+        let Ok(entries) = fs::read_dir(self.root.join("coordination/runtime/supervisors")) else {
+            return vec!["no supervisor status directory".into()];
+        };
+        entries.flatten().filter(|entry| entry.file_name().to_string_lossy().ends_with(".status.json"))
+            .filter_map(|entry| fs::read(entry.path()).ok())
+            .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .filter_map(|value| value["error"].as_str().map(|error| error.chars().take(512).collect()))
+            .collect()
     }
     fn no_task_state(&self) {
         for path in ["coordination/PROJECT-BINDING.yaml", "coordination/runtime/CURRENT-ROUND",
@@ -60,8 +73,8 @@ impl Drop for Fixture {
                 }
             }
         }
-        if safe { let _ = fs::remove_dir_all(&self.root); }
-        else { eprintln!("preserved unclosed owned fixture {}", self.root.display()); }
+        if safe && !std::thread::panicking() { let _ = fs::remove_dir_all(&self.root); }
+        else { eprintln!("preserved failed or unclosed owned fixture {}", self.root.display()); }
     }
 }
 
@@ -112,7 +125,7 @@ fn default_refuses_broken_selfhost_markers_before_any_spawn_or_artifact() {
 fn managed_direct_identity_survives_config_change_and_exact_cancel() {
     let fixture = Fixture::new("opencode", "printf '%s\\n' '{\"type\":\"text\",\"part\":{\"text\":\"working\"}}'\n/bin/sleep 30");
     let output = fixture.command(&["wake", "mock", "--message", "owned fixture", "--deadline-secs", "20"]);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{}; supervisor errors: {:?}", String::from_utf8_lossy(&output.stderr), fixture.supervisor_errors());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let wake = stdout.split("wakeId=").nth(1).unwrap().split_whitespace().next().unwrap();
     let descriptor_path = fixture.root.join("coordination/runtime/supervisors").join(format!("{wake}.control.json"));

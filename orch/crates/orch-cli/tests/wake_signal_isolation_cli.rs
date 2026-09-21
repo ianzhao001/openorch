@@ -206,10 +206,10 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn provider_exec_script(paths: &FixturePaths) -> String {
+fn provider_exec_script(paths: &FixturePaths, interpreter: &str) -> String {
     let argv = paths.managed_argv(&std::env::current_exe().unwrap());
     format!(
-        "#!/bin/sh\nexec {provider}\n",
+        "#!{interpreter}\nexec {provider}\n",
         provider = argv
             .iter()
             .map(|argument| shell_quote(argument))
@@ -221,7 +221,7 @@ fn provider_exec_script(paths: &FixturePaths) -> String {
 fn write_proxy_fixture(root: &Path) -> (PathBuf, FixturePaths) {
     let paths = fixture_paths(root);
     let wrapper = root.join("coordination/scripts/wake-multica.sh");
-    write_executable(&wrapper, &provider_exec_script(&paths));
+    write_executable(&wrapper, &provider_exec_script(&paths, "/bin/sh"));
     let configured = root.join("bin/smartclaw");
     write_executable(&configured, "#!/bin/sh\nexit 99\n");
     (configured, paths)
@@ -233,7 +233,10 @@ fn write_managed_fixture(root: &Path) -> (PathBuf, FixturePaths) {
     // The shim immediately execs the compiled helper. The stable provider is
     // therefore one PID/PGID with no polling shell children, while the config
     // still names the absolute executable selected by the OpenCode driver.
-    write_executable(&executable, &provider_exec_script(&paths));
+    // Bypass only Darwin's measured /bin/sh selector stage in the owned direct shim.
+    // Production admission remains bounded and still requires exact exec identity.
+    let interpreter = if cfg!(target_os = "macos") { "/bin/bash" } else { "/bin/sh" };
+    write_executable(&executable, &provider_exec_script(&paths, interpreter));
     (executable, paths)
 }
 
@@ -366,7 +369,7 @@ fn managed_fixture_uses_one_compiled_provider_without_shell_children() {
     let root = temp_root("managed-shape");
     let (program, paths) = write_managed_fixture(&root);
     let shim = fs::read_to_string(&program).unwrap();
-    assert!(shim.starts_with("#!/bin/sh\nexec "));
+    assert!(shim.starts_with(if cfg!(target_os = "macos") { "#!/bin/bash\nexec " } else { "#!/bin/sh\nexec " }));
     assert!(shim.contains(MANAGED_FIXTURE_TEST));
     assert!(!shim.contains("/bin/sleep"));
     assert!(!shim.contains("while "));

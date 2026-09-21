@@ -6,63 +6,16 @@ This file records the public OpenOrch release line. Internal selfhost rounds, ta
 
 ## 中文
 
-### [v0.1.0-alpha.10](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.10) — 2026-09-20
+### 未发布 · 0.1.0-alpha.11 本地候选
 
-- 新增本机 Native Discovery 与 WebUI 显式、有限的 Fusion；固定问题、HEAD、角色和原生配置快照。
-- 详情读取不再被后台轮询打断，提供独立取消与 12 秒浏览器超时。
-- 保守展示历史证据不完整与未知终态；OpenCode 只读就绪检查及同通道启动间隔保护。
-- 保留 alpha.9 的 DSH 包清单修复，统一公开文档、支持范围和插件版本；默认核心仍为六叶命令。
+- 新增独立 MCP 四工具服务和共用 ACP 客户端；CLI/Web 共用咨询生命周期及答卷验证
+- 个人配置、默认成员和项目初始化迁入 Rust，移除 Python 配置解释与临时验证克隆
+- 显式工作树登记限定 MCP 可访问项目；配置更新保留可验证快照与原子交换得到的实际旧文件
+- 完整包包含 CLI、MCP、ACP 三个程序和四个兼容脚本，保留旧项目配置与 DSH 技能入口
+- 本次不发布远端；Codex ACP 的指定 DeepSeek Flash/max 仍明确拒绝，不降档或声称已认证
 
-### [v0.1.0-alpha.9](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.9) — 2026-09-16
-
-- 将 AGENTS.md 纳入 DSH 包清单，使原生安装可以物化并核验完整插件；产品核心与 alpha.8 相同。
-
-
-### [v0.1.0-alpha.8](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.8) — 2026-09-16
-
-本版在 r89 的只读终端观察面板基础上，新增本机 loopback-only WebUI；默认 CLI、手动 selfhost 和插件调用边界保持不变。
-
-- 新增独立 `orch-web` 前台服务与内嵌 WebUI，只绑定 `127.0.0.1`，不增加默认 `orch` 命令、不控制 provider 或修改项目
-- 以启动 capability、严格同源/Origin/Host 校验、无 CORS、CSP/no-store/nosniff/no-referrer 和无任意文件接口保护本机观察 API
-- 支持任务、全部调用和成员三视图；关联任务与未关联调用分区显示，共享 30 卡窗口，窗口内异常优先且可按 30 加载更多
-- 双主题、双语、宽中窄布局、键盘可达性、减少动态效果、刷新与详情过期保护；失败读取保留旧快照并诚实显示错误
-- 页面不加载 CDN、远程字体或答卷图片；不可信 Markdown 经受限语义重建，外链仅保留绝对 HTTP/HTTPS 且附安全关系
-- `orch-web` 与既有 `orch-tui` 都仅从源码构建；预编译插件包仍为默认 6 叶 runtime 与四个 wrapper
-
-仅验证 Apple Silicon macOS。核心为 ad-hoc 签名，非 Developer ID、未 notarize；公开快照不包含 r90 账本、审查现场、运行配置、历史 fixture 或模型转写。
-
-### [v0.1.0-alpha.7](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.7) — 2026-09-14
-
-本版发布 r89 的只读观测产品增量，继续保持默认 CLI、手动 selfhost 和插件宿主边界。
-
-- 新增独立 `orch-tui` 前台观察面板：只读刷新 invocation 事实，不启动、取消、收取、reconcile 或 GC
-- 增加 invocation observation 捕获、文件大小上限与默认安全状态，保留旧快照并将失败显式标为未知
-- TUI 支持调用/通道/任务导航、详情、项目切换、手动刷新和安全复制；不把观察结果消费成 planner 答卷
-- PTY、宽字符、kernel 状态、clipboard 子进程和凭据格式均采用保守失败边界；非 TTY 与无效参数不会伪装成功
-- DSH、Pi、ZCode 作为 Consult 目标与宿主能力分开记录；AGY 仍不是 Consult 目标
-- 预编译包仍只提供默认 6 叶 `orch` 与四个 wrapper；`orch-ui`/`orch-tui` 仅从源码构建
-
-本版仅验证 Apple Silicon macOS。二进制为 ad-hoc 签名，非 Developer ID、未 notarize；公开快照
-不携带 r89 账本、私有审查现场、历史 fixture、模型转写或本机配置。
-
-### [v0.1.0-alpha.6](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.6) — 2026-09-13
-
-本版继续完善全通道的原生 Consult/执行安全边界，并修复 r88 暴露的通道、回收和固定 source gate 问题。
-
-- DSH envelope 原生 model/settings 快照、Pi/ZCode/DSH 项目历史和 native terminal 事实继续纳入 action 绑定
-- 新增 DSH session uniqueness、native monitor reclaim、等价 generation 回收和固定 source ref gate 保护
-- 增加 Claude auto permission mode 的显式渲染与 native-project-history 保留
-- 强化 quarantine、reclaim、hook、verify/collect gate 的恢复路径，避免 foreign PID、旧 source 或错误回执越过边界
-- 默认6/selfhost30、插件安装边界与无后台自动编排约束保持不变；AGY 仍不是 Consult 目标
-
-### [v0.1.0-alpha.5](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.5) — 2026-09-12
-
-本版将更多原生通道接入 Consult，并把原生设置与调用项目历史绑定纳入真实验证。
-
-- DSH、Pi、ZCode 进入 Consult 目标；每次 action 保留 provider/model/effort 与原生终态事实
-- DSH Consult 支持原生设置快照和完整项目历史定位，Pi/ZCode 支持原生终答与项目历史分离
-- 强化 action discovery、账号环境边界、Pi legacy envelope、凭据漂移与失败/未知终态的保留语义
-- 增加 review quarantine 与 pending-receipt 类型化恢复，避免错误或晚到答卷越过裁决边界
+- Release 与公开源码快照现在都包含 `plugins/openorch/AGENTS.md` 的受版本控制协作规则副本
+- Codex 宿主优先使用原生多代理机制处理本地拆分、并行与等待；OpenOrch 保持显式跨客户端咨询与 fusion 边界，不新增调度器
 
 ### [v0.1.0-alpha.4](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.4) — 2026-09-10
 
@@ -78,7 +31,7 @@ OpenOrch 现在提供 Codex Desktop 与 DSH Web 共用的插件包。核心版�
 - 显式产品源导出和公开输入/制品对照，继续排除私有历史、配置、账本与转写
 
 本版仅验证 Apple Silicon macOS。Codex/DSH 宿主不代表所有同名通道均支持 Consult：
-当前 AGY 仍不是受支持的 Consult 目标。执行/审查能力、默认6/selfhost30
+当前 DSH、Pi、AGY、ZCode 仍不是受支持的 Consult 目标。执行/审查能力、默认6/selfhost30
 命令边界及现有 UI 保持；不新增后台自动编排。二进制为 ad-hoc 签名，非 Developer ID，
 不宣称不存在的 attestation 或可复现构建。
 
@@ -127,65 +80,15 @@ OpenOrch 现在提供 Codex Desktop 与 DSH Web 共用的插件包。核心版�
 
 ## English
 
-### [v0.1.0-alpha.10](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.10) — 2026-09-20
+### Unreleased · 0.1.0-alpha.11 local candidate
 
-- Add local Native Discovery and explicit finite Web Fusion with fixed questions, HEAD, roles and native settings.
-- Keep detail reads independent of polling, with cancellation and a 12-second browser timeout.
-- Preserve historical-unverified/unknown terminal diagnostics; check OpenCode readiness and space same-driver launches.
-- Retain the alpha.9 DSH package fix and align public documentation, capabilities and plugin versions. The core still exposes six default leaf commands.
+- Four-tool MCP stdio, one shared ACP client and unified CLI/Web consultation evidence
+- Rust personal setup/default semantics, explicit project registration and recoverable profile replacement
+- Complete CLI/MCP/ACP runtime inventory; Python remains an integrity/compatibility launcher
+- No remote publication or DSH MCP claim; unsupported Codex Flash/max is refused before Prompt
 
-### [v0.1.0-alpha.9](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.9) — 2026-09-16
-
-- Include AGENTS.md in the DSH package inventory so native installation can materialize and verify the complete plugin. Core behavior matches alpha.8.
-
-
-### [v0.1.0-alpha.8](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.8) — 2026-09-16
-
-This release adds a local loopback-only WebUI alongside r89's read-only terminal observation panel. Default CLI, manual selfhost, and native-plugin boundaries remain unchanged.
-
-- Adds the independent `orch-web` foreground service and embedded WebUI, bound only to `127.0.0.1`; it adds no default `orch` command, provider control, or project writes
-- Protects local observation APIs with a startup capability, exact same-origin/Origin/Host checks, no CORS, CSP/no-store/nosniff/no-referrer headers, and no arbitrary-file endpoint
-- Adds Tasks, All calls, and Members views with separate associated/unassociated sections, a shared 30-card window, in-window failure/invalid priority, and load-more by 30
-- Adds bilingual themes, responsive layouts, keyboard access, reduced motion, refresh/detail staleness protection, and honest retained snapshots after failed reads
-- Loads no CDN, remote font, or answer image; untrusted Markdown is reconstructed from a restricted semantic set and links are limited to absolute HTTP/HTTPS with safe relations
-- `orch-web` and `orch-tui` are source-built only; the prebuilt plugin bundle remains the default six-leaf runtime plus four wrappers
-
-Only Apple Silicon macOS is validated. The core is ad-hoc signed, not Developer ID signed or notarized. The public snapshot excludes r90 ledgers, review sites, runtime configuration, historical fixtures, and model transcripts.
-
-### [v0.1.0-alpha.7](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.7) — 2026-09-14
-
-This release publishes the r89 read-only observation increment while keeping the
-default CLI, manual selfhost, and native plugin-host boundaries unchanged.
-
-- Adds the independent `orch-tui` foreground observation panel: it refreshes invocation facts only and never starts, cancels, collects, reconciles, or GCs work
-- Adds bounded invocation-observation capture and conservative defaults; failed reads retain the old snapshot and surface an explicit unknown state
-- TUI navigation covers invocation/channel/task views, details, project switching, refresh, and safe copy without consuming planner answers
-- PTY, Unicode width, kernel state, clipboard children, and credential-format handling fail closed; non-TTY and invalid arguments never look successful
-- DSH, Pi, and ZCode are documented as Consult targets separately from the DSH plugin host; AGY remains unsupported for Consult
-- The prebuilt bundle still contains only the default six-leaf `orch` and four wrappers; `orch-ui`/`orch-tui` are source-built only
-
-Only Apple Silicon macOS is validated. The binary is ad-hoc signed, not Developer ID
-signed, and not notarized. The public snapshot excludes r89 ledgers, private review
-sites, historical fixtures, model transcripts, and machine configuration.
-
-### [v0.1.0-alpha.6](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.6) — 2026-09-13
-
-This release continues the native Consult/execute safety work and fixes the channel, reclaim, and fixed-source gate gaps found in r88.
-
-- Binds DSH envelope settings, Pi/ZCode/DSH project history, and native terminal facts to each action
-- Adds DSH session uniqueness, native monitor reclamation, equivalent-generation reclaim, and fixed source-ref gate protection
-- Adds explicit Claude auto-permission rendering while preserving native project history
-- Hardens quarantine, reclaim, hook, verify, and collect recovery paths against foreign PIDs, stale sources, and invalid receipts
-- Retains default6/selfhost30, plugin installation boundaries, and no background automatic orchestration; AGY remains unsupported for Consult
-
-### [v0.1.0-alpha.5](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.5) — 2026-09-12
-
-This release expanded native Consult coverage and bound native settings and original-project history to actual invocation evidence.
-
-- DSH, Pi, and ZCode became Consult targets with provider/model/effort and native-terminal facts preserved per action
-- DSH Consult used pinned native settings and full calling-project history; Pi/ZCode retained native final answers and project-history separation
-- Hardened action discovery, account-environment boundaries, the Pi legacy envelope, credential-drift handling, and failed/unknown terminal preservation
-- Added review quarantine and typed pending-receipt recovery so bad or late answers cannot cross verdict boundaries
+- Release bundles and public source snapshots now include the versioned collaboration policy at `plugins/openorch/AGENTS.md`
+- Codex hosts use native multi-agent delegation, parallelism, and waits for local work; OpenOrch remains an explicit cross-harness consultation/fusion layer and adds no scheduler
 
 ### [v0.1.0-alpha.4](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.4) — 2026-09-10
 
@@ -200,7 +103,7 @@ OpenOrch now ships one plugin for Codex Desktop and DSH Web. The core still repo
 - Correct handling of duplicate error-only SmartClaw tool receipts without promoting a late answer past a hard deadline
 - Explicit product-source export and source/artifact comparisons, excluding private history, configuration, ledgers and transcripts
 
-Only Apple Silicon macOS is validated. AGY remains an unsupported Consult target even though
+Only Apple Silicon macOS is validated. DSH, Pi, AGY and ZCode remain unsupported Consult targets even though
 DSH Web is a supported plugin host. Execution/review capabilities, default6/selfhost30 and retained UI boundaries
 are unchanged; no automatic orchestration is added. The binary is ad-hoc signed, not Developer ID signed;
 no unavailable attestation or reproducible-build guarantee is claimed.

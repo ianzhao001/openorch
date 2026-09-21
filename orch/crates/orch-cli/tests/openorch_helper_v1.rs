@@ -1,3 +1,16 @@
+//! Actual Rust CLI compatibility entry; Python packaging is only a verified launcher.
+use std::process::Command;
+#[test]
+fn rust_helper_namespace_is_hidden_but_available() {
+    let binary=env!("CARGO_BIN_EXE_orch");
+    let public=Command::new(binary).arg("--help").output().unwrap();
+    assert!(public.status.success());assert!(!String::from_utf8_lossy(&public.stdout).contains("__openorch"));
+    let internal=Command::new(binary).args(["__openorch","--help"]).output().unwrap();
+    assert!(internal.status.success(),"{}",String::from_utf8_lossy(&internal.stderr));
+    let help=String::from_utf8(internal.stdout).unwrap();for action in ["configure","attach","discover","doctor","run"] {assert!(help.contains(action));}
+}
+
+mod legacy_compatibility {
 //! B336 behavioral contract. Keep source bytes unchanged until TaskRecorded.
 //! Negative mutations: overwrite existing config; drop explicit members; invoke
 //! a shell for question text; accept an unsupported default; follow a config
@@ -9,6 +22,7 @@ use std::process::Command;
 fn run_contract(case: &str) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let output = Command::new("python3")
+        .env("OPENORCH_TEST_CORE", env!("CARGO_BIN_EXE_orch"))
         .arg("-c")
         .arg(python_contract())
         .arg(root.canonicalize().unwrap())
@@ -38,49 +52,16 @@ CASE=sys.argv[2]
 PARENT=SOURCE/'orch/target/test-tmp'
 PARENT.mkdir(parents=True,exist_ok=True)
 
-FAKE_CORE=r'''import json,os,subprocess,sys
-from pathlib import Path
+# Packaging facade only: the all-feature test binary may expose selfhost leaves.
+# Every semantic operation executes the real Cargo-built Rust CLI unchanged.
+TEST_CORE_FACADE=r'''import os,sys
 args=sys.argv[1:]
-package=Path(__file__).resolve().parents[1]
-root=Path(args[args.index('--root')+1]) if '--root' in args else Path.cwd()
-tail=args[:]
-if '--root' in tail:
-    i=tail.index('--root'); del tail[i:i+2]
-record={'args':args,'cwd':os.getcwd()}
-if tail and tail[0]=='consult':
-    record['questionPath']=tail[1]
-    record['question']=Path(tail[1]).read_text()
-with (package/'calls.jsonl').open('a') as log:log.write(json.dumps(record)+'\n')
-if tail==['guide','--check']:
-    print('orch guide: OK · commands=6 sections=10 invariants=4 wakeActions=4 dispositions=4');sys.exit(0)
-if tail==['--version']:
-    print('orch 0.1.0');sys.exit(0)
-if tail and tail[0]=='consult':
-    print('orch consult · id=01R86FIXTURE000000000000000 fusion=2/2')
-    print('summary='+str(root/'coordination/consultations/01R86FIXTURE000000000000000/summary.md'));sys.exit(0)
-common=subprocess.check_output(['git','rev-parse','--git-common-dir'],cwd=root,text=True).strip()
-common=Path(common) if Path(common).is_absolute() else root/common
-config=common.resolve().parent/'.orch/harnesses.yaml'
-try:
-    obj=json.loads(config.read_text())
-    assert type(obj.get('version')) is int and obj['version']==1
-    assert set(obj)=={'version','harnesses'}
-    for name,row in obj['harnesses'].items():
-        assert set(row)<= {'driver','executable','enabled','cwdPolicy','defaults','execute','review','consult'}
-        assert Path(row['executable']).is_absolute() and Path(row['executable']).is_file()
-except Exception as error:
-    print('invalid native configuration: '+str(error),file=sys.stderr);sys.exit(2)
-if tail==['harness','lint']:
-    print('orch harness lint · ok');sys.exit(0)
-if tail[:2]==['harness','list']:
-    print('alias\tdriver\tstatus\treason')
-    for name,row in obj['harnesses'].items():
-        supported=row['driver'] in ('codex','opencode','smartclaw','claude','cursor','mimo','codebuddy')
-        print(name+'\t'+row['driver']+'\t'+('supported' if supported else 'unsupported')+'\t'+('—' if supported else 'driver does not support consult'))
-    sys.exit(0)
-if tail==['doctor']:
-    print('orch doctor: standalone configuration checked');sys.exit(0)
-print('unexpected core arguments',args,file=sys.stderr);sys.exit(2)
+if args==['guide','--check']:
+    print('orch guide: OK · commands=6');raise SystemExit(0)
+if args==['--version']:
+    print('orch 0.1.0');raise SystemExit(0)
+core=os.environ['OPENORCH_TEST_CORE']
+os.execv(core,[core,*args])
 '''
 
 def command(args,cwd=None,ok=True,env=None):
@@ -101,19 +82,28 @@ with tempfile.TemporaryDirectory(prefix='b336-',dir=PARENT) as temporary:
     (package/'scripts').mkdir(parents=True)
     helper=package/'scripts/openorch.py'
     shutil.copyfile(SOURCE/'plugins/openorch/scripts/openorch.py',helper)
+    shutil.copyfile(SOURCE/'plugins/openorch/scripts/install.py',package/'scripts/install.py')
     runtime=package/'runtime';runtime.mkdir()
-    core=runtime/'orch';core.write_text('#!'+sys.executable+'\n'+FAKE_CORE);core.chmod(0o755)
+    core=runtime/'orch';core.write_text('#!'+sys.executable+'\n'+TEST_CORE_FACADE);core.chmod(0o755)
     inventory={}
-    assets=['orch','scripts/wake-multica.sh','scripts/wake-dsh-stream.sh','scripts/wake-pi-stream.sh','scripts/wake-zcode-stream.sh']
+    assets=['orch','orch-mcp','orch-acp','scripts/wake-multica.sh','scripts/wake-dsh-stream.sh','scripts/wake-pi-stream.sh','scripts/wake-zcode-stream.sh']
     for name in assets:
         path=runtime/name
-        if name!='orch':path.parent.mkdir(exist_ok=True);path.write_text('#!/bin/sh\nexit 0\n');path.chmod(0o755)
+        if name!='orch':
+            path.parent.mkdir(exist_ok=True);path.write_text('#!/bin/sh\necho \"'+name+' 0.1.0\"\n');path.chmod(0o755)
         data=path.read_bytes();inventory[name]={'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data)}
     (runtime/'manifest.json').write_text(json.dumps({'version':1,'files':inventory}))
     config_dir=base/'个人 设置'
     a=project(base/'项目 甲')
     b=project(base/'项目 乙')
-    executable=base/'native tool';executable.write_text('#!/bin/sh\nexit 0\n');executable.chmod(0o755)
+    executable=base/'native tool'
+    executable.write_text('#!'+sys.executable+'\n'+r'''import sys,json
+if 'exec' in sys.argv:
+    frames=[{'type':'thread.started','thread_id':'fixture'},{'type':'item.completed','item':{'type':'agent_message','text':'verified fixture answer'}},{'type':'turn.completed','usage':{'input_tokens':1,'output_tokens':1}}]
+else:
+    frames=[{'type':'step_start','sessionID':'fixture','part':{'type':'step-start','modelID':'fixture-model'}},{'type':'text','part':{'text':'verified fixture answer'}},{'type':'step_finish','part':{'type':'step-finish','reason':'stop'}}]
+for frame in frames:print(json.dumps(frame),flush=True)
+''');executable.chmod(0o755)
     rows={name:{'driver':driver,'executable':str(executable),'enabled':True,'cwdPolicy':'project-root'} for name,driver in [('alpha','codex'),('beta','opencode')]}
     profile={'version':1,'harnesses':rows,'defaults':{'single':'alpha','fusion':['alpha','beta']}}
     input_file=base/'选择.json';input_file.write_text(json.dumps(profile))
@@ -158,26 +148,28 @@ with tempfile.TemporaryDirectory(prefix='b336-',dir=PARENT) as temporary:
         marker=base/'must-not-exist'
         text='请保留字面值 $(touch '+str(marker)+'); "quoted" & `not-a-command`\n第二行'
         question.write_text(text)
-        helper_call('run','--project',a,'--mode','single','--question-file',question)
-        helper_call('run','--project',a,'--mode','fusion','--question-file',question)
-        helper_call('run','--project',a,'--mode','single','--harness','beta','--question-file',question)
-        calls=[json.loads(x) for x in (package/'calls.jsonl').read_text().splitlines()]
-        calls=[x for x in calls if 'consult' in x['args']]
-        assert len(calls)==3,calls
-        def members(call):return [call['args'][i+1] for i,v in enumerate(call['args']) if v=='--harness']
-        assert [members(x) for x in calls]==[['alpha'],['alpha','beta'],['beta']]
-        for call in calls:
-            assert call['args'][call['args'].index('--root')+1]==str(a)
-            assert call['cwd']==str(a)
-            assert call['question']==text
-            assert Path(call['questionPath']).is_relative_to(a)
+        outputs=[helper_call('run','--project',a,'--mode','single','--question-file',question),
+                 helper_call('run','--project',a,'--mode','fusion','--question-file',question),
+                 helper_call('run','--project',a,'--mode','single','--harness','beta','--question-file',question)]
+        import re
+        ids=[re.search(r'id=([A-Z0-9]+)',x.stdout).group(1) for x in outputs]
+        calls=[json.loads((a/'.orch/fusion-runs'/identity/'request.json').read_text()) for identity in ids]
+        assert [x['legacy']['aliases'] for x in calls]==[['alpha'],['alpha','beta'],['beta']]
+        for identity,call in zip(ids,calls):
+            assert call['project']==str(a)
+            assert call['request']['question']==text
+            assert Path(call['legacy']['questionSource']).is_relative_to(a)
+            state=json.loads((a/'.orch/fusion-runs'/identity/'state.json').read_text())
+            assert state['phase']=='completed',state
+            assert all(member['status']=='verified' for member in state['members'])
+            assert (a/'coordination/consultations'/identity/'summary.md').is_file()
         assert not marker.exists()
         assert json.loads(saved.read_text())['defaults']==profile['defaults']
 
     elif CASE=='reject':
         before=saved.read_bytes()
         bad=json.loads(input_file.read_text())
-        bad['harnesses']['blocked']={'driver':'dsh','executable':str(executable),'enabled':True,'cwdPolicy':'project-root'}
+        bad['harnesses']['blocked']={'driver':'agy','executable':str(executable),'enabled':True,'cwdPolicy':'project-root'}
         bad['defaults']['fusion']=['alpha','blocked'];input_file.write_text(json.dumps(bad))
         assert helper_call('configure','--project',a,'--input',input_file,'--replace-profile',ok=False).returncode!=0
         assert saved.read_bytes()==before
@@ -195,10 +187,46 @@ with tempfile.TemporaryDirectory(prefix='b336-',dir=PARENT) as temporary:
         original_dir.unlink();backup_dir.rename(original_dir)
         question=base/'q.txt';question.write_text('read only')
         assert helper_call('run','--project',a,'--mode','fusion','--harness','alpha','--harness','alpha','--question-file',question,ok=False).returncode!=0
+        for protocol in ['orch-mcp','orch-acp']:
+            path=runtime/protocol;original=path.read_bytes();path.write_bytes(original+b'\n# changed bytes, unchanged version output\n')
+            assert helper_call('run','--project',a,'--mode','single','--question-file',question,ok=False).returncode!=0
+            path.write_bytes(original)
         wrapper=runtime/'scripts/wake-dsh-stream.sh';wrapper.write_text('tampered')
         assert helper_call('run','--project',a,'--mode','single','--question-file',question,ok=False).returncode!=0
         assert saved.read_bytes()==before
     else:raise AssertionError(CASE)
 print('contract passed',CASE)
 "####
+}
+
+}
+
+#[test]
+fn python_helper_has_no_profile_interpreter_or_validation_clone() {
+    let source=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../plugins/openorch/scripts/openorch.py");
+    let text=std::fs::read_to_string(source).unwrap();
+    for retired in ["def profile_shape(","def validate_in_clone(","def configure(","def attach(","def run_invocation("] {assert!(!text.contains(retired),"duplicate helper semantics: {retired}");}
+    assert!(text.contains("__openorch"));
+}
+
+#[cfg(not(feature="selfhost"))]
+#[test]
+fn default_helper_cannot_bypass_selfhost_markers_from_a_nested_directory() {
+    let root=orch_host::util::test_scratch_dir("default helper gate");
+    for args in [vec!["init","-q"],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","core.hooksPath=/dev/null","-c","commit.gpgSign=false","commit","--allow-empty","-qm","base"]] {
+        assert!(Command::new("git").args(args).current_dir(&root).status().unwrap().success());
+    }
+    std::fs::create_dir(root.join("coordination")).unwrap();std::fs::write(root.join("coordination/PROJECT-BINDING.yaml"),"malformed: [").unwrap();
+    let nested=root.join("nested");std::fs::create_dir(&nested).unwrap();let personal=root.join("personal");
+    let output=Command::new(env!("CARGO_BIN_EXE_orch")).arg("--root").arg(nested).args(["__openorch","--config-dir"]).arg(&personal).arg("attach").output().unwrap();
+    assert_eq!(output.status.code(),Some(2));assert!(String::from_utf8_lossy(&output.stderr).contains("project contains selfhost state"));assert!(!personal.exists());
+}
+#[test]
+fn helper_rejects_relative_personal_directory_before_discovery() {
+    let root=orch_host::util::test_scratch_dir("helper relative config");
+    for args in [vec!["init","-q"],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","core.hooksPath=/dev/null","-c","commit.gpgSign=false","commit","--allow-empty","-qm","base"]] {
+        assert!(Command::new("git").args(args).current_dir(&root).status().unwrap().success());
+    }
+    let output=Command::new(env!("CARGO_BIN_EXE_orch")).arg("--root").arg(&root).args(["__openorch","--config-dir","relative","discover"]).output().unwrap();
+    assert_eq!(output.status.code(),Some(2));assert!(String::from_utf8_lossy(&output.stderr).contains("absolute_normalized_path_required"));assert!(!root.join("relative").exists());
 }

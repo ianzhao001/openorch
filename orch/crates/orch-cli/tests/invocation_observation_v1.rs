@@ -155,9 +155,23 @@ fn live_writer_exit_leaves_only_last_observed_phase_without_fake_completion() {
 
 #[test]
 fn real_standalone_projection_retains_identity_and_never_exposes_control_tokens() {
-    let fixture=Fixture::new();let exe=fixture.root.join("mock");fs::write(&exe,"#!/bin/sh\nprintf '%s\\n' '{\"type\":\"text\",\"part\":{\"text\":\"owned\"}}'\n/bin/sleep 0.2\n").unwrap();fs::set_permissions(&exe,fs::Permissions::from_mode(0o755)).unwrap();
+    let fixture=Fixture::new();let exe=fixture.root.join("mock");
+    // Projection/secret isolation needs a live handshake, not an arbitrary sleep.
+    // Release after wake returns; the fallback stays below its10s provider limit.
+    let interpreter=if cfg!(target_os="macos") {"/bin/bash"} else {"/bin/sh"};
+    let body=r#"printf '%s\n' '{"type":"text","part":{"text":"owned"}}'
+n=0
+while [ ! -f .orch/projection-release ] && [ "$n" -lt 160 ]; do
+  n=$((n+1))
+  /bin/sleep 0.05
+done
+"#;
+    fs::write(&exe,format!("#!{interpreter}\n{body}")).unwrap();
+    fs::set_permissions(&exe,fs::Permissions::from_mode(0o755)).unwrap();
     fs::write(fixture.root.join(".orch/harnesses.yaml"),format!("version: 1\nharnesses:\n  mock:\n    driver: opencode\n    executable: {}\n    enabled: true\n    defaults: {{provider: local, model: native-initial, effort: high}}\n    cwdPolicy: project-root\n",exe.display())).unwrap();
-    let out=fixture.command(&["wake","mock","--message-file","question-B777.md","--deadline-secs","10"]).output().unwrap();assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let out=fixture.command(&["wake","mock","--message-file","question-B777.md","--deadline-secs","10"]).output().unwrap();
+    fs::write(fixture.root.join(".orch/projection-release"),b"release").unwrap();
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
     let text=String::from_utf8(out.stdout).unwrap();let wake=text.split("wakeId=").nth(1).unwrap().split_whitespace().next().unwrap();
     let path=fixture.root.join("coordination/runtime/supervisors").join(format!("{wake}.control.json"));let bytes=fs::read(&path).unwrap();let value:serde_json::Value=serde_json::from_slice(&bytes).unwrap();let token=value["token"].as_str().unwrap();let status=value["statusPath"].as_str().unwrap();let supervisor=value["supervisorPid"].as_u64().unwrap() as i32;
     assert!(wait_until(||fs::read(status).ok().and_then(|b|serde_json::from_slice::<serde_json::Value>(&b).ok()).is_some_and(|s|s["managedScopeTerminated"]==true)));

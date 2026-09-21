@@ -1,0 +1,18 @@
+[package]
+name = "orch-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "Local MCP stdio adapter for the shared OpenOrch consultation core"
+
+[dependencies]
+orch-host = { path = "../orch-host", default-features = false }
+orch-core = { path = "../orch-core", features = ["protocol-io"] }
+rmcp = { version = "=3.4.0", default-features = false, features = ["server", "transport-io"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "io-std", "io-util", "signal", "sync", "time", "macros"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"

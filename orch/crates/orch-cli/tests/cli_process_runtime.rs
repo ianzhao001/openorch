@@ -850,14 +850,33 @@ mod wake_supervisor_cli_tests {
     }
 
     fn write_new_mode_0600(path: &std::path::Path, bytes: &[u8]) {
+        write_new_mode_0600_observe(path,bytes,||{});
+    }
+
+    fn write_new_mode_0600_observe(path: &std::path::Path, bytes: &[u8], after_create: impl FnOnce()) {
+        let temporary=path.with_extension(format!("pending-{}",std::process::id()));
         let mut file = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .mode(0o600)
-            .open(path)
+            .open(&temporary)
             .unwrap();
+        after_create();
         file.write_all(bytes).unwrap();
         file.sync_all().unwrap();
+        drop(file);
+        let publication=fs::hard_link(&temporary,path);
+        fs::remove_file(&temporary).unwrap();
+        publication.unwrap();
+    }
+
+    #[test]
+    fn ready_marker_is_visible_only_after_complete_private_bytes() {
+        let root=orch_host::util::test_scratch_dir("atomic ready marker");let path=root.join("identity.json");
+        write_new_mode_0600_observe(&path,b"{\"pid\":123}",||assert!(!path.exists(),"ready name exposed before content"));
+        assert_eq!(fs::read(&path).unwrap(),b"{\"pid\":123}");
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode()&0o777,0o600);
+        let second=std::panic::catch_unwind(||write_new_mode_0600(&path,b"other"));assert!(second.is_err());assert_eq!(fs::read(&path).unwrap(),b"{\"pid\":123}");
     }
 
     fn detached_marker_path(ready: &std::path::Path, prefix: &str) -> PathBuf {

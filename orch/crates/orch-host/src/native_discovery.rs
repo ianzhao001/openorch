@@ -56,9 +56,35 @@ pub struct NativeModel {
     /// Explicit native default for this model, when provided.
     pub default_effort: Option<String>,
 }
+/// Nonsecret native routing data, captured with the same configuration read as models.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NativeProviderRoute {
+    /// Native provider identity; for Claude this is identified from its endpoint.
+    pub provider: String,
+    /// Endpoint without credentials, query or fragment.
+    pub url: String,
+    /// Optional environment variable used by the native provider for credentials.
+    pub credential_env: Option<String>,
+}
+fn safe_provider_url(value: &str) -> Option<String> {
+    let value=value.trim().trim_end_matches('/');
+    ((value.starts_with("https://") || value.starts_with("http://")) && value.len()<=2048
+        && !value.contains(['@','?','#']) && !value.chars().any(char::is_control)).then(||value.to_string())
+}
+fn claude_provider_route(value: &Value) -> Option<NativeProviderRoute> {
+    let env=value.get("env")?;
+    if ["CLAUDE_CODE_USE_BEDROCK","CLAUDE_CODE_USE_VERTEX"].iter().any(|key|env.get(key).and_then(Value::as_str).is_some_and(|v|v=="1"||v=="true")) {return None;}
+    let url=safe_provider_url(env.get("ANTHROPIC_BASE_URL")?.as_str()?)?;
+    let authority=url.split_once("://")?.1.split('/').next()?;
+    let provider=match authority {"api.deepseek.com"|"api.deepseek.com:443"=>"deepseek","api.anthropic.com"|"api.anthropic.com:443"=>"anthropic",_=>return None};
+    Some(NativeProviderRoute { provider:provider.into(),url,credential_env:None })
+}
 /// A safe projection of one client's current settings and available catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NativeConfiguration {
+    /// Captured private routing metadata; never exposed by ordinary discovery serialization.
+    #[serde(skip)]
+    pub provider_route: Option<NativeProviderRoute>,
     /// Configured model-selection values; None means not exposed/configured.
     pub current: InvocationTuple,
     /// Native candidates, not a hardcoded product model list.
@@ -71,6 +97,7 @@ pub struct NativeConfiguration {
 impl Default for NativeConfiguration {
     fn default() -> Self {
         Self {
+            provider_route: None,
             current: InvocationTuple::default(),
             models: Vec::new(),
             status: "unknown".into(),
@@ -91,6 +118,8 @@ pub struct NativeSource {
 /// A selectable installed client or an existing project alias.
 #[derive(Debug, Clone, Serialize)]
 pub struct NativeHarness {
+    /// Selected consultation backend, distinct from native model/account qualification.
+    pub backend: String,
     /// Stable source identity: configured:alias or installed:driver.
     pub id: String,
     /// Code-owned driver name.
@@ -534,7 +563,13 @@ fn codex_toml(input: &str) -> Result<NativeConfiguration> {
     if values.contains_key("profile") {
         bail!("codex_explicit_profile_context_required");
     }
+    let provider_route=values.get("model_provider").and_then(|provider| {
+        let table=tables.get(&format!("model_providers.{provider}"))?;
+        let url=safe_provider_url(table.get("base_url")?)?;
+        Some(NativeProviderRoute { provider:provider.clone(),url,credential_env:table.get("env_key").cloned() })
+    });
     finish(NativeConfiguration {
+        provider_route,
         current: InvocationTuple {
             model: values.remove("model"),
             effort: values.remove("model_reasoning_effort"),
@@ -668,6 +703,7 @@ pub fn parse_native_config(driver: &str, input: &str) -> Result<NativeConfigurat
             }
         }
         "claude" => {
+            out.provider_route=claude_provider_route(&value);
             out.current.model = text(value.get("model"));
             let (value, unresolved) =
                 claude_effort(&[claude_layer(&value)], out.current.model.as_deref());
@@ -733,7 +769,7 @@ fn executable(path: &Path) -> bool {
 fn installed(context: &DiscoveryContext, driver: HarnessId) -> Option<PathBuf> {
     let names: Vec<&str> = match driver {
         HarnessId::Cursor => vec!["cursor-agent"],
-        HarnessId::SmartClaw => vec!["DewuSmartClaw"],
+        HarnessId::SmartClaw => vec!["DewuSmartClaw", "smartclaw"],
         HarnessId::Dclaw => vec![],
         other => vec![other.as_str()],
     };
@@ -744,6 +780,14 @@ fn installed(context: &DiscoveryContext, driver: HarnessId) -> Option<PathBuf> {
                 return Some(p);
             }
         }
+    }
+    for name in &names {
+        let path=context.home.join(".local/bin").join(name);
+        if executable(&path) {return Some(path);}
+    }
+    if driver==HarnessId::Codex && context.include_platform_locations {
+        let path=PathBuf::from("/Applications/Codex.app/Contents/Resources/codex");
+        if executable(&path) {return Some(path);}
     }
     let extra = match driver {
         HarnessId::Codex => Some(context.home.join(".local/bin/codex")),
@@ -760,6 +804,10 @@ fn installed(context: &DiscoveryContext, driver: HarnessId) -> Option<PathBuf> {
         _ => None,
     };
     extra.filter(|p| executable(p))
+}
+/// Shared executable-only discovery for setup; no native metadata command is run.
+pub(crate) fn installed_executables(context: &DiscoveryContext) -> Vec<(String,PathBuf)> {
+    HarnessId::ALL.iter().filter_map(|driver|installed(context,*driver).and_then(|path|fs::canonicalize(path).ok()).map(|path|(driver.as_str().to_string(),path))).collect()
 }
 fn files(context: &DiscoveryContext, driver: &str) -> Vec<PathBuf> {
     let h = &context.home;
@@ -1177,6 +1225,7 @@ fn project_native(
         }) {
             Ok((parsed, source)) => {
                 out.current = crate::fusion_roles::resolve_tuple(&out.current, &parsed.current);
+                out.provider_route=parsed.provider_route.or(out.provider_route);
                 out.models.extend(parsed.models);
                 out.diagnostics.extend(parsed.diagnostics);
                 sources.push(source);
@@ -1325,6 +1374,7 @@ fn project_native(
             .and_then(|m| m.default_effort.clone());
     }
     if config_error {
+        out.provider_route=None;
         out.current = InvocationTuple::default();
         out.status = "unavailable".into();
     } else if auth {
@@ -1338,6 +1388,14 @@ pub fn discover(project: &Path) -> Result<DiscoverySnapshot> {
 }
 /// Scan a captured environment; fake executables/configs can exercise the real IO path.
 pub fn discover_with_context(context: &DiscoveryContext) -> Result<DiscoverySnapshot> {
+    discover_captured(context, None)
+}
+/// Discover native metadata using the caller's already captured configuration.
+/// The project harness file is not read or parsed a second time.
+pub(crate) fn discover_with_config(context: &DiscoveryContext, snapshot: HarnessConfigSnapshot) -> Result<DiscoverySnapshot> {
+    discover_captured(context, Some(snapshot))
+}
+fn discover_captured(context: &DiscoveryContext, mut captured: Option<HarnessConfigSnapshot>) -> Result<DiscoverySnapshot> {
     let main = crate::fusion_roles::project_root(&context.project)?;
     let mut result = DiscoverySnapshot {
         observed_at: humantime::format_rfc3339_seconds(SystemTime::now()).to_string(),
@@ -1346,8 +1404,8 @@ pub fn discover_with_context(context: &DiscoveryContext) -> Result<DiscoverySnap
         configured_snapshot: None,
     };
     let config_path = main.join(".orch/harnesses.yaml");
-    if fs::symlink_metadata(&config_path).is_ok() {
-        let loaded = (|| -> Result<HarnessConfigSnapshot> {
+    if captured.is_some() || fs::symlink_metadata(&config_path).is_ok() {
+        let loaded = if let Some(snapshot) = captured.take() { Ok(snapshot) } else { (|| -> Result<HarnessConfigSnapshot> {
             if fs::symlink_metadata(main.join(".orch"))?
                 .file_type()
                 .is_symlink()
@@ -1367,7 +1425,7 @@ pub fn discover_with_context(context: &DiscoveryContext) -> Result<DiscoverySnap
                 &config_path,
                 std::str::from_utf8(&bytes).context("config_not_utf8")?,
             )
-        })();
+        })() };
         match loaded {
             Ok(snapshot) => {
                 for row in snapshot.discover_for_action(HarnessAction::Consult) {
@@ -1375,6 +1433,7 @@ pub fn discover_with_context(context: &DiscoveryContext) -> Result<DiscoverySnap
                         .inspect_configured(row.alias(), HarnessAction::Consult)
                         .ok();
                     result.harnesses.push(NativeHarness {
+                        backend: if resolved.as_ref().is_some_and(|r|r.acp().is_some()) {"acp"}else{"native"}.into(),
                         id: format!("configured:{}", row.alias()),
                         driver: row.driver().into(),
                         executable: resolved.as_ref().map(|r| r.executable().to_path_buf()),
@@ -1405,6 +1464,7 @@ pub fn discover_with_context(context: &DiscoveryContext) -> Result<DiscoverySnap
     for driver in HarnessId::ALL {
         if let Some(exe) = installed(context, *driver) {
             result.harnesses.push(NativeHarness {
+                backend: "native".into(),
                 id: format!("installed:{}", driver.as_str()),
                 driver: driver.as_str().into(),
                 executable: Some(exe),
@@ -1450,4 +1510,16 @@ pub fn discover_with_context(context: &DiscoveryContext) -> Result<DiscoverySnap
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod helper_locator_tests {
+    use super::*;
+    #[test]
+    fn shared_locator_preserves_legacy_local_bin_names_without_execution() {
+        let root=crate::util::test_scratch_dir("helper executable locator");let bin=root.join(".local/bin");fs::create_dir_all(&bin).unwrap();
+        for name in ["smartclaw","cursor-agent","codebuddy"] {let path=bin.join(name);fs::write(&path,"#!/bin/sh\nexit 99\n").unwrap();fs::set_permissions(&path,fs::Permissions::from_mode(0o755)).unwrap();}
+        let context=DiscoveryContext{project:root.clone(),home:root.clone(),search_path:vec![],query_timeout_ms:1,allow_commands:false,overrides:Default::default(),include_platform_locations:false};
+        let rows=installed_executables(&context);for expected in ["smartclaw","cursor","codebuddy"] {assert!(rows.iter().any(|(name,_)|name==expected));}
+    }
 }

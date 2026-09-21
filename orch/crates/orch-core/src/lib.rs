@@ -4,6 +4,11 @@
 //! 纪律：本 crate 零平台代码；路径一律由调用方传入绝对根（errata E6）。
 
 pub mod observation;
+/// Stable private-bridge request and evidence data, with no protocol SDK dependency.
+pub mod acp;
+/// Bounded line IO shared by protocol binaries; absent from the default CLI.
+#[cfg(feature = "protocol-io")]
+pub mod protocol_io;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;

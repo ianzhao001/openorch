@@ -21,7 +21,7 @@ import tempfile
 NAME = "openorch"
 SELECTOR = "openorch@openorch"
 PLUGIN = "plugins/openorch/"
-ASSETS = ("orch", "scripts/wake-multica.sh", "scripts/wake-dsh-stream.sh",
+ASSETS = ("orch", "orch-mcp", "orch-acp", "scripts/wake-multica.sh", "scripts/wake-dsh-stream.sh",
           "scripts/wake-pi-stream.sh", "scripts/wake-zcode-stream.sh")
 SEMVER = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?")
 
@@ -91,7 +91,7 @@ def files_under(root):
     return result
 
 
-def verify_bundle(root):
+def verify_bundle(root, legacy_runtime=False):
     """Verify the complete inventory, native manifests and five runtime resources."""
     root = check_path(root, directory=True)
     manifest = read_json(root / "manifest.json")
@@ -126,8 +126,22 @@ def verify_bundle(root):
             and entries[0].get("policy") == {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
             "Marketplace must contain only its local OpenOrch plugin.")
     runtime = read_json(root / PLUGIN / "runtime/manifest.json")
-    require(runtime.get("version") == 1 and set(runtime.get("files", {})) == set(ASSETS), "Incomplete runtime inventory.")
-    for name in ASSETS:
+    legacy = set(ASSETS) - {"orch-mcp", "orch-acp"}
+    actual = set(runtime.get("files", {}))
+    accepted = actual == set(ASSETS) or (legacy_runtime and actual == legacy)
+    require(runtime.get("version") == 1 and accepted, "Incomplete runtime inventory.")
+    if actual == legacy:
+        descriptor = read_json(root / PLUGIN / ".codex-plugin/plugin.json")
+        new_resources = {PLUGIN + ".mcp.json", PLUGIN + "scripts/openorch-mcp.py", PLUGIN + "runtime/orch-mcp", PLUGIN + "runtime/orch-acp"}
+        require("mcpServers" not in descriptor and not new_resources.intersection(files), "Legacy runtime cannot contain MCP declarations or protocol resources.")
+    if actual == set(ASSETS):
+        descriptor = read_json(root / PLUGIN / ".codex-plugin/plugin.json")
+        require(descriptor.get("mcpServers") == "./.mcp.json", "Missing MCP companion declaration.")
+        mcp = read_json(root / PLUGIN / ".mcp.json")
+        require(mcp == {"mcpServers": {"openorch": {"command": "./scripts/openorch-mcp.py", "cwd": "."}}}, "Unexpected MCP startup declaration.")
+        require(PLUGIN + "scripts/openorch-mcp.py" in files and os.access(root / PLUGIN / "scripts/openorch-mcp.py", os.X_OK), "Missing executable MCP launcher.")
+    for name in actual:
+        require(os.access(root / PLUGIN / "runtime" / name, os.X_OK), "Runtime resource is not executable: " + name)
         require(digest(read_file(root / PLUGIN / "runtime" / name)) == runtime["files"][name], "Runtime resource changed: " + name)
     return manifest
 
@@ -174,7 +188,7 @@ def owned_root(path, prefix, plugin=False):
     require(not plugin or path == root / "plugins/openorch", "Unknown plugin path: " + str(path))
     relative = root.relative_to(prefix / "versions") if root.is_relative_to(prefix / "versions") else None
     require(relative is not None and len(relative.parts) == 1, "Foreign OpenOrch registration: " + str(path))
-    value = verify_bundle(root)
+    value = verify_bundle(root, legacy_runtime=True)
     require(value["version"] == root.name, "Version directory and inventory disagree: " + str(root))
     return root
 

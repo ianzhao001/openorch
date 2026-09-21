@@ -1482,3 +1482,184 @@ reported as indeterminate—not as proof of login, provider balance or future su
 A definitive unsafe result fails only that role. Within a role wave, OpenCode starts
 are kept in stable member order at least one second apart; other drivers retain
 parallel launch and no member is retried automatically.
+
+
+## Explicit finite consultation service
+
+`FusionEngine::start_consult` accepts one to five explicit roles and never adds a synthesis call. The same core still runs the Web role combination plus its explicit synthesizer. Requests capture project-local text attachment bytes and the native configuration snapshot before worker launch. Reusing an id with different request or attachment bytes is refused; matching replays never start another worker.
+
+`read_status` reads lifecycle metadata without answer bodies. Independent status and history-list readers inspect an exclusive owner file lock, not their own process-local set. Unsafe owner-lock metadata fails the read; it does not silently classify another process as lost. An unlocked unfinished run is HOLD and is not restarted; a lock alone never proves provider termination. Historical completed records keep their existing digest checks. `read_answer_page` validates the complete answer and returns bounded UTF-8 byte pages with a full-answer SHA-256; continuations require that digest. Invalid offsets, missing members and changed/unverified evidence fail closed.
+
+
+On macOS, initial managed-wake OFFER sampling identifies the `/bin/sh` dispatch image from the system `/var/select/sh` selector. That known intermediate image cannot become an OFFER; sampling continues within the unchanged 500 ms window until a different complete credential is stable for the existing 50 ms interval. Ordinary stable short-lived providers retain the fast path. No executable equivalence is introduced: subsequent OFFER/ACCEPT/ACCEPTED checks still compare every credential field exactly, and the 2-second ACCEPTED deadline is unchanged. Rejection diagnostics on stderr contain only process identities and executable hashes, never launch tokens or prompts.
+
+After the OFFER is settled, supervisor and parent revalidation use fresh A/full/B samples and exact equality to the OFFER, rather than restarting a 50 ms startup wait at each hop. This preserves topology/credential checks while allowing already-ready short-lived providers to finish the handshake. An absent or changed credential still rejects ownership transfer.
+
+Explicit consultation precedence is role/request pins, then captured configured consultation pins, then native defaults. Web role combinations retain their existing native-default behavior. Both paths consume one captured discovery/configuration snapshot, without frontend-specific model selection.
+
+
+## Local MCP stdio adapter
+
+`orch-mcp --project <canonical-git-worktree>` is an independent default-feature binary built with
+`cargo build -p orch-mcp --locked --manifest-path orch/Cargo.toml`. Repeat `--project` for an explicit
+allowlist (maximum32). It exposes exactly four MCP tools: `list_harnesses`, `consult`, `get_run`,
+`read_answer`. Standard output contains protocol frames only; no HTTP listener or background daemon
+is created. MCP and the default CLI have no dependency on orch-ui or the selfhost feature.
+
+Every tool requires `project`, the exact authorized canonical worktree path; `.` is accepted only
+with one authorized project. Shared Git storage does not authorize sibling worktree answers.
+`list_harnesses` reads local capability/catalog metadata without launching native commands or models;
+unknown catalog entries stay unknown and selfhost projects may be unavailable to a default build.
+It omits executable paths, raw source/config records and credential material.
+
+`consult` accepts `requestKey`, `question`, explicit `members` (1–5 FusionRole records) and optional
+`attachments` (at most16 project files). Each member contains `id`, `name`, `instructions`, a discovered
+`harness` identity and `fixed` provider/model/effort/mode pins. It returns the reserved run ID and compact
+state. Reusing a key with identical inputs returns the original run; changed inputs conflict. No
+synthesis role is added, no retries or model fallback occur. Configuration, inputs and Git identity
+are captured by the common core. Existing CLI and Web semantics remain unchanged.
+
+`get_run` accepts `runId` and optional `waitMs` (0–30000). It returns compact member state and safe
+reasons, never question text, answers or raw channel facts. `read_answer` accepts `runId`, `memberId`,
+byte `offset` (default0), `limit` (default16384, maximum65536), and the preceding page `sha256` for every
+continuation. Pages are validated against whole-answer identity, digest and trusted completion;
+UTF-8 boundaries are preserved. A tool failure is an MCP isError result with a structured error code;
+invalid protocol requests use SDK errors. HOLD requires investigation and never triggers replay.
+
+The service limits both inbound and outbound newline protocol frames to2MiB, tool payloads to256KiB, and admits at most8 concurrent operations. Oversized catalog results return response_too_large rather than silently truncating capabilities. Cancelled get_run observations release their slots promptly; cancellation never undoes an admitted consult reservation.
+EOF or SIGTERM/SIGINT stops admission, drains admitted reservations and finite core jobs under their
+existing deadlines, then closes. Client cancellation cannot undo a published reservation. Abnormal
+exit retains existing evidence; an independent reader uses the OS owner lock rather than a local
+in-memory task list. No guarantee is made that a run continues after its host exits.
+
+For isolated Codex registration, place an absolute built binary path and `--project` argument in a
+separate test CODEX_HOME config under `[mcp_servers.openorch]` using `command` and `args`. Keep global
+model defaults unchanged. Host discovery qualification proves registration only; actual downstream
+model certification is recorded separately. DSH continues its existing compatibility entry.
+
+
+## Finite ACP consultation bridge
+
+Build `orch-acp` alongside `orch-mcp` or `orch`; the host resolves the sibling runtime and
+checks its identity before execution. The independent bridge uses agent-client-protocol
+2.2.0 and ACP wire v1. The default CLI does not link either protocol SDK.
+
+Opt in explicitly in a harness's `consult.acp` block. Its closed fields are `agentVersion`
+(required exact adapter version), `adapter` (absolute adapter entry, required for Codex and
+Claude), `node` (optional absolute interpreter), and `credentialEnv` (optional credential
+variable name, never a literal credential). OpenCode uses its built-in ACP command.
+ACP configuration on execute or review is rejected. Omitting the block selects the existing
+native consultation backend; a failing ACP invocation never switches to that backend.
+
+The existing defaults and explicit member tuple select provider/model/effort. The host captures
+native configuration, provider routing, attachment context and invocation identity before
+launch. A requested custom provider must match the captured native route. Request files carry
+no credential values or arbitrary environment/command maps, are private and digest-bound,
+and are validated before starting an adapter. Native executables, adapter entries and request
+files are rechecked at the existing channel boundary.
+
+The client requires the exact adapter name/version and wire v1, then selects and reads back
+readonly mode, model and effort before sending a prompt. OpenCode uses `plan` plus the `effort`
+option exposed after model selection. Claude uses `plan`, explicit model aliases and native
+model/result evidence. Codex uses `read-only` and `reasoning_effort`; absent requested effort
+is an explicit pre-prompt refusal. Mode alone is insufficient: configured write/delegation
+tools are disabled and client permission requests are denied. Tool output, changed settings,
+wrong sessions and text after the prompt terminal cannot become an answer.
+
+A successful bridge envelope requires end_turn, exact request and model identities, native
+exit zero and actual stdout/stderr EOF. The host additionally verifies its existing managed
+process-group termination and immutable answer evidence. Protocol errors and timeouts keep
+failure evidence; no retry, replay or model substitution occurs. The bridge inherits the
+host process group and does not create a detached scheduling service. ACP frames are bounded
+at 2 MiB and each finite stream at 16 MiB; final text is bounded at 512 KiB. MCP shares the
+same bounded framing implementation, including rejection of an incomplete output frame at
+flush without emitting its prefix.
+
+Qualification status must distinguish metadata negotiation from a real consultation.
+The recorded preflight for Codex ACP 1.12.0 with native Codex 0.155.1 does not advertise
+`reasoning_effort=max` for DeepSeek Flash, so that requested tuple is unavailable and must
+not be marked certified. AGY remains on its existing compatibility channel; Consult and ACP
+are unsupported, including when its selected catalog model is `gemini-3.8-flash-high`.
+
+The B366 production-path qualification used isolated native homes and the MCP four-tool API.
+OpenCode 1.18.31 returned a verified answer with `deepseek/deepseek-flash`, `effort=max`,
+`mode=plan`; Claude ACP 0.79.0 with native 2.1.251 returned a verified answer and raw SDK
+model `deepseek-flash`, with the explicitly remapped `opus` picker, `effort=max`, `mode=plan`.
+Both produced native exit zero, actual pipe EOF and outer managed-group termination.
+Codex ACP 1.12.0 with native 0.155.1 returned `unsupported_effort` at negotiation with
+`promptSent=false`; it is not certified for the requested max tuple. AGY's live catalog
+included `gemini-3.8-flash-high`, while MCP reported its Consult capability unavailable.
+These are qualification results for the pinned local versions, not guarantees for changed
+adapter binaries, providers or model catalogs. Provider evidence is the captured native
+route and explicit launch configuration; it is not independent server-side attestation.
+
+OpenCode production admission also runs `debug agent plan --pure` with the same controlled
+launch environment before sending an ACP prompt. Its final ordered permission rules must
+contain a catch-all deny without a later tool allow/ask. The native truncated-output
+`external_directory` allowance is a secondary path check, not an executable tool. Inherited
+specific tool allows that survive OpenCode's deep configuration merge cause
+`acp_native_policy_allows_tools` before inference. Metadata output and stderr remain in
+bounded memory; only the permission-rules digest/count are attached to successful evidence.
+The probe shares the outer managed process group and consumes the existing wall deadline.
+OpenCode custom adapter/Node overrides are rejected so the probe and ACP use the same native
+entry. The public production bridge calls `consult_verified`; the lower wire-only client
+entry remains for protocol fixture testing and requires caller-owned native policy admission.
+
+
+## Shared CLI consultation lifecycle
+
+The public CLI consultation entry now reserves a run through the same FusionEngine
+used by MCP and Web. Explicit CLI members keep their configured aliases, order,
+per-member and total deadlines, and partial-success exit behavior. CLI consultation
+does not add a synthesis member. Web combinations retain their selected synthesis.
+
+CLI results remain authoritative at coordination/consultations/<id>/fusion/; fast
+member manifests become visible before slow siblings finish. The shared run record
+under .orch/fusion-runs/<id> binds this code-owned layout, captured project/Git
+identity, raw configuration and native routing snapshot. There is no mirrored answer
+or second transcript parser. Reading the visible answer through the shared reader
+checks the same manifest, digest and trusted terminal proof as MCP/Web. Historical
+runs without the legacy-layout field continue to use their original layout.
+
+Question, attachments and harness configuration are captured at admission. Lower
+execution consumes these immutable inputs; derived role and synthesis questions do
+not reread source policy or files. Execution-time Git/authority and executable checks
+remain in force. CLI and MCP/Web share project ownership, so a concurrent request
+cannot bypass an active or unresolved run through another frontend.
+
+A closed run stays completed or failed even if its local CLI result delivery channel
+is interrupted. The CLI reports that delivery error with the verified durable phase;
+it never relabels a verified terminal run HOLD or automatically replays it. A worker
+ending without trusted closure remains HOLD, retaining evidence for inspection.
+
+
+## Rust setup and packaged MCP registration
+
+The installed Python helper is an integrity/argv launcher for private __openorch;
+the six public CLI leaves are unchanged. Setup, default selection and project
+configuration use the same Rust configuration parser and shared consultation
+lifecycle. No temporary validation clone or Python profile interpreter remains.
+Normal project-mode and stale-binary guards run before hidden-entry dispatch.
+Nested --root paths are normalized to the actual Git worktree before those guards.
+
+Profiles are private, locked and bounded. Explicit replacement verifies an initial
+snapshot backup, then uses atomic exchange to retain the actual overwritten file.
+Preexisting identity/byte changes refuse; a last-check race or sync failure reports
+publication as unconfirmed with recovery paths. Actual displaced bytes are never
+unlinked on an exchange error. Unsupported atomic exchange has no rename fallback.
+First creation never clobbers a newly appeared file. Existing project harness
+bytes are preserved; local generated ignore entries may remain after failed setup.
+
+Explicit attach records canonical worktree paths and directory identities in
+projects.json, maximum32. MCP startup accepts explicit --project roots or one
+--projects-file, never both; no arguments select the personal registry. Startup
+cwd is not authority. The Gateway retains its fixed allowlist for the process;
+restart after registration changes. The four MCP tools are unchanged.
+
+A complete bundle includes orch, orch-mcp, orch-acp and four native wrappers.
+Runtime bytes, executable modes and three version strings are checked; the default
+CLI's real command surface and dependency graph remain isolated from SDK/UI/Tokio.
+Old complete five-resource releases are accepted only as legacy installation
+ownership, and cannot contain new MCP declarations/resources. New packages must
+include the complete seven-resource inventory. Versioned payloads and user state
+survive uninstall/explicit rollback. DSH retains its compatibility host entry.

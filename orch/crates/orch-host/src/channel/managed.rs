@@ -3907,6 +3907,68 @@ fn capture_provider_credential(
     observer: &mut ProcessObserver,
     provider_pid: u32,
 ) -> Result<ManagedProcessCredential> {
+    capture_provider_credential_in_window(observer, provider_pid, None)
+}
+
+// macOS /bin/sh can dispatch through the administrator-selected shell. Do not
+// publish that measured intermediate image as an OFFER. This is not an
+// equivalence between images: every later comparison stays byte-for-byte exact.
+#[cfg(target_os = "macos")]
+fn initial_shell_dispatch_image() -> Result<Option<String>> {
+    let selected = match fs::canonicalize("/var/select/sh") {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read system shell selector"),
+    };
+    let dispatch = fs::canonicalize("/bin/sh")?;
+    if selected == dispatch { return Ok(None); }
+    Ok(Some(executable_summary(&dispatch)?))
+}
+#[cfg(not(target_os = "macos"))]
+fn initial_shell_dispatch_image() -> Result<Option<String>> { Ok(None) }
+
+fn capture_initial_provider_credential(
+    observer: &mut ProcessObserver,
+    provider_pid: u32,
+) -> Result<ManagedProcessCredential> {
+    let dispatch = initial_shell_dispatch_image()?;
+    capture_provider_credential_in_window(observer, provider_pid, dispatch.as_deref())
+}
+
+// Revalidate a previously settled OFFER with a fresh A/full/B observation.
+// The caller still compares every field to the OFFER. Repeating the startup
+// wait here would consume short-lived providers without strengthening equality.
+fn sample_provider_credential(
+    observer: &mut ProcessObserver,
+    provider_pid: u32,
+) -> Result<ManagedProcessCredential> {
+    let before = observer.topology_snapshot()?;
+    let first = before
+        .get(&provider_pid)
+        .cloned()
+        .context("provider missing from topology A")?;
+    let credential = observer
+        .stable_credential(provider_pid)?
+        .context("provider full credential did not stabilize")?;
+    let after = observer.topology_snapshot()?;
+    let second = after
+        .get(&provider_pid)
+        .context("provider missing from topology B")?;
+    if first != *second
+        || !credential_matches_topology(&credential, second)
+        || credential.pid != provider_pid
+        || credential.pgid != provider_pid
+    {
+        bail!("provider A/full/B identity or PID=PGID proof failed");
+    }
+    Ok(credential)
+}
+
+fn capture_provider_credential_in_window(
+    observer: &mut ProcessObserver,
+    provider_pid: u32,
+    excluded_dispatch_image: Option<&str>,
+) -> Result<ManagedProcessCredential> {
     // Script-backed test adapters and portable launch shims may perform one
     // same-PID exec immediately after Command::spawn returns. Never relax the
     // immutable A/full/B proof; retry the entire proof for a short bounded
@@ -3915,29 +3977,12 @@ fn capture_provider_credential(
     let required_stability = Duration::from_millis(PROVIDER_IDENTITY_STABLE_MS);
     let mut stable: Option<(ManagedProcessCredential, Instant)> = None;
     loop {
-        let proof = (|| {
-            let before = observer.topology_snapshot()?;
-            let first = before
-                .get(&provider_pid)
-                .cloned()
-                .context("provider missing from topology A")?;
-            let credential = observer
-                .stable_credential(provider_pid)?
-                .context("provider full credential did not stabilize")?;
-            let after = observer.topology_snapshot()?;
-            let second = after
-                .get(&provider_pid)
-                .context("provider missing from topology B")?;
-            if first != *second
-                || !credential_matches_topology(&credential, second)
-                || credential.pid != provider_pid
-                || credential.pgid != provider_pid
-            {
-                bail!("provider A/full/B identity or PID=PGID proof failed");
-            }
-            Ok(credential)
-        })();
+        let proof = sample_provider_credential(observer, provider_pid);
         let error = match proof {
+            Ok(credential) if excluded_dispatch_image == Some(credential.executable_summary.as_str()) => {
+                stable = None;
+                Some(anyhow::anyhow!("provider is still executing the system shell dispatch image"))
+            }
             Ok(credential) => {
                 if let Some((previous, since)) = stable.as_ref() {
                     if *previous == credential
@@ -7091,7 +7136,7 @@ pub fn run_wake_supervisor_from_stdin(root: &Path, caller_selfhost_enabled: bool
     let provider_pid = spawned_owner.provider_pid;
     // Child ownership exists before the first fallible identity operation.
     // Capture failure becomes a Closing reason; it never returns through `?`.
-    let provider_capture = capture_provider_credential(&mut spawned_owner.observer, provider_pid);
+    let provider_capture = capture_initial_provider_credential(&mut spawned_owner.observer, provider_pid);
     let (offered_credential, mut initial_error) = match provider_capture {
         Ok(credential) if credential.sid == provider_pid => (Some(credential), None),
         Ok(_) => (
@@ -7257,7 +7302,7 @@ pub fn run_wake_supervisor_from_stdin(root: &Path, caller_selfhost_enabled: bool
                                 if control == format!("ACCEPT {}\n", spec.token)
                                     && !spec.ack_path.exists() =>
                             {
-                                match capture_provider_credential(
+                                match sample_provider_credential(
                                     &mut spawned_owner.observer,
                                     provider_pid,
                                 ) {
@@ -7681,8 +7726,9 @@ impl Drop for SupervisorLaunchGuard {
     }
 }
 
-#[cfg(test)]
-fn b203_report_credential_drift(
+// Keep rejection diagnostics available to the real CLI, not only unit-test builds.
+// Fields are process identities and hashes; never include launch specs or auth tokens.
+fn report_credential_drift(
     phase: &str,
     old: &ManagedProcessCredential,
     new: &ManagedProcessCredential,
@@ -7695,14 +7741,14 @@ fn b203_report_credential_drift(
         Err(error) => format!("try-wait-error({error})"),
     };
     eprintln!(
-        "B203 CREDENTIAL DRIFT phase={phase} supervisorPid={supervisor_pid} supervisorState={supervisor_state}"
+        "orch: CREDENTIAL DRIFT phase={phase} supervisorPid={supervisor_pid} supervisorState={supervisor_state}"
     );
     macro_rules! field {
         ($name:literal, $old:expr, $new:expr) => {{
             let old = &$old;
             let new = &$new;
             eprintln!(
-                "B203 CREDENTIAL FIELD {} old={:?} -> new={:?} changed={}",
+                "orch: CREDENTIAL FIELD {} old={:?} -> new={:?} changed={}",
                 $name,
                 old,
                 new,
@@ -8010,12 +8056,10 @@ fn spawn_managed_wake_supervisor_inner(
             {
                 bail!("wake supervisor ack identity mismatch");
             }
-            let current = inspect_stable_process(ack.provider_pid)
-                .context("parent provider credential revalidation failed")?
-                .context("parent provider disappeared before ACCEPT")?;
+            let current = sample_provider_credential(&mut ProcessObserver::default(), ack.provider_pid)
+                .context("parent provider credential revalidation failed")?;
             if current != ack.provider_credential {
-                #[cfg(test)]
-                b203_report_credential_drift(
+                report_credential_drift(
                     "offer-to-parent-before-accept",
                     &ack.provider_credential,
                     &current,
@@ -8054,14 +8098,13 @@ fn spawn_managed_wake_supervisor_inner(
                     {
                         bail!("wake supervisor ACCEPTED identity mismatch");
                     }
-                    let parent_fresh = capture_provider_credential(
+                    let parent_fresh = sample_provider_credential(
                         &mut ProcessObserver::default(),
                         accepted.provider_pid,
                     )
                     .context("parent ACCEPTED provider proof failed")?;
                     if parent_fresh != accepted.provider_credential {
-                        #[cfg(test)]
-                        b203_report_credential_drift(
+                        report_credential_drift(
                             "accepted-to-parent-after-accepted",
                             &accepted.provider_credential,
                             &parent_fresh,
@@ -9093,3 +9136,51 @@ mod descriptor_compatibility_tests {
 #[cfg(feature = "selfhost")]
 #[path = "../wake.rs"]
 pub mod selfhost;
+
+#[cfg(test)]
+mod r93_initial_identity_tests {
+    use super::*;
+
+    #[test]
+    fn initial_offer_capture_cannot_publish_a_transient_shell_identity() {
+        let mut command = Command::new("/bin/bash");
+        command.args(["-c", "/bin/sleep 0.15; exec /bin/sleep 2"]);
+        configure_isolated_session(&mut command);
+        let mut child = command.spawn().unwrap();
+        let transient = executable_summary(Path::new("/bin/bash")).unwrap();
+        let captured = capture_provider_credential_in_window(&mut ProcessObserver::default(), child.id(), Some(&transient));
+        let expected = executable_summary(Path::new("/bin/sleep")).unwrap();
+        let waited = child.wait().unwrap();
+        assert!(waited.success());
+        assert_eq!(captured.unwrap().executable_summary, expected,
+            "initial OFFER must not publish the transient interpreter before a delayed same-PID exec");
+    }
+}
+
+#[cfg(test)]
+mod r93_short_provider_tests {
+    use super::*;
+    #[test]
+    fn stable_short_lived_provider_does_not_wait_the_entire_startup_window() {
+        let mut command=Command::new("/bin/sleep"); command.arg("0.35");
+        configure_isolated_session(&mut command);
+        let mut child=command.spawn().unwrap();
+        let captured=capture_initial_provider_credential(&mut ProcessObserver::default(),child.id());
+        let status=child.wait().unwrap();assert!(status.success());
+        assert_eq!(captured.unwrap().pid,child.id());
+    }
+}
+
+#[cfg(test)]
+mod r93_revalidation_tests {
+    use super::*;
+    #[test]
+    fn missing_second_census_never_authorizes_revalidation() {
+        let mut command=Command::new("/bin/sleep");command.arg("1");configure_isolated_session(&mut command);
+        let mut child=command.spawn().unwrap();
+        let mut observer=ProcessObserver::default();observer.fail_topology_at=Some(2);
+        let captured=sample_provider_credential(&mut observer,child.id());
+        assert!(child.wait().unwrap().success());
+        assert!(captured.unwrap_err().to_string().contains("injected process-topology snapshot failure"));
+    }
+}

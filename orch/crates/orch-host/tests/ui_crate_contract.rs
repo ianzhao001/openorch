@@ -8,16 +8,17 @@
 //! 1. `orch/Cargo.toml` 的 `members` 必须含 `crates/orch-ui`
 //! 2. `orch/crates/orch-ui/Cargo.toml` 必须存在，且四个新依赖**全部精确钉死**
 //!    （`=x.y.z` 形式；出现 `^`、`~`、`*` 或裸版本号即违约）
-//! 3. **零污染**：`orch-core` 与 `orch-host` 的 Cargo.toml 里不得出现任何一个新依赖名
+//! 3. UI 依赖不能进入 core/host/CLI；core 的 protocol-io 可声明可选 Tokio，默认 CLI 实际依赖图仍必须无 Tokio/协议 SDK/UI。
 //!
-//! 判据全部基于 manifest 文本，不依赖 orch-ui 是否已实现功能——因此本种子在
+//! UI/pin 判据基于 manifest，默认隔离另查实际 Cargo 依赖图；不依赖 UI 功能实现，因此在
 //! 「crate 建好但功能为空」时即可转绿，符合 B99 的交付边界。
 //!
 //! ## 负向变异清单（REPORT §5 逐条自证）
 //! 1. 任一新依赖改成浮动版本（如 `ratatui = "0.29"`）→ `ui_crate_pins_exact_versions` 红
 //! 2. 把 `ratatui` 加进 orch-host/Cargo.toml → `core_and_host_stay_unpolluted` 红
 //! 3. 从 workspace members 摘掉 crates/orch-ui → `workspace_includes_ui_crate` 红
-//! 4. 删除 orch-ui/Cargo.toml → 全部用例红
+//! 4. 删除 orch-ui/Cargo.toml → 对应存在性/依赖断言红
+//! 5. 将 protocol-io 带入默认 CLI 依赖图 → default_cli_runtime_graph_excludes_ui_and_protocol_runtimes 红
 
 use std::path::{Path, PathBuf};
 
@@ -90,6 +91,16 @@ fn core_and_host_stay_unpolluted() {
     for crate_name in ["orch-core", "orch-host", "orch-cli"] {
         let manifest = read(&repo_root().join(format!("orch/crates/{crate_name}/Cargo.toml")));
         for dep in NEW_DEPS {
+            // B366 adds explicitly enabled, shared protocol IO. A declaration
+            // is not a default runtime dependency; verify both boundaries.
+            if crate_name == "orch-core" && dep == "tokio" {
+                let normal = manifest.split("[dependencies]").nth(1)
+                    .and_then(|section| section.split("\n[").next()).unwrap_or("");
+                if let Some(line) = dep_line(normal, dep) {
+                    assert!(line.replace(' ', "").contains("optional=true"), "core Tokio must remain optional");
+                }
+                continue;
+            }
             assert!(
                 dep_line(&manifest, dep).is_none(),
                 "{crate_name} 的依赖面不得被 {dep} 污染（新依赖只允许出现在 orch-ui）"
@@ -101,4 +112,26 @@ fn core_and_host_stay_unpolluted() {
             "零污染断言必须与 orch-ui 已建立同时成立，否则是假绿"
         );
     }
+}
+
+
+#[test]
+fn default_cli_runtime_graph_excludes_ui_and_protocol_runtimes() {
+    let cargo = option_env!("CARGO").unwrap_or("cargo");
+    let output = std::process::Command::new(cargo)
+        .current_dir(repo_root())
+        .env_remove("_")
+        .args(["tree", "-p", "orch-cli", "--no-default-features", "--offline",
+            "--locked", "--manifest-path", "orch/Cargo.toml", "-e", "normal,build",
+            "--prefix", "none", "--format", "{p}"])
+        .output().expect("inspect default CLI dependency graph");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let graph = String::from_utf8(output.stdout).unwrap();
+    for line in graph.lines() {
+        let name = line.split_whitespace().next().unwrap_or("");
+        assert!(!["orch-ui", "ratatui", "crossterm", "axum", "tokio", "rmcp",
+            "agent-client-protocol", "agent-client-protocol-schema"].contains(&name),
+            "default CLI unexpectedly links {name}");
+    }
+    assert!(graph.lines().any(|line| line.starts_with("orch-core ")));
 }

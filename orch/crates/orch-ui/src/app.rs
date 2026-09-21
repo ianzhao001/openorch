@@ -1056,6 +1056,30 @@ mod tests {
             Some("ANSWER")
         );
     }
+    fn clipboard_pid_fixture_script(pid:&Path,pause:bool)->String {
+        let before=if pause {"printf 'opened\\n'\nread release\n"} else {""};
+        let after=if pause {"printf 'published\\n'\n"} else {""};
+        let temporary=pid.with_extension("pending");
+        format!(": > '{}'\n{before}printf '%s\\n' \"$$\" > '{}'\n/bin/mv '{}' '{}'\n{after}exec /bin/sleep 20",temporary.display(),temporary.display(),temporary.display(),pid.display())
+    }
+    #[test]
+    fn clipboard_pid_ready_name_is_not_published_while_bytes_are_incomplete() {
+        use std::io::{BufRead,BufReader};
+        let fixture=Fixture::new();let pid=fixture.root.join("ready-pid");let exe=fixture.script("publication-probe",&clipboard_pid_fixture_script(&pid,true));
+        let mut child=Command::new(exe).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut input=child.stdin.take().unwrap();let stdout=child.stdout.take().unwrap();let(tx,rx)=std::sync::mpsc::channel();
+        let reader=std::thread::spawn(move||{for line in BufReader::new(stdout).lines(){if tx.send(line).is_err(){break;}}});
+        let result=(||->Result<(),String>{
+            let line=rx.recv_timeout(Duration::from_secs(5)).map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
+            if line!="opened" {return Err("fixture did not reach publication barrier".into());}
+            if pid.exists(){return Err("ready name exposed before content".into());}
+            input.write_all(b"release\n").map_err(|e|e.to_string())?;
+            let line=rx.recv_timeout(Duration::from_secs(5)).map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
+            if line!="published" {return Err("fixture did not publish".into());}
+            if fs::read_to_string(&pid).map_err(|e|e.to_string())?.trim()!=child.id().to_string(){return Err("wrong owned PID".into());}Ok(())
+        })();
+        let _=child.kill();let _=child.wait();drop(input);reader.join().unwrap();assert!(result.is_ok(),"{result:?}");
+    }
     #[test]
     fn clipboard_receives_safe_literal_and_reaps_hanging_child() {
         let f = Fixture::new();
@@ -1074,7 +1098,7 @@ mod tests {
         let pid = f.root.join("pid");
         let hang = f.script(
             "hung-copy",
-            &format!("echo $$ > '{}'\nexec /bin/sleep 20", pid.display()),
+            &clipboard_pid_fixture_script(&pid,false),
         );
         let mut child = Command::new(&hang)
             .stdin(Stdio::piped())

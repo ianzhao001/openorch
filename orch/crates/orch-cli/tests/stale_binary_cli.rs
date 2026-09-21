@@ -622,3 +622,15 @@ fn missing_git_metadata_degrades_with_an_explanation() {
         "降级放行必须说明原因: {stderr}"
     );
 }
+
+#[test]
+fn stale_helper_writes_are_rejected_even_from_nested_project_paths() {
+    let Some(repo)=stale_repo("helper-writes") else {eprintln!("skip: source archive has no Git build stamp");return;};
+    fs::create_dir_all(repo.root.join("coordination/runtime")).unwrap();
+    fs::write(repo.root.join("coordination/runtime/CURRENT-ROUND"),"r-helper-stale\n").unwrap();
+    let nested=repo.root.join("nested");fs::create_dir(&nested).unwrap();let personal=repo.root.join("helper-personal");
+    for action in [vec!["configure","--input","missing-profile.json"],vec!["attach"],vec!["run","--mode","single","--question-file","missing-question.md","--harness","alpha"]] {
+        let mut args=vec!["__openorch","--config-dir",personal.to_str().unwrap()];args.extend(action);
+        let output=run_orch(&nested,&args);assert_stale_write_rejected(&repo,&output,"__openorch setup/run");assert!(!personal.exists());
+    }
+}

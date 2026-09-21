@@ -9,12 +9,12 @@ Git projects.
 
 ## 安装 / Install
 
-下载 [OpenOrch Release](https://github.com/ianzhao001/openorch/releases) 中的完整
-Apple Silicon macOS 插件归档并解压。插件版本为 `0.1.0-alpha.10`，核心版本仍是
-`orch 0.1.0`。源码仓本身不含运行核心，不能代替完整 Release 安装包。
+本次为尚未发布远端的 `0.1.0-alpha.11` 本地候选。使用经验证的完整
+Apple Silicon macOS 本地安装包；三个核心程序的版本均为 `0.1.0`。
+源码仓本身不含预编译运行时，不能代替完整安装包。
 
-Download and extract the complete Apple Silicon macOS plugin archive. It includes
-the default runtime and four channel resources. No Rust toolchain is needed.
+Use the verified local candidate bundle; no remote release is published by this change. It includes
+the default CLI, MCP and ACP binaries plus four channel resources. No Rust toolchain is needed.
 Prerequisites: Python 3.9+, Git, and the native Codex or DSH client. DSH's plugin
 manager also requires its normal Node.js/pnpm environment and network access to
 install the declared filesystem-skill dependency. Tested host versions and build
@@ -70,34 +70,32 @@ Two aliases can still use the same backend; member count alone does not establis
 independent model diversity. Native clients may incur their normal usage costs.
 
 配置细节和完整助手命令见 [HELPER.md](HELPER.md)。更新个人默认配置需要明确选择，
-不会自动覆盖已有项目配置。没有后台常驻编排或自动追加咨询轮次。源码还保留独立的只读
-`orch-tui` 观察面板；它不启动、取消、收取或回收任何调用，也不消费 planner 答卷。
+不会自动覆盖已有项目配置。没有后台常驻编排或自动追加咨询轮次。
+
+## Codex 宿主协作 / Codex host coordination
+
+发布包包含 [AGENTS.md](AGENTS.md) 的协作规则副本。在 Codex Desktop 中，局部实现的
+拆分、子代理并行、消息和等待优先交给 Codex 原生多代理机制；OpenOrch 仅在用户明确要求
+OpenOrch、Fusion 或跨客户端独立咨询时提供逐席咨询与汇总。每个子任务只保留一个执行所有者，
+不会由 OpenOrch 复制 Codex 的任务队列、后台 scheduler、自动接替或重试。
+
+The release includes a copy of the collaboration policy at [AGENTS.md](AGENTS.md).
+In Codex Desktop, use Codex-native delegation, messaging, and waits for local
+implementation work. OpenOrch is only the explicit cross-harness consultation
+and fusion layer. One subtask has one execution owner; OpenOrch does not add a
+duplicate task queue, scheduler, automatic takeover, or retry loop.
 
 ## 支持边界 / Current support
 
 | Surface | Current behavior |
 | --- | --- |
 | Plugin hosts | Codex Desktop and DSH Web |
-| Consult targets | Codex, Claude, OpenCode, Cursor, MiMo, CodeBuddy, SmartClaw, DSH, Pi, ZCode, subject to actual discovery/configuration |
+| Consult targets | Codex, Claude, OpenCode, Cursor, MiMo, CodeBuddy, SmartClaw, DSH, Pi and ZCode, subject to actual discovery/configuration |
 | Unsupported Consult targets | AGY |
-| Core surfaces | Default CLI 6 commands; selfhost CLI 30; read-only `orch-tui`; explicit finite Fusion in `orch-web` |
+| Core surfaces | Default CLI 6 commands; selfhost CLI 30; existing UI preserved |
 
-DSH 既可作为插件宿主，也可作为 Consult 目标；Pi、ZCode 同样受支持。宿主集成与目标通道
-能力仍需分别核验，并以运行时发现、原生终态和项目历史证据为准。
+DSH 作为插件宿主可调用受支持的其它通道；这与 DSH 自身能否成为 Consult 目标是两件事。
 执行和审查动作的支持范围没有由本插件扩展。配置模型名称不等于原生证据已验证该身份。
-
-`orch-tui` 与 `orch-web` 仅随源码构建，不随默认六命令预编译 runtime 发布。源码构建命令为：
-
-```sh
-cargo build -p orch-ui --bin orch-tui --locked --manifest-path orch/Cargo.toml
-orch/target/debug/orch-tui --root /absolute/project
-cargo run --locked --manifest-path orch/Cargo.toml -p orch-ui --bin orch-web --all-features -- --root /exact/git/root
-```
-
-终端面板以只读方式每两秒刷新已捕获的 invocation 观察，明确区分来源时间、陈旧、终态与未知，
-并对展示/复制内容做安全裁剪；非 TTY、参数错误或初始化失败均不会伪装成成功。
-
-`orch-web` 是仅绑定 `127.0.0.1` 的本机浏览器观察面板。启动 capability、精确同源检查、无 CORS、严格响应安全头和 opaque ID API 共同限制浏览器访问；它没有任意文件接口。观察接口保持只读；用户可显式保存项目本地角色/组合并启动有限 Fusion 咨询，但不会收取、reconcile 或 GC 调用，答案 Markdown 被视为不可信内容并在本地净化，页面不加载外部资源。
 
 Missing clients, unsupported members, failed/partial calls and empty or tool-only
 answers remain visible. Do not treat a process exit or partial text as success.
@@ -129,7 +127,7 @@ approval/login flow; no global security-setting changes are required.
 ## 发行构建 / Release construction
 
 `scripts/package.py --runtime-dir ABS --output NEW_DIR --version SEMVER` packages
-one source with a supplied default `orch 0.1.0` runtime and four scripts. It checks
+one source with supplied default `orch 0.1.0`, `orch-mcp 0.1.0`, `orch-acp 0.1.0` and four scripts. It checks
 the six-command surface, rejects missing/symlink resources and writes a full
 relative-path inventory plus an adjacent `.tar.gz`. It is a packaging check,
 not a reproducible-build or publisher-attestation claim. The release builder
@@ -147,4 +145,31 @@ before publication. It writes only local artifacts and a relative SHA-256 invent
 it never initializes Git or pushes refs. Maintainers publish from an independent
 public checkout with exact old-ref checks, then verify public downloads and installs.
 
-WebUI source now supports explicit finite Fusion and read-only Native Discovery. See the public README for build instructions and boundaries.
+
+## Local MCP / ACP candidate
+
+`0.1.0-alpha.11` is a local candidate; this change does not publish a remote release.
+Use the verified local bundle. Codex receives four MCP tools through a package-local
+stdio server; DSH retains the shared skill/helper entry and has no MCP claim.
+Rust now owns personal configuration, default selection and setup through the
+same parser and consultation lifecycle as CLI/Web. Python is a verified launcher.
+
+Run the installed helper's `configure` and `attach` for the intended Git worktree,
+then restart the host to load its explicit private project registry. The current
+directory never grants MCP access. Existing project bytes and native model defaults
+are retained. Explicit profile updates return verified snapshot/actual-old-file
+backup paths; recovery and all helper options are documented in [HELPER.md](HELPER.md).
+
+Package runtime inputs must include all three binaries and four wrappers. Build
+CLI separately from protocol binaries to preserve dependency isolation:
+
+```sh
+cargo build --locked --manifest-path orch/Cargo.toml -p orch-cli --no-default-features --release
+cargo build --locked --manifest-path orch/Cargo.toml -p orch-mcp -p orch-acp --release
+```
+
+MCP consultations require explicit members and verified answer pagination. No
+implicit synthesizer, retry, model fallback or detached scheduler is added.
+Recorded native qualification accepts OpenCode/Claude DeepSeek Flash/max; Codex
+ACP1.12.0/native0.155.1 refuses unsupported effort=max before Prompt. AGY Consult
+and ACP remain unavailable. Actual runtime discovery/evidence remain authoritative.

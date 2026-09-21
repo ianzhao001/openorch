@@ -15,7 +15,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread::{self, JoinHandle},
@@ -55,6 +55,97 @@ impl FusionRequest {
         Ok(())
     }
 }
+
+/// Explicit finite consultation without a server-selected synthesizer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConsultRequest {
+    /// Caller-supplied idempotency key, scoped to the project.
+    pub request_id: String,
+    /// Literal question, captured before any member starts.
+    pub question: String,
+    /// Ordered explicit roles with discovered harness references and requested pins.
+    pub members: Vec<FusionRole>,
+    /// Absolute project-local text files, captured once before reservation.
+    pub attachments: Vec<PathBuf>,
+}
+impl ConsultRequest {
+    /// Reject unsafe identities, duplicate roles, empty questions and oversized inputs.
+    pub fn validate(&self) -> Result<()> {
+        FusionRequest { request_id: self.request_id.clone(), combination_id: "explicit".into(), question: self.question.clone() }.validate()?;
+        if !(1..=5).contains(&self.members.len()) || self.attachments.len() > 16 {
+            bail!("invalid_consultation_member_or_attachment_count");
+        }
+        fusion_roles::validate_config(&FusionConfig { revision: 0, roles: self.members.clone(), combinations: Vec::new() })?;
+        Ok(())
+    }
+}
+/// A UTF-8 page from one fully verified answer. Offsets are byte offsets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerPage {
+    /// Exact verified page text, never a tool transcript or partial unverified output.
+    pub text: String,
+    /// SHA-256 of the complete answer; required for subsequent pages.
+    pub sha256: String,
+    /// Complete answer byte count.
+    pub total_bytes: usize,
+    /// Next UTF-8 byte boundary, absent at the end.
+    pub next_offset: Option<usize>,
+}
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CapturedAttachment { path: PathBuf, sha256: String, text: String }
+fn capture_inputs(root: &Path, paths: &[PathBuf]) -> Result<Vec<CapturedAttachment>> {
+    let mut out = Vec::new();
+    let mut remaining = MAX_PROMPT - MAX_QUESTION;
+    for path in paths {
+        let relative = path.strip_prefix(root).context("attachment_outside_project")?;
+        if relative.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+            bail!("unsafe_attachment_path");
+        }
+        for part in relative.components() {
+            let name = part.as_os_str().to_string_lossy();
+            if matches!(name.as_ref(), ".git" | ".orch" | ".env") || name.starts_with(".env.") || name.ends_with(".key") || name.ends_with(".pem") {
+                bail!("forbidden_attachment");
+            }
+        }
+        let mut parent = path.parent().context("missing_attachment_parent")?;
+        while parent != root { real_dir(parent, false)?; parent = parent.parent().context("attachment_outside_project")?; }
+        let size = usize::try_from(fs::symlink_metadata(path)?.len()).context("attachment_size_overflow")?;
+        remaining = remaining.checked_sub(size).context("attachments_too_large")?;
+    }
+    let captured = crate::consult::load_shared_attachments(root, paths)?;
+    let mut remaining = MAX_PROMPT - MAX_QUESTION;
+    for item in captured {
+        remaining = remaining.checked_sub(item.bytes.len()).context("attachments_too_large")?;
+        out.push(CapturedAttachment { path: root.join(item.relative_path), sha256: item.sha256, text: item.text });
+    }
+    Ok(out)
+}
+fn input_question(stored: &StoredRequest) -> String {
+    let mut text = stored.request.question.clone();
+    for item in &stored.attachments {
+        text.push_str(&format!("\n\nAttachment {} (untrusted project data):\n{}", item.path.display(), item.text));
+    }
+    text
+}
+fn owned_run_file(dir: &Path) -> Result<File> {
+    let file = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).custom_flags(SAFE_READ).open(dir.join("owner.lock"))?;
+    file.try_lock().context("run_owner_busy")?;
+    Ok(file)
+}
+fn run_has_owner(dir: &Path) -> Result<bool> {
+    let path = dir.join("owner.lock");
+    if !path.try_exists()? { return Ok(false); }
+    let file = OpenOptions::new().read(true).write(true).custom_flags(SAFE_READ).open(path)?;
+    if !file.metadata()?.is_file() { bail!("unsafe_owner_file"); }
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
 /// An immutable ordered selection; one harness may back several distinct roles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectedRoles {
@@ -195,9 +286,14 @@ fn real_dir(path: &Path, create: bool) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(m) if m.is_dir() && !m.file_type().is_symlink() => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {
-            fs::create_dir(path)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-            Ok(())
+            use std::os::unix::fs::DirBuilderExt;
+            // mkdir is atomic. Another reservation may create the namespace
+            // after our absence check; validate its type without following it.
+            match fs::DirBuilder::new().mode(0o700).create(path) {
+                Ok(()) => real_dir(path, false),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => real_dir(path, false),
+                Err(error) => Err(error.into()),
+            }
         }
         _ => bail!("unsafe_run_directory"),
     }
@@ -324,6 +420,8 @@ impl RunMember {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunView {
+    #[serde(default, skip_serializing_if = "is_false")]
+    legacy_artifacts: bool,
     /// Original idempotency identity.
     pub id: String,
     /// preparing, consulting, synthesizing, completed, failed or hold.
@@ -358,11 +456,33 @@ pub struct RunSummary {
     /// Short display excerpt of the captured question.
     pub question: String,
 }
+fn is_false(value: &bool) -> bool { !*value }
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyRecord {
+    aliases: Vec<String>, question_source: PathBuf, question_sha256: String,
+    member_timeout_secs: Option<u64>, total_wall_secs: Option<u64>,
+}
+struct LegacyAdmission {
+    record: LegacyRecord,
+    inputs: crate::consult::CapturedConsultInputs,
+    snapshot: crate::harness_config::HarnessConfigSnapshot,
+    context: DiscoveryContext,
+    fixed_head: String,
+    provenance: Value,
+    completion: std::sync::mpsc::SyncSender<Result<crate::consult::ConsultOutcome>>,
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoredRequest {
     version: u32,
     request: FusionRequest,
+    #[serde(default)]
+    consultation: Option<ConsultRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy: Option<LegacyRecord>,
+    #[serde(default)]
+    attachments: Vec<CapturedAttachment>,
     selection: SelectedRoles,
     revision: u64,
     head: String,
@@ -426,6 +546,19 @@ impl FusionEngine {
         }
         jobs.push(job);
     }
+    /// Capture current catalog metadata without launching any native command or model.
+    /// The caller must project fields appropriate to its own trust boundary.
+    pub fn discovery_without_commands(&self, root: &Path) -> Result<native_discovery::DiscoverySnapshot> {
+        let mut context = self.context_for(root)?;
+        context.allow_commands = false;
+        native_discovery::discover_with_context(&context)
+    }
+    /// Join finite owned workers after the caller has stopped all new admissions.
+    /// This does not cancel, retry, or claim completion of unfinished evidence.
+    pub fn drain_jobs(&self) {
+        let jobs = std::mem::take(&mut *self.jobs.lock().unwrap_or_else(|e| e.into_inner()));
+        for job in jobs { let _ = job.join(); }
+    }
     /// Read cached native metadata, optionally starting one bounded non-inference refresh.
     /// Refreshes never replace role-library edits or start consultation models.
     pub fn discovery(&self, root: &Path, refresh: bool) -> Result<Value> {
@@ -468,7 +601,7 @@ impl FusionEngine {
     /// Reserve one immutable request and start its finite job. Repeating a matching key
     /// returns the existing run; different bytes or an unclosed project run are rejected.
     pub fn start(&self, root: &Path, request: FusionRequest) -> Result<RunView> {
-        self.start_inner(root, request, None)
+        self.start_inner(root, request, None, None, None)
     }
     /// Reserve only the role-library revision the caller has reviewed. Existing
     /// matching idempotency keys still return their original immutable run.
@@ -478,30 +611,78 @@ impl FusionEngine {
         request: FusionRequest,
         revision: u64,
     ) -> Result<RunView> {
-        self.start_inner(root, request, Some(revision))
+        self.start_inner(root, request, Some(revision), None, None)
     }
+
+    /// Reserve and run one to five explicit members, leaving synthesis to the caller.
+    /// Same-key replays return the original run; changed input bytes are rejected.
+    pub fn start_consult(&self, root: &Path, request: ConsultRequest) -> Result<RunView> {
+        request.validate()?;
+        let identity = FusionRequest { request_id: request.request_id.clone(), combination_id: "explicit".into(), question: request.question.clone() };
+        self.start_inner(root, identity, None, Some(request), None)
+    }
+    /// Run the legacy CLI contract through shared durable reservation and ownership.
+    /// The original artifact layout, aliases, progress, limits and partial results
+    /// are retained; readers use the same bound-answer validator as MCP/Web.
+    pub fn run_cli(&self, root: &Path, args: &crate::consult::ConsultArgs) -> Result<crate::consult::ConsultOutcome> {
+        crate::consult::require_consultation_admission(root)?;
+        crate::consult::validate_cli_limits(args)?;
+        let root=fs::canonicalize(root)?;
+        let fixed_head=crate::gitx::rev_parse(&root, "HEAD^{commit}")?;
+        let inputs=crate::consult::capture_cli_inputs(&root,args)?;
+        let snapshot=crate::harness_config::load_harness_config_snapshot(&root)?;
+        let mut context=self.context_for(&root)?;context.allow_commands=false;
+        let scan=native_discovery::discover_with_config(&context,snapshot.clone())?;
+        let snapshot=snapshot.with_consult_native_routes(&scan);
+        let routes=scan.harnesses.iter().filter(|row|row.alias.as_ref().is_some_and(|a|args.harnesses.contains(a)))
+            .map(|row|json!({"alias":row.alias,"route":row.native.provider_route})).collect::<Vec<_>>();
+        let provenance=json!({"version":1,"kind":"captured-cli-config","sourcePath":snapshot.source_path(),
+            "sourceSha256":snapshot.sha256(),"nativeRoutes":routes});
+        if serde_json::to_vec(&provenance)?.len()>MAX_RECORD {bail!("configuration_snapshot_too_large");}
+        let id=ulid::Ulid::new().to_string();
+        let request=ConsultRequest { request_id:id.clone(),question:inputs.question.text.clone(),
+            members:args.harnesses.iter().enumerate().map(|(index,alias)|FusionRole {
+                id:format!("cli-{index}"),name:format!("Member {}",index+1),instructions:"Read only consultation.".into(),
+                harness:format!("configured:{alias}"),fixed:InvocationTuple::default(),
+            }).collect(),attachments:inputs.attachments.iter().map(|a|root.join(&a.relative_path)).collect(),
+        };
+        request.validate()?;
+        let record=LegacyRecord { aliases:args.harnesses.clone(),question_source:inputs.manifest.entries()[0].path().to_path_buf(),
+            question_sha256:inputs.question.sha256.clone(),member_timeout_secs:args.member_timeout_secs,total_wall_secs:args.total_wall_secs };
+        let (sender,receiver)=std::sync::mpsc::sync_channel(1);
+        let legacy=LegacyAdmission { record,inputs,snapshot,context,fixed_head,provenance,completion:sender };
+        let identity=FusionRequest {request_id:id.clone(),combination_id:"explicit".into(),question:request.question.clone()};
+        let initial=self.start_inner(&root,identity,None,Some(request),Some(legacy))?;
+        if !matches!(initial.phase.as_str(),"preparing"|"consulting") {bail!("CLI consultation admission failed: {}",initial.reason.as_deref().unwrap_or("run identity already completed"));}
+        match receiver.recv() {
+            Ok(result)=>result,
+            Err(_)=>{let view=self.read_status(&root,&id)?;return Err(cli_completion_disconnect(&id,&view.phase,view.reason.as_deref()));}
+        }
+    }
+
     fn start_inner(
         &self,
         root: &Path,
         request: FusionRequest,
         revision: Option<u64>,
+        consultation: Option<ConsultRequest>,
+        mut legacy: Option<LegacyAdmission>,
     ) -> Result<RunView> {
         request.validate()?;
+        crate::consult::validate_question_before_reservation(&request.question)?;
         let root = fs::canonicalize(root)?;
-        let existing = namespace(&root, false)?.join(&request.request_id);
-        if fs::symlink_metadata(&existing).is_ok() {
-            real_dir(&existing, false)?;
-            let old: StoredRequest = read_json(&existing.join("request.json"))?;
-            if old.version != 1 || old.request != request {
-                bail!("request_id_conflict");
-            }
-            return self.read(&root, &request.request_id);
-        }
-        let config = fusion_roles::load_config(&root)?;
-        if revision.is_some_and(|expected| expected != config.revision) {
-            bail!("revision_conflict");
-        }
-        let selection = select_roles(&config, &request.combination_id)?;
+        let legacy_record=legacy.as_ref().map(|l|l.record.clone());
+        let attachments = if let Some(cli)=&legacy {
+            cli.inputs.attachments.iter().map(|a|CapturedAttachment {path:root.join(&a.relative_path),sha256:a.sha256.clone(),text:a.text.clone()}).collect()
+        } else { capture_inputs(&root, consultation.as_ref().map(|r| r.attachments.as_slice()).unwrap_or(&[]))? };
+        let select = || -> Result<(SelectedRoles, u64)> {
+            let (selection, config_revision) = if let Some(explicit) = &consultation {
+            (SelectedRoles { members: explicit.members.clone(), synthesizer: explicit.members[0].clone() }, 0)
+        } else {
+            let config = fusion_roles::load_config(&root)?;
+            if revision.is_some_and(|expected| expected != config.revision) { bail!("revision_conflict"); }
+            (select_roles(&config, &request.combination_id)?, config.revision)
+        };
         for role in selection
             .members
             .iter()
@@ -509,7 +690,10 @@ impl FusionEngine {
         {
             role_prompt(&request.question, role)?;
         }
-        let context = self.context_for(&root)?;
+            Ok((selection, config_revision))
+        };
+        let preselected = if namespace(&root, false)?.join(&request.request_id).exists() { None } else { Some(select()?) };
+        let context = match &legacy {Some(cli)=>cli.context.clone(),None=>self.context_for(&root)?};
         let base = namespace(&root, true)?;
         let lock_file = OpenOptions::new()
             .read(true)
@@ -522,12 +706,12 @@ impl FusionEngine {
             bail!("unsafe_run_lock");
         }
         let mut lock = fd_lock::RwLock::new(lock_file);
-        let guard = lock.try_write().context("run_busy")?;
+        let guard = lock.write().context("run_busy")?;
         let dir = base.join(&request.request_id);
         if fs::symlink_metadata(&dir).is_ok() {
             real_dir(&dir, false)?;
             let old: StoredRequest = read_json(&dir.join("request.json"))?;
-            if old.version != 1 || old.request != request {
+            if old.version != 1 || old.project != root || old.request != request || old.consultation != consultation || old.legacy != legacy_record || old.attachments != attachments {
                 bail!("request_id_conflict");
             }
             drop(guard);
@@ -544,28 +728,40 @@ impl FusionEngine {
             if !matches!(old.phase.as_str(), "completed" | "failed") {
                 bail!("project_has_unclosed_run");
             }
-            verified_completion(&old_dir, &bytes, &id)?;
+            verified_completion(&old_dir, &bytes, &id, old.legacy_artifacts)?;
             fs::remove_file(&active_path)?;
         }
+        let (selection, config_revision) = match preselected { Some(value) => value, None => select()? };
         let stored = StoredRequest {
             version: 1,
             request: request.clone(),
             selection,
-            revision: config.revision,
+            consultation,
+            legacy: legacy_record,
+            attachments,
+            revision: config_revision,
             head: crate::gitx::rev_parse(&root, "HEAD^{commit}")?,
             project: root.clone(),
             created_at: now(),
         };
+        if legacy.as_ref().is_some_and(|l|l.fixed_head!=stored.head) {bail!("head_changed_during_admission");}
+        let question = input_question(&stored);
+        for role in stored.selection.members.iter().chain(std::iter::once(&stored.selection.synthesizer).filter(|_| stored.consultation.is_none())) {
+            role_prompt(&question, role)?;
+        }
+        if serde_json::to_vec_pretty(&stored)?.len() > MAX_RECORD { bail!("request_record_too_large"); }
         real_dir(&dir, true)?;
+        let owner = owned_run_file(&dir)?;
         immutable(&dir.join("request.json"), &stored)?;
-        let view = RunView {
+        let mut view = RunView {
+            legacy_artifacts: stored.legacy.is_some(),
             id: request.request_id.clone(),
             phase: "preparing".into(),
             question: request.question.clone(),
             created_at: stored.created_at.clone(),
             project: root.clone(),
             head: stored.head.clone(),
-            config_revision: config.revision,
+            config_revision,
             members: stored
                 .selection
                 .members
@@ -574,6 +770,15 @@ impl FusionEngine {
                 .collect(),
             synthesis: RunMember::pending(&stored.selection.synthesizer),
             reason: None,
+        };
+        if stored.consultation.is_some() { view.synthesis.status = "skipped".into(); }
+        let preparation=match legacy.take() {Some(cli)=>prepare_cli_run(&dir,&stored,&mut view,cli),None=>prepare_run(&dir,&stored,&context,&mut view)};
+        let prepared = match preparation {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                finish_run(&dir, &mut view, "failed", Some(crate::observation::safe_observation_text(&error.to_string())))?;
+                return Ok(view);
+            }
         };
         publish(&dir.join("state.json"), &view)?;
         publish(&active_path, &request.request_id)?;
@@ -589,7 +794,8 @@ impl FusionEngine {
             .name("fusion-consultation".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_job(&worker_dir, &stored, &context, &mut worker_view)
+                    let _owner = owner;
+                    run_job(&worker_dir, &stored, &context, &mut worker_view, prepared)
                 }));
                 if !matches!(result, Ok(Ok(()))) {
                     if worker_view.phase == "preparing" {
@@ -631,13 +837,24 @@ impl FusionEngine {
     }
     /// Read a run and its digest-bound, size-limited answers without rerunning anything.
     pub fn read(&self, root: &Path, id: &str) -> Result<RunView> {
+        let mut view = self.read_status(root, id)?;
+        if !view.members.iter().chain(std::iter::once(&view.synthesis)).any(|m|m.status=="verified") { return Ok(view); }
+        let dir = namespace(root, false)?.join(id);
+        let dir = answer_base(&dir,&view)?;
+        let mut budget = 2 * 1024 * 1024;
+        for member in view.members.iter_mut().chain(std::iter::once(&mut view.synthesis)) { load_answer(&dir, member, &mut budget); }
+        Ok(view)
+    }
+    /// Read bounded lifecycle metadata without opening any member answer body.
+    /// An independently connected reader observes the owner's exclusive file lock.
+    pub fn read_status(&self, root: &Path, id: &str) -> Result<RunView> {
         identifier(id)?;
         let dir = namespace(root, false)?.join(id);
         real_dir(&dir, false)?;
         let bytes = read_bytes(&dir.join("state.json"), MAX_RECORD)?;
         let mut view: RunView = serde_json::from_slice(&bytes)?;
         if matches!(view.phase.as_str(), "completed" | "failed") {
-            verified_completion(&dir, &bytes, id)?;
+            verified_completion(&dir, &bytes, id, view.legacy_artifacts)?;
         }
         if view.id != id {
             bail!("run_identity_changed");
@@ -645,26 +862,38 @@ impl FusionEngine {
         if matches!(
             view.phase.as_str(),
             "preparing" | "consulting" | "synthesizing"
-        ) && !self
-            .active
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(&dir)
+        ) && !run_has_owner(&dir)?
         {
             view.phase = "hold".into();
             view.reason = Some("owner_unavailable_no_automatic_restart".into());
         }
-        let mut budget = 2 * 1024 * 1024;
-        for member in view
-            .members
-            .iter_mut()
-            .chain(std::iter::once(&mut view.synthesis))
-        {
-            load_answer(&dir, member, &mut budget);
-        }
+        for member in view.members.iter_mut().chain(std::iter::once(&mut view.synthesis)) { member.answer = None; }
         Ok(view)
     }
+
+    /// Read a bounded page only after full answer identity and digest validation.
+    /// Continuations require the prior page digest and a valid UTF-8 byte boundary.
+    pub fn read_answer_page(&self, root: &Path, id: &str, role_id: &str, offset: usize, limit: usize, expected_digest: Option<&str>) -> Result<AnswerPage> {
+        if limit == 0 || limit > 64 * 1024 || (offset > 0 && expected_digest.is_none()) { bail!("invalid_answer_page"); }
+        let mut view = self.read_status(root, id)?;
+        let selected=view.members.iter().chain(std::iter::once(&view.synthesis)).find(|m|m.role_id==role_id).context("member_not_found")?;
+        if selected.status!="verified" {bail!("answer_not_verified");}
+        let dir = answer_base(&namespace(root, false)?.join(id),&view)?;
+        let member = view.members.iter_mut().chain(std::iter::once(&mut view.synthesis)).find(|m| m.role_id == role_id).context("member_not_found")?;
+        let mut budget = MAX_ANSWER;
+        load_answer(&dir, member, &mut budget);
+        let answer = member.answer.as_ref().filter(|_| member.answer_status.as_deref() == Some("verified")).context("answer_not_verified")?;
+        let sha256 = digest(answer.as_bytes());
+        if expected_digest.is_some_and(|d| d != sha256) { bail!("answer_digest_changed"); }
+        if offset > answer.len() || !answer.is_char_boundary(offset) { bail!("invalid_answer_offset"); }
+        let mut end = offset.saturating_add(limit).min(answer.len());
+        while !answer.is_char_boundary(end) { end -= 1; }
+        if end == offset && offset < answer.len() { bail!("page_too_small_for_utf8"); }
+        Ok(AnswerPage { text: answer[offset..end].into(), sha256, total_bytes: answer.len(), next_offset: (end < answer.len()).then_some(end) })
+    }
     /// Return at most fifty summaries from a bounded 512-entry window, without answer bodies.
+    /// Active runs use the same cross-process owner lock as status reads; unsafe lock
+    /// metadata fails the listing instead of guessing whether another owner is alive.
     pub fn list(&self, root: &Path) -> Result<Vec<RunSummary>> {
         let base = namespace(root, false)?;
         if !base.exists() {
@@ -687,18 +916,14 @@ impl FusionEngine {
                 continue;
             }
             if matches!(view.phase.as_str(), "completed" | "failed")
-                && verified_completion(&item.path(), &bytes, &name).is_err()
+                && verified_completion(&item.path(), &bytes, &name, view.legacy_artifacts).is_err()
             {
                 view.phase = "hold".into();
             }
             if matches!(
                 view.phase.as_str(),
                 "preparing" | "consulting" | "synthesizing"
-            ) && !self
-                .active
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(&item.path())
+            ) && !run_has_owner(&item.path())?
             {
                 view.phase = "hold".into();
             }
@@ -740,6 +965,14 @@ fn publish_state(dir: &Path, view: &RunView) -> Result<()> {
         role.answer = None;
     }
     publish(&dir.join("state.json"), &stored)
+}
+fn answer_base(dir: &Path, view: &RunView) -> Result<PathBuf> {
+    if !view.legacy_artifacts {return Ok(dir.to_path_buf());}
+    identifier(&view.id)?;
+    if fs::canonicalize(&view.project)?!=view.project {bail!("legacy_project_identity_changed");}
+    let mut base=view.project.clone();
+    for component in ["coordination","consultations",view.id.as_str()] {base.push(component);real_dir(&base,false)?;}
+    Ok(base)
 }
 fn load_answer(dir: &Path, member: &mut RunMember, budget: &mut usize) {
     member.answer = None;
@@ -841,11 +1074,19 @@ fn load_answer(dir: &Path, member: &mut RunMember, budget: &mut usize) {
     }
 }
 
-fn snapshot_hash(dir: &Path) -> Result<Option<String>> {
-    let path = dir.join("harness-snapshot.json");
+fn snapshot_hash(dir: &Path, legacy: bool) -> Result<Option<String>> {
+    // The digest-bound run layout selects authority, never incidental file presence.
+    let path = dir.join(if legacy {"harness-snapshot.yaml"} else {"harness-snapshot.json"});
     match fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         _ => Ok(Some(digest(&read_bytes(&path, MAX_RECORD)?))),
+    }
+}
+fn native_snapshot_hash(dir: &Path) -> Result<Option<String>> {
+    let path=dir.join("harness-native.json");
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>Ok(None),
+        _=>Ok(Some(digest(&read_bytes(&path,MAX_RECORD)?))),
     }
 }
 fn finish_run(dir: &Path, view: &mut RunView, phase: &str, reason: Option<String>) -> Result<()> {
@@ -861,7 +1102,7 @@ fn finish_run(dir: &Path, view: &mut RunView, phase: &str, reason: Option<String
     {
         member.answer = None;
     }
-    let snapshot = snapshot_hash(dir)?;
+    let snapshot = snapshot_hash(dir,view.legacy_artifacts)?;
     for member in view.members.iter().chain(std::iter::once(&view.synthesis)) {
         if let Some(expected) = member
             .channel_facts
@@ -876,7 +1117,7 @@ fn finish_run(dir: &Path, view: &mut RunView, phase: &str, reason: Option<String
     let bytes = serde_json::to_vec_pretty(view)?;
     immutable(
         &dir.join("complete.json"),
-        &json!({"version":1,"id":view.id,"stateSha256":digest(&bytes),"snapshotSha256":snapshot,"requestSha256":digest(&read_bytes(&dir.join("request.json"),MAX_RECORD)?)}),
+        &json!({"version":1,"id":view.id,"stateSha256":digest(&bytes),"snapshotSha256":snapshot,"nativeSnapshotSha256":native_snapshot_hash(dir)?,"requestSha256":digest(&read_bytes(&dir.join("request.json"),MAX_RECORD)?)}),
     )?;
     publish_state(dir, view)?;
     // A completed state permits recovery if a concurrent short reservation lock
@@ -896,9 +1137,10 @@ fn finish_run(dir: &Path, view: &mut RunView, phase: &str, reason: Option<String
     }
     Ok(())
 }
-fn verified_completion(dir: &Path, bytes: &[u8], id: &str) -> Result<()> {
+fn verified_completion(dir: &Path, bytes: &[u8], id: &str, legacy: bool) -> Result<()> {
     let proof: Value = read_json(&dir.join("complete.json"))?;
-    if proof["snapshotSha256"].as_str() != snapshot_hash(dir)?.as_deref() {
+    if proof["snapshotSha256"].as_str() != snapshot_hash(dir,legacy)?.as_deref()
+        || proof["nativeSnapshotSha256"].as_str() != native_snapshot_hash(dir)?.as_deref() {
         bail!("run_snapshot_changed");
     }
     if proof["version"] != 1
@@ -944,10 +1186,8 @@ fn update_member(
     slot.reason = outcome.reason.clone();
     slot.channel_facts = outcome.channel_facts.clone();
     slot.channel_diagnostic = crate::consult::ChannelDiagnostic::from_outcome(outcome);
-    let path = format!(
-        "{phase}/fusion/{}-{}.manifest.json",
-        outcome.index, outcome.member
-    );
+    let prefix=if phase.is_empty(){String::new()}else{format!("{phase}/")};
+    let path = format!("{prefix}fusion/{}-{}.manifest.json",outcome.index,outcome.member);
     let bytes = read_bytes(&dir.join(&path), MAX_RECORD)?;
     slot.artifact = Some(ArtifactRef {
         manifest: path,
@@ -968,16 +1208,25 @@ fn update_member(
     slot.answer = None;
     Ok(())
 }
-fn run_job(
+fn prepare_cli_run(dir: &Path, stored: &StoredRequest, view: &mut RunView, cli: LegacyAdmission) -> Result<PreparedRun> {
+    let mut choices=Vec::new();
+    for (index,alias) in cli.record.aliases.iter().enumerate() {
+        let tuple=cli.snapshot.inspect_configured(alias,crate::harness_config::HarnessAction::Consult).ok()
+            .map(|r|InvocationTuple {provider:r.provider().map(str::to_owned),model:r.model().map(str::to_owned),effort:r.effort().map(str::to_owned),mode:r.mode().map(str::to_owned)}).unwrap_or_default();
+        view.members[index].tuple=tuple.clone();view.members[index].name=alias.clone();
+        choices.push((alias.clone(),stored.selection.members[index].clone(),tuple));
+    }
+    crate::consult::write_new_regular(&dir.join("harness-snapshot.yaml"),cli.snapshot.source_bytes())?;
+    immutable(&dir.join("harness-native.json"),&cli.provenance)?;
+    Ok(PreparedRun {snapshot:cli.snapshot.clone(),choices,legacy:Some(cli)})
+}
+fn prepare_run(
     dir: &Path,
     stored: &StoredRequest,
     context: &DiscoveryContext,
     view: &mut RunView,
-) -> Result<()> {
-    let scan = match native_discovery::discover_with_context(context) {
-        Ok(scan) => scan,
-        Err(_) => return finish_run(dir, view, "failed", Some("native_discovery_failed".into())),
-    };
+) -> Result<PreparedRun> {
+    let scan = native_discovery::discover_with_context(context)?;
     let mut choices = Vec::new();
     for (index, role) in stored
         .selection
@@ -987,7 +1236,7 @@ fn run_job(
         .chain(std::iter::once((
             stored.selection.members.len(),
             &stored.selection.synthesizer,
-        )))
+        )).filter(|_| stored.consultation.is_none()))
     {
         let alias = if index == stored.selection.members.len() {
             "fusion-synthesis".into()
@@ -995,7 +1244,17 @@ fn run_job(
             format!("fusion-{index}")
         };
         let row = scan.harnesses.iter().find(|h| h.id == role.harness);
+        if stored.consultation.is_some() && row.is_none_or(|h| h.availability != "supported" || !h.enabled || h.executable.is_none()) {
+            bail!("consultation_harness_unavailable");
+        }
         let mut native = row.map(|h| h.native.current.clone()).unwrap_or_default();
+        // Explicit consultation aliases retain their captured project/action pins.
+        // The Web role editor still follows native defaults unless a role pins them.
+        if stored.consultation.is_some() {
+            if let Some(row) = row {
+                native = fusion_roles::resolve_tuple(&native, &row.configured);
+            }
+        }
         // These are consultation action defaults, not inferred native model settings.
         if native.mode.is_none() {
             native.mode = match row.map(|h| h.driver.as_str()) {
@@ -1022,28 +1281,42 @@ fn run_job(
         provenance,
     )?;
     crate::consult::write_new_regular(&dir.join("harness-snapshot.json"), snapshot.source_bytes())?;
+    Ok(PreparedRun { snapshot, choices, legacy: None })
+}
+struct PreparedRun {
+    legacy: Option<LegacyAdmission>,
+    snapshot: crate::harness_config::HarnessConfigSnapshot,
+    choices: Vec<(String, FusionRole, InvocationTuple)>,
+}
+fn run_job(dir: &Path, stored: &StoredRequest, context: &DiscoveryContext, view: &mut RunView, prepared: PreparedRun) -> Result<()> {
+    let PreparedRun { snapshot, choices, legacy } = prepared;
+    let question = input_question(stored);
     view.phase = "consulting".into();
     for member in &mut view.members {
         member.status = "running".into();
     }
     publish_state(dir, view)?;
     let question_path = dir.join("question.md");
-    crate::consult::write_new_regular(&question_path, stored.request.question.as_bytes())?;
+    crate::consult::write_new_regular(&question_path, question.as_bytes())?;
     let aliases = choices[..view.members.len()]
         .iter()
         .map(|c| c.0.clone())
         .collect::<Vec<_>>();
     let prompts = choices[..view.members.len()]
         .iter()
-        .map(|(alias, role, _)| Ok((alias.clone(), role_prompt(&stored.request.question, role)?)))
+        .map(|(alias, role, _)| Ok((alias.clone(), role_prompt(&question, role)?)))
         .collect::<Result<BTreeMap<_, _>>>()?;
+    let first_skeleton=if legacy.is_some() {crate::consult::create_consultation_skeleton_for_id(&stored.project,&stored.request.request_id)?} else {skeleton(dir,"members",&stored.request.request_id)?};
+    let first_base=if legacy.is_some(){first_skeleton.dir.clone()}else{dir.to_path_buf()};
+    let first_phase=if legacy.is_some(){""}else{"members"};
+    let first_inputs=match &legacy {Some(cli)=>cli.inputs.clone(),None=>crate::consult::capture_literal_inputs(&stored.project,&question_path,&question)?};
     let first = {
         let mut observer = |outcome: &MemberOutcome| -> Result<()> {
             let slot = view
                 .members
                 .get_mut(outcome.index)
                 .context("invalid_member_slot")?;
-            update_member(dir, "members", slot, outcome)?;
+            update_member(&first_base, first_phase, slot, outcome)?;
             publish_state(dir, view)
         };
         crate::consult::run_role_wave(
@@ -1051,32 +1324,45 @@ fn run_job(
             &crate::consult::ConsultArgs {
                 question: question_path,
                 harnesses: aliases,
-                member_timeout_secs: None,
-                total_wall_secs: Some(900),
+                member_timeout_secs: legacy.as_ref().and_then(|c|c.record.member_timeout_secs),
+                total_wall_secs: legacy.as_ref().map(|c|c.record.total_wall_secs).unwrap_or(Some(900)),
                 attachments: Vec::new(),
             },
             crate::consult::RoleWaveV1 {
                 fixed_head: stored.head.clone(),
                 snapshot: snapshot.clone(),
                 prompts,
-                skeleton: skeleton(dir, "members", &stored.request.request_id)?,
+                skeleton: first_skeleton,
                 native_context: context.clone(),
+                inputs: first_inputs,
+                native_role: legacy.is_none(),
+                legacy_log: legacy.is_some(),
                 observer: &mut observer,
             },
         )
     };
     let mut first = match first {
         Ok(result) => result,
-        Err(_) => {
+        Err(error) => {
             view.phase = "hold".into();
             view.reason = Some("consultation_evidence_or_lifecycle_unclosed".into());
-            return publish_state(dir, view);
+            publish_state(dir, view)?;
+            // Preserve the original synchronous CLI diagnostic after retaining
+            // durable HOLD evidence; this never turns an unclosed run successful.
+            if let Some(cli)=legacy {let _=cli.completion.send(Err(error));}
+            return Ok(());
         }
     };
     if first.members.iter().any(held) {
         view.phase = "hold".into();
         view.reason = Some("member_lifecycle_unclosed".into());
         return publish_state(dir, view);
+    }
+    if stored.consultation.is_some() {
+        let phase = if first.members.iter().all(valid_answer) { "completed" } else { "failed" };
+        finish_run(dir, view, phase, (phase == "failed").then(|| "consultation_member_failed".into()))?;
+        if let Some(cli)=legacy {let _=cli.completion.send(Ok(first));}
+        return Ok(());
     }
     for member in &mut first.members {
         let role = &stored.selection.members[member.index];
@@ -1095,6 +1381,7 @@ fn run_job(
     publish_state(dir, view)?;
     let input_path = dir.join("synthesis-input.md");
     crate::consult::write_new_regular(&input_path, input.as_bytes())?;
+    let second_inputs=crate::consult::capture_literal_inputs(&stored.project,&input_path,&input)?;
     let second = {
         let mut observer = |outcome: &MemberOutcome| -> Result<()> {
             update_member(dir, "synthesis", &mut view.synthesis, outcome)?;
@@ -1115,6 +1402,9 @@ fn run_job(
                 prompts: BTreeMap::from([("fusion-synthesis".into(), synthesis_prompt)]),
                 skeleton: skeleton(dir, "synthesis", &stored.request.request_id)?,
                 native_context: context.clone(),
+                inputs: second_inputs,
+                native_role: true,
+                legacy_log: false,
                 observer: &mut observer,
             },
         )
@@ -1140,4 +1430,44 @@ fn run_job(
             publish_state(dir, view)
         }
     }
+}
+
+#[cfg(test)]
+mod namespace_initialization_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn disconnected_cli_reports_durable_terminal_phase() {
+        for phase in ["completed", "failed"] {
+            let message=cli_completion_disconnect("run",phase,Some("persisted reason")).to_string();
+            assert!(message.contains(phase));
+            assert!(!message.contains("HOLD"), "{message}");
+            assert!(message.contains("persisted reason"));
+        }
+        for phase in ["preparing", "consulting", "synthesizing", "hold"] {
+            assert!(cli_completion_disconnect("run",phase,None).to_string().contains("HOLD"));
+        }
+    }
+    #[test]
+    fn concurrent_initialization_preserves_directory_and_rejects_symlink() {
+        use std::sync::Barrier;
+        let root=crate::util::test_scratch_dir("concurrent namespace");
+        for n in 0..16 {
+            let path=root.join(n.to_string());let barrier=Arc::new(Barrier::new(8));
+            std::thread::scope(|scope| {
+                let handles=(0..8).map(|_| {let path=path.clone();let barrier=barrier.clone();scope.spawn(move ||{barrier.wait();real_dir(&path,true)})}).collect::<Vec<_>>();
+                for handle in handles {handle.join().unwrap().unwrap();}
+            });
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777,0o700);
+        }
+        let link=root.join("link");std::os::unix::fs::symlink(root.join("0"),&link).unwrap();
+        assert!(real_dir(&link,true).is_err());let file=root.join("file");fs::write(&file,"x").unwrap();assert!(real_dir(&file,true).is_err());
+    }
+}
+
+fn cli_completion_disconnect(id: &str, phase: &str, reason: Option<&str>) -> anyhow::Error {
+    if matches!(phase,"completed"|"failed") {
+        return anyhow::anyhow!("consultation {id} has verified terminal state {phase}, but its CLI result delivery was interrupted: {}",reason.unwrap_or("read the persisted run and verified answers"));
+    }
+    anyhow::anyhow!("consultation {id} remains unclosed (HOLD): {}", reason.unwrap_or("worker ended without a closed result"))
 }

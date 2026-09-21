@@ -1597,6 +1597,9 @@ pub fn contract_digest_of_mode(mode_yaml: &str) -> Result<String> {
         .as_object_mut()
         .context("ModeConfig contract projection 非 object")?
         .remove("budgets");
+    // ACP enables serde_json::preserve_order in workspace builds. Preserve the
+    // established BTreeMap ordering for every nested object before signing.
+    projection.sort_all_objects();
     let normalized =
         serde_json::to_vec(&projection).context("序列化 ModeConfig contract projection 失败")?;
     Ok(source_sha256(&normalized))
@@ -2965,12 +2968,15 @@ pub fn parse_signed_round_ir(yaml: &str) -> std::result::Result<RoundIr, String>
     crate::legacy::decode_round_ir_v1_v2(yaml, schema)
 }
 
+/// Hash the historical canonical contract independently of dependency map-order features.
 pub fn validation_digest(ir: &RoundIr) -> String {
     let mut contract = serde_json::to_value(ir).expect("RoundIr serialization is infallible");
     contract
         .as_object_mut()
         .expect("RoundIr serializes as an object")
         .remove("budgets");
+    // Match historical sorted maps even when ACP enables preserve_order.
+    contract.sort_all_objects();
     let normalized =
         serde_json::to_vec(&contract).expect("RoundIr contract serialization is infallible");
     let digest = Sha256::digest(normalized);
@@ -3052,6 +3058,16 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+// Preserve EventRecord's established typed field order while normalizing only
+// opaque JSON maps, which were sorted before preserve_order feature unification.
+fn runtime_policy_event_bytes(event: &EventRecord) -> Result<Vec<u8>> {
+    let mut event=event.clone();
+    if let Some(payload)=&mut event.payload {payload.sort_all_objects();}
+    event.extra.sort_keys();
+    for value in event.extra.values_mut() {value.sort_all_objects();}
+    Ok(serde_json::to_vec(&event)?)
+}
+
 fn policy_config_sha256(node: &serde_yaml::Value) -> Result<String> {
     let mut value =
         serde_json::to_value(node).context("runtime policy config 无法 canonicalize")?;
@@ -3060,6 +3076,7 @@ fn policy_config_sha256(node: &serde_yaml::Value) -> Result<String> {
         .context("runtime policy descriptor 必须是 mapping")?;
     object.remove("initialState");
     object.remove("carryForward");
+    value.sort_all_objects();
     Ok(sha256_bytes(&serde_json::to_vec(&value)?))
 }
 
@@ -3303,7 +3320,7 @@ fn verify_policy_carry_forward(
     {
         bail!("carryForward source activation tuple 漂移");
     }
-    let canonical = serde_json::to_vec(event)?;
+    let canonical = runtime_policy_event_bytes(event)?;
     if sha256_bytes(&canonical) != carry.source_event_sha256 {
         bail!("carryForward sourceEventSha256 漂移");
     }
@@ -3336,7 +3353,8 @@ fn verify_policy_carry_forward(
     let source_yaml: serde_yaml::Value =
         serde_yaml::from_slice(&source_binding).context("carryForward source binding 非 YAML")?;
     let source_node = yaml_policy_node(&source_yaml, policy)?;
-    let source_raw = serde_json::to_value(source_node)?;
+    let mut source_raw = serde_json::to_value(source_node)?;
+    source_raw.sort_all_objects();
     if sha256_bytes(&serde_json::to_vec(&source_raw)?) != carry.source_policy_sha256
         || policy_config_sha256(source_node)? != current_config_sha256
     {
@@ -3417,8 +3435,9 @@ pub fn resolve_runtime_policy_at(
     if !matches!(initial_state.as_str(), "dormant" | "active") {
         bail!("runtime policy initialState 必须为 dormant|active");
     }
-    let policy_json =
+    let mut policy_json =
         serde_json::to_value(node).context("runtime policy subtree 无法 canonicalize")?;
+    policy_json.sort_all_objects();
     let policy_sha256 = sha256_bytes(&serde_json::to_vec(&policy_json)?);
     let config_sha256 = policy_config_sha256(node)?;
     let carry_forward = policy_node_carry_forward(node)?;
@@ -5317,6 +5336,14 @@ verification: {independentVerifier: required-for-write}
         input.has_seeds = false;
         let error = compile_ir("r1", MODE, BINDING, &[input]).unwrap_err();
         assert!(error.to_string().contains("seed"));
+    }
+
+    #[test]
+    fn runtime_policy_event_digest_retains_historical_typed_and_map_order() {
+        let event: EventRecord=serde_json::from_str(r#"{"eventId":"e","ts":"t","actor":"a","type":"X","payload":{"z":1,"a":{"z":2,"a":3}},"zz":{"z":2,"a":1},"aa":1}"#).unwrap();
+        let canonical=runtime_policy_event_bytes(&event).unwrap();
+        assert_eq!(String::from_utf8(canonical).unwrap(), r#"{"eventId":"e","ts":"t","actor":"a","type":"X","payload":{"a":{"a":3,"z":2},"z":1},"aa":1,"zz":{"a":1,"z":2}}"#);
+        assert_eq!(event.extra["zz"]["z"],2);
     }
 
     #[test]

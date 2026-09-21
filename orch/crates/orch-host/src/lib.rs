@@ -56,6 +56,8 @@ pub mod native_discovery;
 pub mod fusion_roles;
 /// Explicit role consultation staged for the authorized r91 delivery.
 pub mod fusion_run;
+/// Shared personal setup and compatibility helper entry points.
+pub mod openorch_helper;
 #[cfg(feature = "selfhost")]
 pub mod hooks;
 #[cfg(feature = "selfhost")]

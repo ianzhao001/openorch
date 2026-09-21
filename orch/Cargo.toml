@@ -1,4 +1,4 @@
 [workspace]
 resolver = "2"
 default-members = ["crates/orch-cli"]
-members = ["crates/orch-core", "crates/orch-host", "crates/orch-cli", "crates/orch-ui"]
+members = ["crates/orch-core", "crates/orch-host", "crates/orch-cli", "crates/orch-ui", "crates/orch-mcp", "crates/orch-acp"]

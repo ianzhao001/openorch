@@ -56,6 +56,8 @@ file.write_text(json.dumps(s))
 with tempfile.TemporaryDirectory(prefix='b337-',dir=PARENT) as t:
     base=Path(t);runtime=base/'runtime input';runtime.mkdir()
     core=runtime/'orch';core.write_text('#!/bin/sh\nif [ "$1" = "--version" ]; then echo "orch 0.1.0"; else echo "orch guide: OK · commands=6 sections=10 invariants=4 wakeActions=4 dispositions=4"; fi\n');core.chmod(0o755)
+    for name in ['orch-mcp','orch-acp']:
+        p=runtime/name;p.write_text('#!/bin/sh\necho \"'+name+' 0.1.0\"\n');p.chmod(0o755)
     for name in ['wake-multica.sh','wake-dsh-stream.sh','wake-pi-stream.sh','wake-zcode-stream.sh']:
         p=runtime/'scripts'/name;p.parent.mkdir(exist_ok=True);p.write_text('#!/bin/sh\nexit 0\n');p.chmod(0o755)
     (runtime/'LICENSE').write_text('MIT fixture license\n')
@@ -66,13 +68,16 @@ with tempfile.TemporaryDirectory(prefix='b337-',dir=PARENT) as t:
     dsh=json.loads((plugin/'package.json').read_text())
     assert manifest['name']=='openorch' and manifest['version']=='0.1.0-alpha.4'
     assert dsh['name']=='openorch' and dsh['version']==manifest['version']
+    assert manifest['mcpServers']=='./.mcp.json'
+    mcp=json.loads((plugin/'.mcp.json').read_text());assert mcp['mcpServers']['openorch']['command']=='./scripts/openorch-mcp.py'
+    assert (plugin/'scripts/openorch-mcp.py').is_file()
     assert (plugin/dsh['dsh']['bundle']['patch']).is_file()
     skill=plugin/'skills/openorch/SKILL.md';assert skill.is_file()
     agents=plugin/'AGENTS.md';assert agents.read_bytes()==(SOURCE/'plugins/openorch/AGENTS.md').read_bytes()
     full_inventory=json.loads((bundle/'manifest.json').read_text())['files']
     assert full_inventory['plugins/openorch/AGENTS.md']=={'sha256':hashlib.sha256(agents.read_bytes()).hexdigest(),'bytes':len(agents.read_bytes())}
     inventory=json.loads((plugin/'runtime/manifest.json').read_text())
-    expected={'orch','scripts/wake-multica.sh','scripts/wake-dsh-stream.sh','scripts/wake-pi-stream.sh','scripts/wake-zcode-stream.sh'}
+    expected={'orch','orch-mcp','orch-acp','scripts/wake-multica.sh','scripts/wake-dsh-stream.sh','scripts/wake-pi-stream.sh','scripts/wake-zcode-stream.sh'}
     assert set(inventory['files'])==expected
     for name,item in inventory['files'].items():
         data=(plugin/'runtime'/name).read_bytes();assert item=={'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data)}
@@ -82,6 +87,25 @@ with tempfile.TemporaryDirectory(prefix='b337-',dir=PARENT) as t:
     assert catalog['plugins'][0]['policy']=={'installation':'AVAILABLE','authentication':'ON_INSTALL'}
 
     if CASE=='package':
+        for protocol in ['orch-mcp','orch-acp']:
+            for fault in ['missing','mode','version']:
+                bad_protocol=base/(protocol+'-'+fault);shutil.copytree(runtime,bad_protocol);p=bad_protocol/protocol
+                if fault=='missing':p.unlink()
+                elif fault=='mode':p.chmod(0o644)
+                else:p.write_text('#!/bin/sh\necho wrong-version\n')
+                assert run([sys.executable,SOURCE/'plugins/openorch/scripts/package.py','--runtime-dir',bad_protocol,'--output',base/(protocol+'-'+fault+'-bundle'),'--version','0.1.0-alpha.4'],ok=False).returncode==2
+        hybrid=base/'hybrid-legacy';shutil.copytree(bundle,hybrid)
+        hybrid_runtime=hybrid/'plugins/openorch/runtime/manifest.json';rv=json.loads(hybrid_runtime.read_text())
+        inventory_path=hybrid/'manifest.json';iv=json.loads(inventory_path.read_text())
+        for protocol in ['orch-mcp','orch-acp']:
+            (hybrid/'plugins/openorch/runtime'/protocol).unlink();rv['files'].pop(protocol);iv['files'].pop('plugins/openorch/runtime/'+protocol)
+        hybrid_runtime.write_text(json.dumps(rv));data=hybrid_runtime.read_bytes();iv['files']['plugins/openorch/runtime/manifest.json']={'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data)};inventory_path.write_text(json.dumps(iv))
+        import importlib.util
+        sys.dont_write_bytecode=True
+        spec=importlib.util.spec_from_file_location('installed_checker',SOURCE/'plugins/openorch/scripts/install.py');checker=importlib.util.module_from_spec(spec);spec.loader.exec_module(checker)
+        try:checker.verify_bundle(hybrid,legacy_runtime=True)
+        except checker.InstallError:pass
+        else:raise AssertionError('MCP metadata must not downgrade to a five-resource legacy runtime')
         bad=base/'bad-runtime';shutil.copytree(runtime,bad);(bad/'scripts/wake-pi-stream.sh').unlink()
         assert run([sys.executable,SOURCE/'plugins/openorch/scripts/package.py','--runtime-dir',bad,'--output',base/'bad-bundle','--version','0.1.0-alpha.4'],ok=False).returncode!=0
         linked=base/'linked-runtime';shutil.copytree(runtime,linked);p=linked/'scripts/wake-dsh-stream.sh';p.unlink();p.symlink_to(runtime/'scripts/wake-dsh-stream.sh')
@@ -98,6 +122,14 @@ with tempfile.TemporaryDirectory(prefix='b337-',dir=PARENT) as t:
         assert len([x for x in state['installed'] if x['pluginId']=='openorch@openorch'])==1
         assert 'openorch' in state['dsh']
         used=Path(state['dsh']['openorch']['path']);assert used.is_relative_to(prefix) and (used/'runtime/orch').is_file()
+        newer=base/'newer-bundle'
+        run([sys.executable,SOURCE/'plugins/openorch/scripts/package.py','--runtime-dir',runtime,'--output',newer,'--version','0.1.0-alpha.5'])
+        run([sys.executable,newer/'install.py','--bundle',newer,'--prefix',prefix,'--host','codex','--codex-bin',bins/'codex'])
+        assert json.loads((bins/'state.json').read_text())['installed'][0]['version']=='0.1.0-alpha.5'
+        assert (used/'runtime/orch').is_file() and sentinel.read_text()=='keep personal choices'
+        run([sys.executable,bundle/'install.py','--bundle',bundle,'--prefix',prefix,'--host','codex','--codex-bin',bins/'codex'])
+        assert json.loads((bins/'state.json').read_text())['installed'][0]['version']=='0.1.0-alpha.4'
+        assert (prefix/'versions/0.1.0-alpha.5/plugins/openorch/runtime/orch-mcp').is_file()
         run([sys.executable,bundle/'install.py','--bundle',bundle,'--prefix',prefix,'--host','codex','--codex-bin',bins/'codex','--uninstall'])
         state=json.loads((bins/'state.json').read_text());assert not state['installed'] and 'openorch' in state['dsh']
         assert (used/'runtime/orch').is_file() and sentinel.read_text()=='keep personal choices'
@@ -108,6 +140,11 @@ with tempfile.TemporaryDirectory(prefix='b337-',dir=PARENT) as t:
         assert run(args,ok=False).returncode!=0
         assert (bins/'state.json').read_bytes()==before
         (bins/'state.json').write_bytes(good_state)
+        for protocol in ['orch-mcp','orch-acp']:
+            damaged_protocol=used/'runtime'/protocol;original=damaged_protocol.read_bytes();damaged_protocol.write_text('tampered')
+            assert run(args,ok=False).returncode!=0
+            assert (bins/'state.json').read_bytes()==good_state
+            damaged_protocol.write_bytes(original)
         damaged=used/'runtime/scripts/wake-dsh-stream.sh';damaged.write_text('tampered')
         assert run(args,ok=False).returncode!=0
     elif CASE=='loader':

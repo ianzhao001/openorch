@@ -1962,7 +1962,7 @@ mod tests {
     fn native_monitor_group_aba_holds_before_any_stop() {
         struct Stop(PathBuf);impl Drop for Stop {fn drop(&mut self){let _=Command::new("git").args(["fsmonitor--daemon","stop"]).current_dir(&self.0).output();}}
         let (root,members,events)=retired_group_fixture();let wt=root.join(&members[0].worktree);let _stop=Stop(wt.clone());
-        assert!(Command::new("git").args(["-c","core.fsmonitor=true","fsmonitor--daemon","start"]).current_dir(&wt).output().unwrap().status.success());
+        assert!(Command::new("git").args(["-c","core.fsmonitor=true","fsmonitor--daemon","start"]).current_dir(&wt).env("HOME", &wt).output().unwrap().status.success());
         let p=root.join(format!("coordination/runtime/site-cleanup/rMaint/{}.json",members[0].site_id));fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(&p,serde_json::to_vec(&serde_json::json!({"version":1,"round":"rMaint","site":members[0],"phase":"complete","quarantine":null,"note":null})).unwrap()).unwrap();
         let result=crate::sites::maintain_equivalent_implementations(&root,"rMaint",&events,&members,false,&||true);

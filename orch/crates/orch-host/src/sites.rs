@@ -2564,7 +2564,7 @@ mod native_monitor_tests {
         }
     }
     struct Owned(PathBuf);
-    impl Owned { fn start(wt: PathBuf)->Self { let o=Command::new("git").args(["--no-optional-locks","-c","core.fsmonitor=true","fsmonitor--daemon","start"]).current_dir(&wt).output().unwrap();assert!(o.status.success());Self(wt) } }
+    impl Owned { fn start(wt: PathBuf)->Self { let o=Command::new("git").args(["--no-optional-locks","-c","core.fsmonitor=true","fsmonitor--daemon","start"]).env("HOME", &wt).current_dir(&wt).output().unwrap();assert!(o.status.success());Self(wt) } }
     impl Drop for Owned { fn drop(&mut self) { if self.0.exists() {let _=native_monitor_command(&self.0,"stop");} } }
     fn fixture(tag: &str) -> (PathBuf, crate::sites::Site, Vec<EventRecord>) {
         use sha2::Digest;

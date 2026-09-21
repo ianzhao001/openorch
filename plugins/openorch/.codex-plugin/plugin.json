@@ -1,6 +1,6 @@
 {
   "name": "openorch",
-  "version": "0.1.0-alpha.10",
+  "version": "0.1.0-alpha.11",
   "description": "Consult your installed AI harnesses and combine their answers in Codex or DSH.",
   "author": {
     "name": "ianzhao"
@@ -21,5 +21,6 @@
       "Use OpenOrch to consult my default advisor.",
       "Use OpenOrch fusion and summarize the disagreements."
     ]
-  }
+  },
+  "mcpServers": "./.mcp.json"
 }

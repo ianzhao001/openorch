@@ -169,7 +169,7 @@ impl Fixture {
 struct Monitor { wt: PathBuf, ipc: PathBuf }
 impl Monitor {
     fn command(wt: &Path, verb: &str) -> std::process::Output {
-        Command::new("git").args(["--no-optional-locks", "-c", "core.fsmonitor=true", "fsmonitor--daemon", verb]).current_dir(wt).output().unwrap()
+        Command::new("git").args(["--no-optional-locks", "-c", "core.fsmonitor=true", "fsmonitor--daemon", verb]).current_dir(wt).env("HOME", wt).output().unwrap()
     }
     fn start(wt: PathBuf) -> Self {
         let ipc = PathBuf::from(git(&wt, &["rev-parse", "--git-path", "fsmonitor--daemon.ipc"]));

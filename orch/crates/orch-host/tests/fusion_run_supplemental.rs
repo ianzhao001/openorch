@@ -306,7 +306,7 @@ fn real_parallel_roles_forward_native_config_and_freeze_input_before_single_synt
     assert!(engine.read(&f.root, "run-one").is_err());
 }
 #[test]
-fn partial_answers_survive_and_an_unowned_pending_run_is_never_reexecuted() {
+fn partial_answers_survive_and_an_independent_reader_does_not_restart_live_work() {
     let f = Fixture::new();
     let mut c = f.config.clone();
     c.roles[0].instructions = "fixture:fail".into();
@@ -316,7 +316,7 @@ fn partial_answers_survive_and_an_unowned_pending_run_is_never_reexecuted() {
     f.wait_started("fail");
     f.wait_started("beta");
     let another = f.engine();
-    assert_eq!(another.read(&f.root, "partial").unwrap().phase, "hold");
+    assert_eq!(another.read(&f.root, "partial").unwrap().phase, "consulting");
     assert!(another.start(&f.root, f.request("do-not-restart")).is_err());
     assert_eq!(f.calls().len(), 2);
     f.release();
@@ -434,4 +434,103 @@ fn concurrent_duplicate_requests_never_duplicate_native_work() {
         e.start(&f.root, f.request("concurrent")).unwrap().id,
         "concurrent"
     );
+}
+
+
+fn explicit(f: &Fixture, id: &str) -> orch_host::fusion_run::ConsultRequest {
+    orch_host::fusion_run::ConsultRequest { request_id:id.into(),question:"Assess the evidence.".into(),members:vec![f.config.roles[0].clone()],attachments:vec![] }
+}
+#[test]
+fn separate_process_metadata_reader() {
+    let Some(root)=std::env::var_os("ORCH_TEST_B364_READER_ROOT") else {return};
+    assert_eq!(FusionEngine::new().read_status(Path::new(&root),"cross-process").unwrap().phase,"consulting");
+    let entries=FusionEngine::new().list(Path::new(&root)).unwrap();
+    assert_eq!(entries.iter().find(|entry|entry.id=="cross-process").unwrap().phase,"consulting");
+}
+#[test]
+fn another_process_observes_owner_without_owning_jobs() {
+    let f=Fixture::new();let e=f.engine();e.start_consult(&f.root,explicit(&f,"cross-process")).unwrap();f.wait_started("alpha");
+    let output=Command::new(std::env::current_exe().unwrap()).args(["--exact","separate_process_metadata_reader","--nocapture"]).env("ORCH_TEST_B364_READER_ROOT",&f.root).output().unwrap();
+    f.release();assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stdout));assert_eq!(f.wait(&e,"cross-process").phase,"completed");
+}
+#[test]
+fn ownerless_unfinished_run_is_hold_without_replay() {
+    let f=Fixture::new();f.release();let e=f.engine();let q=explicit(&f,"lost-owner");e.start_consult(&f.root,q.clone()).unwrap();f.wait(&e,"lost-owner");drop(e);
+    let state=f.root.join(".orch/fusion-runs/lost-owner/state.json");let mut v:Value=serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();v["phase"]="consulting".into();fs::write(state,serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    let reader=f.engine();assert_eq!(reader.read_status(&f.root,"lost-owner").unwrap().phase,"hold");assert_eq!(reader.list(&f.root).unwrap().iter().find(|entry|entry.id=="lost-owner").unwrap().phase,"hold");assert_eq!(reader.start_consult(&f.root,q).unwrap().phase,"hold");assert_eq!(f.calls().len(),1);
+}
+#[test]
+fn pages_reject_changed_answers_and_invalid_offsets_without_state_prefetch() {
+    let f=Fixture::new();f.release();let e=f.engine();e.start_consult(&f.root,explicit(&f,"tamper")).unwrap();f.wait(&e,"tamper");
+    assert!(e.read_answer_page(&f.root,"tamper","alpha",1,10,None).is_err());
+    assert!(e.read_answer_page(&f.root,"tamper","alpha",999,10,Some("bad")).is_err());
+    assert!(e.read_answer_page(&f.root,"tamper","alpha",0,0,None).is_err());
+    fs::write(f.root.join(".orch/fusion-runs/tamper/members/fusion/0-fusion-0.md"),"changed").unwrap();
+    assert_eq!(e.read_status(&f.root,"tamper").unwrap().members[0].answer,None);
+    assert!(e.read_answer_page(&f.root,"tamper","alpha",0,100,None).is_err());
+}
+#[test]
+fn attachments_reject_symlinks_secrets_and_escaping_paths_before_launch() {
+    use std::os::unix::fs::symlink;
+    let f=Fixture::new();let e=f.engine();let target=f.root.join("facts.txt");fs::write(&target,"facts").unwrap();symlink(&target,f.root.join("link.txt")).unwrap();fs::write(f.root.join(".env"),"not sent").unwrap();
+    for path in [f.root.join("link.txt"),f.root.join(".env"),f.root.join("../escape"),PathBuf::from("relative")] {
+        let mut q=explicit(&f,"unsafe");q.attachments.push(path);assert!(e.start_consult(&f.root,q).is_err());
+    }
+    assert!(f.calls().is_empty());
+}
+
+#[test]
+fn attachment_secret_and_oversize_serialization_refuse_before_reservation() {
+    let f=Fixture::new();let e=f.engine();let path=f.root.join("text.txt");
+    for content in ["ANTHROPIC_API_KEY=sk-secret-example-key-12345678901234567890".to_string(), "\u{1}".repeat(400_000)] {
+        fs::write(&path,content).unwrap();let mut q=explicit(&f,"no-reservation");q.attachments.push(path.clone());
+        assert!(e.start_consult(&f.root,q).is_err());
+        assert!(!f.root.join(".orch/fusion-runs/no-reservation/request.json").exists());
+    }
+    assert!(f.calls().is_empty());
+}
+#[test]
+fn pages_preserve_utf8_and_reject_mid_character_offsets() {
+    let f=Fixture::new();let script=f.root.join("bin/fixture-client");let s=fs::read_to_string(&script).unwrap().replace("else kind+' answer'", "else '你好世界'");fs::write(script,s).unwrap();f.release();let e=f.engine();e.start_consult(&f.root,explicit(&f,"unicode")).unwrap();f.wait(&e,"unicode");
+    let a=e.read_answer_page(&f.root,"unicode","alpha",0,4,None).unwrap();assert_eq!(a.text,"你");assert_eq!(a.next_offset,Some(3));
+    assert!(e.read_answer_page(&f.root,"unicode","alpha",1,4,Some(&a.sha256)).is_err());
+    assert!(e.read_answer_page(&f.root,"unicode","alpha",0,1,None).is_err());
+    let b=e.read_answer_page(&f.root,"unicode","alpha",3,64,Some(&a.sha256)).unwrap();assert_eq!(b.text,"好世界");
+}
+
+#[test]
+fn matching_replay_waits_for_reservation_transaction_publication() {
+    let f=Fixture::new();f.release();let e=f.engine();let q=explicit(&f,"transaction");e.start_consult(&f.root,q.clone()).unwrap();f.wait(&e,"transaction");
+    let base=f.root.join(".orch/fusion-runs");let lock=fs::OpenOptions::new().read(true).write(true).open(base.join("run.lock")).unwrap();lock.lock().unwrap();
+    let state=base.join("transaction/state.json");let saved=base.join("transaction/state.saved");fs::rename(&state,&saved).unwrap();
+    let another=f.engine();let root=f.root.clone();let (tx,rx)=std::sync::mpsc::channel();let reader=std::thread::spawn(move|| {tx.send(()).unwrap();another.start_consult(&root,q)});rx.recv().unwrap();std::thread::sleep(Duration::from_millis(100));
+    fs::rename(saved,state).unwrap();drop(lock);
+    assert_eq!(reader.join().unwrap().unwrap().phase,"completed");assert_eq!(f.calls().len(),1);
+}
+#[test]
+fn unsupported_explicit_member_fails_before_worker_launch() {
+    let f=Fixture::new();let e=f.engine();let mut q=explicit(&f,"missing-harness");q.members[0].harness="configured:missing".into();
+    let v=e.start_consult(&f.root,q).unwrap();assert_eq!(v.phase,"failed");assert!(f.calls().is_empty());
+}
+
+#[test]
+fn explicit_attachments_honor_project_binding_before_reservation() {
+    let f=Fixture::new();f.release();let e=f.engine();
+    fs::create_dir_all(f.root.join("coordination")).unwrap();
+    fs::write(f.root.join("coordination/PROJECT-BINDING.yaml"), r#"{"data":{"forbiddenArtifactPatterns":["private-notes.txt"]}}"#).unwrap();
+    let path=f.root.join("private-notes.txt");fs::write(&path,"project-private facts").unwrap();let mut q=explicit(&f,"binding-policy");q.attachments.push(path);
+    let error=e.start_consult(&f.root,q).unwrap_err();assert!(error.to_string().contains("命中 PROJECT-BINDING"),"{error:#}");assert!(!f.root.join(".orch/fusion-runs/binding-policy/request.json").exists());assert!(f.calls().is_empty());
+}
+#[test]
+fn explicit_attachments_share_cli_duplicate_rejection() {
+    let f=Fixture::new();f.release();let e=f.engine();let path=f.root.join("notes.txt");fs::write(&path,"facts").unwrap();let mut q=explicit(&f,"duplicate-file");q.attachments=vec![path.clone(),path];
+    let error=e.start_consult(&f.root,q).unwrap_err();assert!(error.to_string().contains("重复"),"{error:#}");assert!(f.calls().is_empty());
+}
+
+#[test]
+fn explicit_configured_member_pins_take_precedence_over_native_defaults() {
+    let f=Fixture::new();f.release();let e=f.engine();e.start_consult(&f.root,explicit(&f,"configured-pins")).unwrap();
+    assert_eq!(f.wait(&e,"configured-pins").phase,"completed");
+    let calls=f.calls();assert_eq!(calls.len(),1);
+    assert_eq!(calls[0]["model"],"registry-model");assert_eq!(calls[0]["effort"],"high");
 }

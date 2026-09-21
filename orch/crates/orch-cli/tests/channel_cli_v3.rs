@@ -177,6 +177,14 @@ requiredEvidence: [fixture-proof]\n---\n# Synthetic channel fixture\n",
         b"#!/bin/sh\nprintf '%s\\n' '{\"type\":\"step_start\",\"sessionID\":\"session-alpha\",\"part\":{\"type\":\"step-start\",\"modelID\":\"model-a\"}}'\nprintf '%s\\n' '{\"type\":\"text\",\"part\":{\"text\":\"done\"}}'\nprintf '%s\\n' '{\"type\":\"step_finish\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}'\n/bin/sleep 2\n",
     )
     .unwrap();
+    // Pin the concrete test interpreter, not Darwin's /bin/sh dispatcher.
+    #[cfg(target_os = "macos")]
+    {
+        let original = fs::read(&executable).unwrap();
+        let mut stable = b"#!/bin/bash\n".to_vec();
+        stable.extend_from_slice(original.strip_prefix(b"#!/bin/sh\n").unwrap());
+        fs::write(&executable, stable).unwrap();
+    }
     let mut permissions = fs::metadata(&executable).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&executable, permissions).unwrap();
@@ -399,7 +407,10 @@ fn harness_dispatch_keeps_local_owner_and_replays_without_a_second_spawn() {
     let script = fs::read_to_string(&executable).unwrap();
     fs::write(
         &executable,
-        script.replacen("#!/bin/sh\n", "#!/bin/sh\n/bin/sleep 2\n", 1),
+        {
+            let (interpreter, body) = script.split_once('\n').unwrap();
+            format!("{interpreter}\n/bin/sleep 2\n{body}")
+        },
     )
     .unwrap();
     let first = run(&root, &["dispatch", "B320", "--harness", "alpha"]);
