@@ -9,11 +9,11 @@ Git projects.
 
 ## 安装 / Install
 
-本次为尚未发布远端的 `0.1.0-alpha.11` 本地候选。使用经验证的完整
-Apple Silicon macOS 本地安装包；三个核心程序的版本均为 `0.1.0`。
+本次为 [`0.1.0-alpha.11`](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.11)
+Release。使用经验证的完整 Apple Silicon macOS 安装包；三个核心程序的版本均为 `0.1.0`。
 源码仓本身不含预编译运行时，不能代替完整安装包。
 
-Use the verified local candidate bundle; no remote release is published by this change. It includes
+Use the verified Release bundle. It includes
 the default CLI, MCP and ACP binaries plus four channel resources. No Rust toolchain is needed.
 Prerequisites: Python 3.9+, Git, and the native Codex or DSH client. DSH's plugin
 manager also requires its normal Node.js/pnpm environment and network access to
@@ -146,10 +146,9 @@ it never initializes Git or pushes refs. Maintainers publish from an independent
 public checkout with exact old-ref checks, then verify public downloads and installs.
 
 
-## Local MCP / ACP candidate
+## MCP / ACP
 
-`0.1.0-alpha.11` is a local candidate; this change does not publish a remote release.
-Use the verified local bundle. Codex receives four MCP tools through a package-local
+`0.1.0-alpha.11` includes four MCP tools for Codex through a package-local
 stdio server; DSH retains the shared skill/helper entry and has no MCP claim.
 Rust now owns personal configuration, default selection and setup through the
 same parser and consultation lifecycle as CLI/Web. Python is a verified launcher.

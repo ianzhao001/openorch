@@ -6,7 +6,7 @@ OpenOrch connects installed AI harnesses to Codex Desktop and DSH Web through on
 shared skill and a bundled local runtime. Choose your own clients/models, consult
 one or several members, and let the current host synthesize their original answers.
 
-Local candidate: `v0.1.0-alpha.11` (not remotely published by this change) · runtime binaries: `0.1.0`.
+Plugin release: [`v0.1.0-alpha.11`](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.11) · runtime binaries: `0.1.0`.
 
 ## 中文
 
@@ -17,7 +17,13 @@ DSH 插件管理还使用其正常的 Node.js/pnpm 环境，并从官方包源�
 完整 Release 包已包含运行核心，使用者不需要 Rust，也不需要任何私有仓库。
 
 ```sh
-bundle=/absolute/path/to/openorch-v0.1.0-alpha.11-darwin-arm64
+release=v0.1.0-alpha.11
+bundle=openorch-$release-darwin-arm64
+base=https://github.com/ianzhao001/openorch/releases/download/$release
+curl -fLO "$base/$bundle.tar.gz"
+curl -fLO "$base/$bundle.tar.gz.sha256"
+shasum -a 256 -c "$bundle.tar.gz.sha256"
+tar -xzf "$bundle.tar.gz"
 python3 "$bundle/install.py" --host both
 ```
 
@@ -80,8 +86,8 @@ python3 /path/to/release/install.py --host dsh --uninstall
 
 ### 运行时来源与源码
 
-本地候选从固定产品源码构建，包内 `runtime/provenance.json` 记录源码提交、工具链与
-构建参数；本次没有远端发布或公开 tag 对应声明，不能借用旧版的资格证明。
+本版从固定产品源码构建，包内 `runtime/provenance.json` 记录源码提交、工具链与
+构建参数，并对应本 Release tag；不能借用其它版本的资格证明。
 全包 `manifest.json` 与包内七资源 `runtime/manifest.json` 用于检测字节变化。
 核心是 macOS ad-hoc 签名，没有 Apple Developer ID 签名或 notarization；不宣称
 可复现构建或不存在的 GitHub attestation。验证示例：
@@ -112,7 +118,7 @@ cargo build --release -p orch-cli --no-default-features \
 
 ### Install and use
 
-Use the complete local candidate bundle
+Use the complete [Release](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.11)
 archive on Apple Silicon macOS. Python3.9+, Git and the native Codex/DSH client are
 required. DSH uses its normal Node.js/pnpm environment and fetches the declared
 filesystem-skill dependency. The bundle includes the runtime; Rust and the private
@@ -164,9 +170,9 @@ Another host may still reference an older payload. Resolve a reported native
 dependency/login/conflict through its normal workflow, then rerun the affected host.
 
 The complete bundle and seven runtime resources have separate integrity inventories.
-The bundled `runtime/provenance.json` identifies fixed local source inputs and
-compiler/build details. This local candidate makes no remote-release/public-tag
-claim and does not reuse an older release's source-equality claim. The core is ad-hoc signed, not Developer ID signed
+The bundled `runtime/provenance.json` identifies fixed source inputs and
+compiler/build details for this Release tag; it does not reuse an older
+release's source-equality claim. The core is ad-hoc signed, not Developer ID signed
 or notarized; no reproducible-build or unavailable attestation claim is made.
 Build-from-source commands and signature checks appear above; Rust1.98.0 was used,
 and no MSRV is declared.
@@ -178,10 +184,9 @@ full private selfhost test history. See the [plugin README](plugins/openorch/REA
 [MIT license](LICENSE).
 
 
-## Local MCP / ACP candidate
+## MCP / ACP
 
-`0.1.0-alpha.11` is a local candidate; this change does not publish a remote release.
-Use the verified local bundle. Codex receives four MCP tools through a package-local
+`0.1.0-alpha.11` includes four MCP tools for Codex through a package-local
 stdio server; DSH retains the shared skill/helper entry and has no MCP claim.
 Rust now owns personal configuration, default selection and setup through the
 same parser and consultation lifecycle as CLI/Web. Python is a verified launcher.

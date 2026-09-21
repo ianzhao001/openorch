@@ -6,13 +6,13 @@ This file records the public OpenOrch release line. Internal selfhost rounds, ta
 
 ## 中文
 
-### 未发布 · 0.1.0-alpha.11 本地候选
+### [v0.1.0-alpha.11](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.11) — 2026-09-22
 
 - 新增独立 MCP 四工具服务和共用 ACP 客户端；CLI/Web 共用咨询生命周期及答卷验证
 - 个人配置、默认成员和项目初始化迁入 Rust，移除 Python 配置解释与临时验证克隆
 - 显式工作树登记限定 MCP 可访问项目；配置更新保留可验证快照与原子交换得到的实际旧文件
 - 完整包包含 CLI、MCP、ACP 三个程序和四个兼容脚本，保留旧项目配置与 DSH 技能入口
-- 本次不发布远端；Codex ACP 的指定 DeepSeek Flash/max 仍明确拒绝，不降档或声称已认证
+- Codex ACP 的指定 DeepSeek Flash/max 仍明确拒绝，不降档或声称已认证
 
 - Release 与公开源码快照现在都包含 `plugins/openorch/AGENTS.md` 的受版本控制协作规则副本
 - Codex 宿主优先使用原生多代理机制处理本地拆分、并行与等待；OpenOrch 保持显式跨客户端咨询与 fusion 边界，不新增调度器
@@ -80,12 +80,12 @@ OpenOrch 现在提供 Codex Desktop 与 DSH Web 共用的插件包。核心版�
 
 ## English
 
-### Unreleased · 0.1.0-alpha.11 local candidate
+### [v0.1.0-alpha.11](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.11) — 2026-09-22
 
 - Four-tool MCP stdio, one shared ACP client and unified CLI/Web consultation evidence
 - Rust personal setup/default semantics, explicit project registration and recoverable profile replacement
 - Complete CLI/MCP/ACP runtime inventory; Python remains an integrity/compatibility launcher
-- No remote publication or DSH MCP claim; unsupported Codex Flash/max is refused before Prompt
+- No DSH MCP claim; unsupported Codex Flash/max is refused before Prompt
 
 - Release bundles and public source snapshots now include the versioned collaboration policy at `plugins/openorch/AGENTS.md`
 - Codex hosts use native multi-agent delegation, parallelism, and waits for local work; OpenOrch remains an explicit cross-harness consultation/fusion layer and adds no scheduler
