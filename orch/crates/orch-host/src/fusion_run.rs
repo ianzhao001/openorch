@@ -4,7 +4,7 @@
 use crate::{
     channel::InvocationTuple,
     consult::{MemberOutcome, MemberStatus},
-    fusion_roles::{self, FusionConfig, FusionRole},
+    fusion_roles::{self, validate_identifier, FusionConfig, FusionRole},
     native_discovery::{self, DiscoveryContext},
 };
 use anyhow::{bail, Context, Result};
@@ -44,8 +44,8 @@ pub struct FusionRequest {
 impl FusionRequest {
     /// Check path-safe identities, nonempty text and the request byte limit.
     pub fn validate(&self) -> Result<()> {
-        identifier(&self.request_id)?;
-        identifier(&self.combination_id)?;
+        validate_identifier(&self.request_id)?;
+        validate_identifier(&self.combination_id)?;
         if self.question.trim().is_empty()
             || self.question.len() > MAX_QUESTION
             || self.question.contains('\0')
@@ -267,17 +267,6 @@ fn role_prompt(question: &str, role: &FusionRole) -> Result<String> {
     let text=format!("You are a read-only consultation role. Do not edit files, commit, push or perform mutating actions. Return a substantive answer and identify uncertainty.\n\nRole: {}\nInstructions:\n{}\n\nQuestion:\n{}",role.name,role.instructions,question);
     checked_prompt(&text)?;
     Ok(text)
-}
-fn identifier(id: &str) -> Result<()> {
-    if id.is_empty()
-        || id.len() > 64
-        || !id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        bail!("invalid_identifier");
-    }
-    Ok(())
 }
 fn now() -> String {
     humantime::format_rfc3339_seconds(SystemTime::now()).to_string()
@@ -720,7 +709,7 @@ impl FusionEngine {
         let active_path = base.join("active.json");
         if fs::symlink_metadata(&active_path).is_ok() {
             let id: String = read_json(&active_path)?;
-            identifier(&id)?;
+            validate_identifier(&id)?;
             let old_dir = base.join(&id);
             real_dir(&old_dir, false)?;
             let bytes = read_bytes(&old_dir.join("state.json"), MAX_RECORD)?;
@@ -848,7 +837,7 @@ impl FusionEngine {
     /// Read bounded lifecycle metadata without opening any member answer body.
     /// An independently connected reader observes the owner's exclusive file lock.
     pub fn read_status(&self, root: &Path, id: &str) -> Result<RunView> {
-        identifier(id)?;
+        validate_identifier(id)?;
         let dir = namespace(root, false)?.join(id);
         real_dir(&dir, false)?;
         let bytes = read_bytes(&dir.join("state.json"), MAX_RECORD)?;
@@ -903,7 +892,7 @@ impl FusionEngine {
         for item in fs::read_dir(&base)?.take(512) {
             let item = item?;
             let name = item.file_name().to_string_lossy().into_owned();
-            if identifier(&name).is_err() || !item.file_type()?.is_dir() {
+            if validate_identifier(&name).is_err() || !item.file_type()?.is_dir() {
                 continue;
             }
             let Ok(bytes) = read_bytes(&item.path().join("state.json"), MAX_RECORD) else {
@@ -968,7 +957,7 @@ fn publish_state(dir: &Path, view: &RunView) -> Result<()> {
 }
 fn answer_base(dir: &Path, view: &RunView) -> Result<PathBuf> {
     if !view.legacy_artifacts {return Ok(dir.to_path_buf());}
-    identifier(&view.id)?;
+    validate_identifier(&view.id)?;
     if fs::canonicalize(&view.project)?!=view.project {bail!("legacy_project_identity_changed");}
     let mut base=view.project.clone();
     for component in ["coordination","consultations",view.id.as_str()] {base.push(component);real_dir(&base,false)?;}

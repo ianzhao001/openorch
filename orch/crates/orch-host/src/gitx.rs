@@ -10,6 +10,37 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{bail, Context, Result};
 use fd_lock::RwLock;
 
+/// Resolve the supplied directory to its own committed, non-bare Git worktree.
+///
+/// Subdirectories and symlinks resolve to the canonical top-level; linked
+/// worktrees retain their own identity rather than becoming the shared main root.
+/// Inspection ignores inherited Git directory/worktree/config overrides and
+/// disables fsmonitor and optional locks. Missing, non-repository, bare and
+/// unborn repositories are refused without changing repository state.
+pub fn canonical_committed_worktree(root: &Path) -> Result<PathBuf> {
+    let supplied = std::fs::canonicalize(root)?;
+    let inspect = |cwd: &Path, args: &[&str]| -> Result<String> {
+        let output = Command::new("git")
+            .args(["-c", "core.fsmonitor=false", "--no-optional-locks", "-C"])
+            .arg(cwd)
+            .args(args)
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()?;
+        if !output.status.success() {
+            bail!("project_git_inspection_failed");
+        }
+        Ok(String::from_utf8(output.stdout)?.trim_end_matches(['\r', '\n']).to_string())
+    };
+    let project = std::fs::canonicalize(inspect(&supplied, &["rev-parse", "--show-toplevel"])?)?;
+    if inspect(&project, &["rev-parse", "--is-bare-repository"])? != "false" {
+        bail!("bare_repository_not_supported");
+    }
+    inspect(&project, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    Ok(project)
+}
+
 fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     run_with_envs(root, args, &[])
 }

@@ -79,7 +79,7 @@ pub fn validate_config(config: &FusionConfig) -> Result<()> {
     }
     let mut roles = BTreeSet::new();
     for role in &config.roles {
-        identifier(&role.id)?;
+        validate_identifier(&role.id)?;
         label(&role.name)?;
         if !roles.insert(role.id.as_str()) {
             bail!("duplicate_role_id");
@@ -98,7 +98,7 @@ pub fn validate_config(config: &FusionConfig) -> Result<()> {
     }
     let mut combinations = BTreeSet::new();
     for group in &config.combinations {
-        identifier(&group.id)?;
+        validate_identifier(&group.id)?;
         label(&group.name)?;
         if !combinations.insert(group.id.as_str()) {
             bail!("duplicate_combination_id");
@@ -142,7 +142,7 @@ pub fn validate_tuple(tuple: &InvocationTuple) -> Result<()> {
     }
     Ok(())
 }
-fn identifier(id: &str) -> Result<()> {
+pub(crate) fn validate_identifier(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 64
         || !id

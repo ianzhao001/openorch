@@ -206,26 +206,9 @@ fn validate_project(root: &Path) -> Result<Project, String> {
     if !root.is_dir() {
         return Err("invalid project".into());
     }
-    let git = |args: &[&str]| {
-        Command::new("git")
-            .args(["-c", "core.fsmonitor=false", "--no-optional-locks", "-C"])
-            .arg(&root)
-            .args(args)
-            .env_remove("GIT_CONFIG_PARAMETERS")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .output()
-    };
-    let top = git(&["rev-parse", "--show-toplevel"]).map_err(|_| "invalid project".to_string())?;
-    let top_path = String::from_utf8(top.stdout).map_err(|_| "invalid project".to_string())?;
-    if !top.status.success() || fs::canonicalize(top_path.trim()).ok().as_ref() != Some(&root) {
-        return Err("invalid project".into());
-    }
-    if !git(&["rev-parse", "--verify", "HEAD^{commit}"])
-        .map_err(|_| "invalid project".to_string())?
-        .status
-        .success()
-    {
+    let top = orch_host::gitx::canonical_committed_worktree(&root)
+        .map_err(|_| "invalid project".to_string())?;
+    if top != root {
         return Err("invalid project".into());
     }
     let mut reader = ObservationReader::open(&root).map_err(|_| "invalid project".to_string())?;

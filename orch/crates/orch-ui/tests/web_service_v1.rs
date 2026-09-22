@@ -213,6 +213,21 @@ fn project_validation_and_transaction() {
         404
     );
 }
+
+#[test]
+fn project_registration_rejects_an_unborn_repository_without_changing_projects() {
+    let f = Fixture::new();
+    let unborn = f.0.join("unborn");
+    fs::create_dir(&unborn).unwrap();
+    assert!(Command::new("git").args(["init", "-q"]).arg(&unborn)
+        .status().unwrap().success());
+    let s = WebServer::start(&f.0, 0).unwrap();
+    let before = http(&s, "GET", "/api/v1/projects", "", &[], true).2;
+    assert_eq!(http(&s, "POST", "/api/v1/projects", &json!({"root":unborn}).to_string(),
+        &[("Origin", format!("http://{}", s.address())), ("Sec-Fetch-Site", "same-origin".into())], true).0, 400);
+    assert_eq!(before, http(&s, "GET", "/api/v1/projects", "", &[], true).2);
+}
+
 #[test]
 fn project_ids_and_generations_are_independent() {
     let a = Fixture::new();

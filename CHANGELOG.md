@@ -6,6 +6,11 @@ This file records the public OpenOrch release line. Internal selfhost rounds, ta
 
 ## 中文
 
+### [v0.1.0-alpha.12](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.12) — 2026-09-22
+
+- Fusion 标识与已提交工作树检查改为共用的固定输入边界，保留运行读写隔离
+- Web 观察与本机配置助手同步使用经过验证的工作树身份
+
 ### [v0.1.0-alpha.11](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.11) — 2026-09-22
 
 - 新增独立 MCP 四工具服务和共用 ACP 客户端；CLI/Web 共用咨询生命周期及答卷验证
@@ -79,6 +84,11 @@ OpenOrch 现在提供 Codex Desktop 与 DSH Web 共用的插件包。核心版�
 ---
 
 ## English
+
+### [v0.1.0-alpha.12](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.12) — 2026-09-22
+
+- Shares fixed-input validation for Fusion identifiers and committed-worktree inspection while retaining run isolation
+- Aligns Web observation and the local setup helper with verified worktree identity
 
 ### [v0.1.0-alpha.11](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.11) — 2026-09-22
 

@@ -131,9 +131,7 @@ fn git(root:&Path,args:&[&str])->Result<String> {
 /// Resolve the actual non-bare Git worktree and require its existing commit.
 /// This is read-only and may run before ordinary CLI project-mode/staleness guards.
 pub fn canonical_project(root:&Path)->Result<PathBuf> {
-    let supplied=fs::canonicalize(root)?;let project=fs::canonicalize(git(&supplied,&["rev-parse","--show-toplevel"])?)?;
-    if git(&project,&["rev-parse","--is-bare-repository"])?!="false" {bail!("bare_repository_not_supported");}
-    git(&project,&["rev-parse","--verify","HEAD^{commit}"])?;Ok(project)
+    crate::gitx::canonical_committed_worktree(root)
 }
 /// Resolve only the local startup selector; no MCP request can change this directory.
 pub fn default_config_dir()->Result<PathBuf> {

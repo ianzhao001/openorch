@@ -9,7 +9,7 @@ Git projects.
 
 ## 安装 / Install
 
-本次为 [`0.1.0-alpha.11`](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.11)
+本次为 [`0.1.0-alpha.12`](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.12)
 Release。使用经验证的完整 Apple Silicon macOS 安装包；三个核心程序的版本均为 `0.1.0`。
 源码仓本身不含预编译运行时，不能代替完整安装包。
 
@@ -148,7 +148,7 @@ public checkout with exact old-ref checks, then verify public downloads and inst
 
 ## MCP / ACP
 
-`0.1.0-alpha.11` includes four MCP tools for Codex through a package-local
+`0.1.0-alpha.12` includes four MCP tools for Codex through a package-local
 stdio server; DSH retains the shared skill/helper entry and has no MCP claim.
 Rust now owns personal configuration, default selection and setup through the
 same parser and consultation lifecycle as CLI/Web. Python is a verified launcher.
