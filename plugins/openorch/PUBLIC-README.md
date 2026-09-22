@@ -6,7 +6,7 @@ OpenOrch connects installed AI harnesses to Codex Desktop and DSH Web through on
 shared skill and a bundled local runtime. Choose your own clients/models, consult
 one or several members, and let the current host synthesize their original answers.
 
-Plugin release: [`v0.1.0-alpha.12`](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.12) · runtime binaries: `0.1.0`.
+Plugin release: [`v0.1.0-alpha.13`](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.13) · runtime binaries: `0.1.0`.
 
 ## 中文
 
@@ -17,7 +17,7 @@ DSH 插件管理还使用其正常的 Node.js/pnpm 环境，并从官方包源�
 完整 Release 包已包含运行核心，使用者不需要 Rust，也不需要任何私有仓库。
 
 ```sh
-release=v0.1.0-alpha.12
+release=v0.1.0-alpha.13
 bundle=openorch-$release-darwin-arm64
 base=https://github.com/ianzhao001/openorch/releases/download/$release
 curl -fLO "$base/$bundle.tar.gz"
@@ -118,7 +118,7 @@ cargo build --release -p orch-cli --no-default-features \
 
 ### Install and use
 
-Use the complete [Release](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.12)
+Use the complete [Release](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.13)
 archive on Apple Silicon macOS. Python3.9+, Git and the native Codex/DSH client are
 required. DSH uses its normal Node.js/pnpm environment and fetches the declared
 filesystem-skill dependency. The bundle includes the runtime; Rust and the private
@@ -186,7 +186,7 @@ full private selfhost test history. See the [plugin README](plugins/openorch/REA
 
 ## MCP / ACP
 
-`0.1.0-alpha.12` includes four MCP tools for Codex through a package-local
+`0.1.0-alpha.13` includes four MCP tools for Codex through a package-local
 stdio server; DSH retains the shared skill/helper entry and has no MCP claim.
 Rust now owns personal configuration, default selection and setup through the
 same parser and consultation lifecycle as CLI/Web. Python is a verified launcher.

@@ -1,6 +1,6 @@
 {
   "name": "openorch",
-  "version": "0.1.0-alpha.12",
+  "version": "0.1.0-alpha.13",
   "description": "Consult your installed AI harnesses and combine their answers in Codex or DSH.",
   "author": {
     "name": "ianzhao"
