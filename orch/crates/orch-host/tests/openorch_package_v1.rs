@@ -71,6 +71,7 @@ with tempfile.TemporaryDirectory(prefix='b337-',dir=PARENT) as t:
     assert manifest['mcpServers']=='./.mcp.json'
     mcp=json.loads((plugin/'.mcp.json').read_text());assert mcp['mcpServers']['openorch']['command']=='./scripts/openorch-mcp.py'
     assert '.mcp.json' in dsh['files']
+    assert 'AGENTS.md' in dsh['files']
     assert (plugin/'scripts/openorch-mcp.py').is_file()
     assert (plugin/dsh['dsh']['bundle']['patch']).is_file()
     skill=plugin/'skills/openorch/SKILL.md';assert skill.is_file()

@@ -6,6 +6,10 @@ This file records the public OpenOrch release line. Internal selfhost rounds, ta
 
 ## 中文
 
+### [v0.1.0-alpha.14](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.14) — 2026-09-22
+
+- DSH 包白名单补齐 `AGENTS.md`，使实际 materialized 包覆盖完整发布清单
+
 ### [v0.1.0-alpha.13](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.13) — 2026-09-22
 
 - DSH 包白名单显式包含 `.mcp.json`，使 materialized 插件与发布清单一致
@@ -88,6 +92,10 @@ OpenOrch 现在提供 Codex Desktop 与 DSH Web 共用的插件包。核心版�
 ---
 
 ## English
+
+### [v0.1.0-alpha.14](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.14) — 2026-09-22
+
+- Includes `AGENTS.md` in the DSH package allowlist so materialized files cover the full release inventory
 
 ### [v0.1.0-alpha.13](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.13) — 2026-09-22
 

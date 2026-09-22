@@ -1,6 +1,6 @@
 {
   "name": "openorch",
-  "version": "0.1.0-alpha.13",
+  "version": "0.1.0-alpha.14",
   "description": "OpenOrch shared skill and local runtime for Codex and DSH Web",
   "license": "MIT",
   "type": "module",
@@ -16,6 +16,7 @@
   "files": [
     ".codex-plugin",
     ".mcp.json",
+    "AGENTS.md",
     "dsh-entry.mjs",
     "cordis.patch.yml",
     "skills",
