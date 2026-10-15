@@ -301,6 +301,9 @@ enum SitesCmd {
         /// Read-only full eligibility snapshot; create no locks, receipts, or ledger/WAL writes.
         #[arg(long)]
         dry_run: bool,
+        /// Retire one explicitly authorized, preserved exact object; no historical lifecycle writes.
+        #[arg(long, conflicts_with = "round")]
+        retire_manifest: Option<PathBuf>,
     },
     /// Inspect legacy scratch ownership; names and age do not authorize deletion.
     SweepScratch {
@@ -2744,7 +2747,12 @@ fn cmd_sites(root: &std::path::Path, action: SitesCmd) -> Result<ExitCode> {
                 })
             }
         },
-        SitesCmd::Gc { round, dry_run } => {
+        SitesCmd::Gc { round, dry_run, retire_manifest } => {
+            if let Some(manifest) = retire_manifest {
+                let result = orch_host::storage_policy::retire_manifest(root, &manifest, dry_run)?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(ExitCode::SUCCESS);
+            }
             // Preserve explicit live receipt recovery without turning historical maintenance
             // into a ledger writer. The host rejects closed/legacy generations before sidecars.
             if !dry_run {
@@ -4103,10 +4111,11 @@ mod review_wake_cli_tests {
         let gc = Cli::try_parse_from(["orch", "sites", "gc", "--round", "r63"]).unwrap();
         match gc.cmd {
             Cmd::Sites {
-                action: SitesCmd::Gc { round, dry_run },
+                action: SitesCmd::Gc { round, dry_run, retire_manifest },
             } => {
                 assert_eq!(round.as_deref(), Some("r63"));
                 assert!(!dry_run);
+                assert!(retire_manifest.is_none());
             }
             _ => panic!("expected sites gc command"),
         }

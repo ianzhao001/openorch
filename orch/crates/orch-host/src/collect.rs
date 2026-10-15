@@ -35,6 +35,7 @@ pub(crate) struct CollectSourceSnapshot {
     git_identity: (u64, u64),
     pinned_main: String,
     closed: bool,
+    receipt: crate::storage_policy::SnapshotReceipt,
 }
 
 fn collect_directory_identity(path: &Path) -> Result<(u64, u64)> {
@@ -79,10 +80,19 @@ fn collect_snapshot_git(root: &Path, args: &[&str]) -> Result<String> {
 }
 
 impl CollectSourceSnapshot {
-    pub(crate) fn new(
+    #[cfg(test)]
+    pub(crate) fn new(root: &Path, head: &str, permit: &crate::storage::StoragePermit) -> Result<Self> {
+        Self::create(root, head, permit, None)
+    }
+    pub(crate) fn new_owned(root: &Path, head: &str, permit: &crate::storage::StoragePermit,
+        owner: crate::storage_policy::SnapshotOwner<'_>) -> Result<Self> {
+        Self::create(root, head, permit, Some(owner))
+    }
+    fn create(
         root: &Path,
         head: &str,
         _permit: &crate::storage::StoragePermit,
+        owner: Option<crate::storage_policy::SnapshotOwner<'_>>,
     ) -> Result<Self> {
         if head.len() != 40
             || !head
@@ -102,6 +112,7 @@ impl CollectSourceSnapshot {
         if fs::symlink_metadata(&path).is_ok() {
             bail!("collect snapshot refuses to reuse {}", path.display());
         }
+        let receipt = crate::storage_policy::SnapshotReceipt::new(&root, &path, head, owner)?;
         // The caller already holds its collect storage permit. Refs, objects and
         // the default Cargo target belong to this clone, without shared alternates.
         collect_snapshot_git(
@@ -139,6 +150,7 @@ impl CollectSourceSnapshot {
             git_identity,
             pinned_main,
             closed: false,
+            receipt,
         };
         source.select(head)?;
         Ok(source)
@@ -232,6 +244,7 @@ impl CollectSourceSnapshot {
         {
             bail!("collect snapshot phase failed its fixed-ref postcondition");
         }
+        self.receipt.update("selected", Some(head))?;
         Ok(())
     }
 
@@ -269,6 +282,7 @@ impl CollectSourceSnapshot {
         self.validate_identity()?;
         crate::util::remove_dir_all_with_enotempty_retry(&self.path)?;
         self.closed = true;
+        self.receipt.update("removed", None)?;
         Ok(())
     }
 }
@@ -465,6 +479,42 @@ fn integration_selector(target: &str) -> std::result::Result<(String, String), S
     Ok(((*package).to_string(), test.to_string()))
 }
 
+fn schema3_seed_command(
+    binding: &binding::Binding,
+    meta: &card::CardMeta,
+    target: &str,
+) -> Result<ResolvedCollectCommand> {
+    let integration_error = match integration_selector(target) {
+        Ok((package, test)) => {
+            return derived_test_command(binding, "seedTargets", "seedTargets", &package, &test);
+        }
+        Err(error) => error,
+    };
+    if meta.schema_version != Some(plan::ACTORLESS_ROUND_IR_SCHEMA_VERSION)
+        || meta.seed_protocol.as_deref() != Some("seeded-red")
+        || meta.red_form.as_deref() != Some("compile")
+    {
+        bail!(integration_error);
+    }
+    let parts = target.split('/').collect::<Vec<_>>();
+    let ["orch", "crates", package, "src", file] = parts.as_slice() else {
+        bail!(integration_error);
+    };
+    // Reuse the existing exact path/component validator without broadening
+    // integration or legacy selectors. Never infer a Rust module-name filter.
+    let (package, _) = integration_selector(&format!("orch/crates/{package}/tests/{file}"))
+        .map_err(anyhow::Error::msg)?;
+    if package.starts_with('-') {
+        bail!("compile unit seed package must not be a Cargo option");
+    }
+    derived_cargo_test_command(
+        binding,
+        "seedTargets",
+        "seedTargets",
+        vec!["-p".into(), package, "--lib".into()],
+    )
+}
+
 fn derived_test_command(
     binding: &binding::Binding,
     command_ref: &str,
@@ -472,18 +522,26 @@ fn derived_test_command(
     package: &str,
     test: &str,
 ) -> Result<ResolvedCollectCommand> {
+    derived_cargo_test_command(
+        binding,
+        command_ref,
+        binding_command_ref,
+        vec!["-p".into(), package.into(), "--test".into(), test.into()],
+    )
+}
+
+fn derived_cargo_test_command(
+    binding: &binding::Binding,
+    command_ref: &str,
+    binding_command_ref: &str,
+    derived_argv: Vec<String>,
+) -> Result<ResolvedCollectCommand> {
     let base = binding.commands.get(binding_command_ref).with_context(|| {
         format!("policy-base binding 缺 derived command base {binding_command_ref}")
     })?;
     if base.argv.iter().any(|arg| arg == "--") {
         bail!("derived Cargo command base 不得在 selector 前含 `--` terminator");
     }
-    let derived_argv = vec![
-        "-p".to_string(),
-        package.to_string(),
-        "--test".to_string(),
-        test.to_string(),
-    ];
     let mut spec = copy_command_spec(base);
     spec.argv.extend(derived_argv.iter().cloned());
     Ok(ResolvedCollectCommand {
@@ -784,6 +842,7 @@ pub(crate) fn resolve_collect_lane_plan(
             bail!("schema 3 candidate gate lane 为空");
         }
         let mut commands = Vec::new();
+        let mut unit_build_added = false;
         for command_ref in &committed.gates.candidate {
             if command_ref == "seedTargets" {
                 if card.meta.seeds.is_empty() {
@@ -793,15 +852,21 @@ pub(crate) fn resolve_collect_lane_plan(
                     continue;
                 }
                 for seed in &card.meta.seeds {
-                    let (package, test) =
-                        integration_selector(&seed.target).map_err(anyhow::Error::msg)?;
-                    commands.push(derived_test_command(
-                        &committed,
-                        "seedTargets",
-                        "seedTargets",
-                        &package,
-                        &test,
-                    )?);
+                    let command = schema3_seed_command(&committed, &card.meta, &seed.target)?;
+                    if command.digest_input.derived_argv.last().map(String::as_str) == Some("--lib")
+                        && !unit_build_added
+                    {
+                        if !committed.gates.candidate.iter().any(|name| name == "buildSelfhost")
+                            || !committed.commands.contains_key("buildSelfhost")
+                        {
+                            bail!("compile unit seed requires candidate-declared buildSelfhost");
+                        }
+                        // Library tests may invoke the CLI in this same clean
+                        // candidate snapshot. Keep the original later build too.
+                        commands.extend(static_collect_commands(&committed, &["buildSelfhost".into()])?);
+                        unit_build_added = true;
+                    }
+                    commands.push(command);
                 }
             } else {
                 commands.extend(static_collect_commands(
@@ -1990,7 +2055,8 @@ pub fn check_and_gate(
     let candidate_source = gitx::rev_parse(root, branch)?;
     let red_root_main = gitx::rev_parse(root, "main")?;
     let mut source_snapshot =
-        CollectSourceSnapshot::new(root, &candidate_source, &_storage_permit)?;
+        CollectSourceSnapshot::new_owned(root, &candidate_source, &_storage_permit,
+            crate::storage_policy::SnapshotOwner { round, task_id: &c.meta.task_id, attempt_id: &attempt_id, purpose: "collect" })?;
     let source_path = source_snapshot.path.clone();
     let worktree = source_path.as_path();
     if !c.meta.seeds.is_empty() {
@@ -2547,6 +2613,42 @@ mod tests {
     }
 
     #[test]
+    fn collect_snapshot_receipts_bind_owner_success_and_partial_initialization() {
+        let (root, _, candidate, main, _) = snapshot_test_history("collect-source-owner-receipt");
+        let permit = fixture_storage_permit(&root);
+        let owner = crate::storage_policy::SnapshotOwner {
+            round: "r17", task_id: "B99", attempt_id: "B99-A0004", purpose: "collect",
+        };
+        let mut source = CollectSourceSnapshot::new_owned(&root, &candidate, &permit, owner.clone()).unwrap();
+        let receipt = source.path.with_extension("receipt.json");
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(value["owner"]["round"], "r17");
+        assert_eq!(value["owner"]["attemptId"], "B99-A0004");
+        assert_eq!(value["head"], candidate);
+        assert_eq!(value["phase"], "selected");
+        source.close().unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(value["phase"], "removed");
+        // The exact commit remains available, but a clone with no main cannot initialize.
+        // Failure after clone must keep both the partial source and its original caller identity.
+        git(&root, &["branch", "-m", "main", "renamed-main"]);
+        assert!(CollectSourceSnapshot::new_owned(&root, &main, &permit, owner).is_err());
+        let retained = fs::read_dir(root.join(".cowork-temp")).unwrap().filter_map(|e| {
+            let p=e.unwrap().path();
+            if p.extension().is_some_and(|e|e=="json") {
+                let v:serde_json::Value=serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+                if v["phase"]=="retained" {return Some(v);}
+            }
+            None
+        }).collect::<Vec<_>>();
+        assert_eq!(retained.len(),1);
+        assert_eq!(retained[0]["owner"]["taskId"],"B99");
+        assert_eq!(retained[0]["head"],main);
+        assert!(Path::new(retained[0]["path"].as_str().unwrap()).join(".git").is_dir());
+        assert!(retained[0]["inode"].as_u64().is_some());
+    }
+
+    #[test]
     fn collect_snapshot_redirect_context_child() {
         let Ok(key) = std::env::var("ORCH_SNAPSHOT_CONTEXT_CHILD") else {
             return;
@@ -2614,6 +2716,95 @@ mod tests {
         )
         .unwrap();
         assert!(normalize_candidate_refs(&ambiguous).1.is_some());
+    }
+
+    #[test]
+    fn compile_unit_seed_lane_prebuilds_once_with_committed_order_and_digest() {
+        let (root, _) = init_repo("compile-unit-seed-lane");
+        fs::create_dir_all(root.join("coordination")).unwrap();
+        let source = include_str!("../../../../coordination/PROJECT-BINDING.yaml");
+        fs::write(root.join("coordination/PROJECT-BINDING.yaml"), source).unwrap();
+        let base = commit_all(&root, "signed candidate binding");
+        let binding = binding::parse_binding_bytes(source.as_bytes()).unwrap();
+        let mut changed: serde_yaml::Value = serde_yaml::from_str(source).unwrap();
+        let (_, mut meta) = compile_unit_seed_fixture();
+        meta.gates.fast = binding.gates.fast.clone();
+        meta.seeds = ["first", "second"].map(|name| serde_json::from_value(serde_json::json!({
+            "src": format!("coordination/seeds/{name}.rs"),
+            "target": format!("orch/crates/orch-host/src/{name}.rs"), "sha256": "a".repeat(64)
+        })).unwrap()).to_vec();
+        let mut card = card::Card { meta, body: String::new(), rel_path: "coordination/tasks/B370.md".into() };
+        let lane = resolve_collect_lane_plan(&root, "r95", &card, &[], "B370-A0001", &base, &base, &[]).unwrap();
+        let names = lane.commands.iter().map(|c| c.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, ["buildSelfhost", "seedTargets", "seedTargets", "check", "checkDefault", "buildDefault", "buildSelfhost"]);
+        assert_eq!(lane.commands[0].spec.argv, binding.commands["buildSelfhost"].argv);
+        assert_eq!(lane.commands[0].spec.timeout_seconds, binding.commands["buildSelfhost"].timeout_seconds);
+        assert_eq!(lane.trial_refs, binding.gates.merge);
+        let without_prebuild = resolved_collect_command_digest(&root, &base, &lane.commands[1..]).unwrap();
+        assert_ne!(lane.resolved_command_digest(), without_prebuild);
+        let mut reordered = lane.commands.iter().map(|c| c.digest_input.clone()).collect::<Vec<_>>(); reordered.swap(0, 1);
+        assert_ne!(lane.resolved_command_digest(), plan::resolved_command_argv_digest_at_policy_base(&root, &base, &reordered).unwrap());
+        card.meta.seeds.truncate(1);
+        card.meta.seeds[0].target = "orch/crates/orch-host/tests/existing.rs".into();
+        let integration = resolve_collect_lane_plan(&root, "r95", &card, &[], "B370-A0001", &base, &base, &[]).unwrap();
+        assert_eq!(integration.commands.iter().map(|c| &c.name).collect::<Vec<_>>(), binding.gates.candidate.iter().collect::<Vec<_>>());
+        card.meta.seeds[0].target = "orch/crates/orch-host/src/first.rs".into();
+        changed["gates"]["candidate"].as_sequence_mut().unwrap().retain(|name| name.as_str() != Some("buildSelfhost"));
+        fs::write(root.join("coordination/PROJECT-BINDING.yaml"), serde_yaml::to_string(&changed).unwrap()).unwrap();
+        let no_declared_build = commit_all(&root, "candidate omits build declaration");
+        assert!(resolve_collect_lane_plan(&root, "r95", &card, &[], "B370-A0001", &no_declared_build, &no_declared_build, &[]).is_err());
+        // Working-tree changes cannot remove a previously committed prerequisite.
+        assert!(resolve_collect_lane_plan(&root, "r95", &card, &[], "B370-A0001", &base, &base, &[]).is_ok());
+        changed["gates"]["candidate"].as_sequence_mut().unwrap().push(serde_yaml::Value::String("buildSelfhost".into()));
+        changed["commands"].as_mapping_mut().unwrap().remove(serde_yaml::Value::String("buildSelfhost".into()));
+        fs::write(root.join("coordination/PROJECT-BINDING.yaml"), serde_yaml::to_string(&changed).unwrap()).unwrap();
+        let no_command = commit_all(&root, "binding omits build command");
+        assert!(resolve_collect_lane_plan(&root, "r95", &card, &[], "B370-A0001", &no_command, &no_command, &[]).is_err());
+    }
+
+    fn compile_unit_seed_fixture() -> (binding::Binding, card::CardMeta) {
+        let binding = serde_yaml::from_str("commands:\n  seedTargets:\n    argv: [/absolute/cargo, test, --all-features, --locked, --manifest-path, orch/Cargo.toml]\n    timeoutSeconds: 1800\n").unwrap();
+        let meta = serde_json::from_value(serde_json::json!({
+            "taskId": "B370", "schemaVersion": 3, "seedProtocol": "seeded-red", "redForm": "compile"
+        })).unwrap();
+        (binding, meta)
+    }
+
+    #[test]
+    fn compile_unit_seed_command_preserves_prefix_and_selects_whole_library() {
+        let (binding, meta) = compile_unit_seed_fixture();
+        let command = schema3_seed_command(&binding, &meta, "orch/crates/orch-host/src/fusion_timeout_contract.rs").unwrap();
+        assert_eq!(command.digest_input.derived_argv, ["-p", "orch-host", "--lib"]);
+        let mut expected = binding.commands["seedTargets"].argv.clone();
+        expected.extend(["-p", "orch-host", "--lib"].map(str::to_string));
+        assert_eq!(command.spec.argv, expected);
+        assert_eq!(command.spec.timeout_seconds, binding.commands["seedTargets"].timeout_seconds);
+        assert_eq!(command.name, "seedTargets");
+        let integration = schema3_seed_command(&binding, &meta, "orch/crates/orch-host/tests/existing.rs").unwrap();
+        assert_eq!(integration.digest_input.derived_argv, ["-p", "orch-host", "--test", "existing"]);
+    }
+
+    #[test]
+    fn compile_unit_seed_command_rejects_other_contracts_and_unsafe_paths() {
+        let (binding, mut meta) = compile_unit_seed_fixture();
+        let target = "orch/crates/orch-host/src/fusion_timeout_contract.rs";
+        for red in [None, Some("assertion".to_string())] {
+            meta.red_form = red;
+            assert!(schema3_seed_command(&binding, &meta, target).is_err());
+        }
+        meta.red_form = Some("compile".into());
+        meta.seed_protocol = Some("verify-only".into());
+        assert!(schema3_seed_command(&binding, &meta, target).is_err());
+        meta.seed_protocol = Some("seeded-red".into());
+        meta.schema_version = Some(2);
+        assert!(schema3_seed_command(&binding, &meta, target).is_err());
+        meta.schema_version = Some(3);
+        for bad in ["/orch/crates/orch-host/src/a.rs", "./orch/crates/orch-host/src/a.rs", "orch/crates/orch-host/src/../a.rs", "orch/crates/orch-host/src/nested/a.rs", "orch/crates/orch-host/src/a.txt", "orch/crates/--evil/src/a.rs", "orch/crates/orch-host/src/a/b.rs"] {
+            assert!(schema3_seed_command(&binding, &meta, bad).is_err(), "{bad}");
+        }
+        let mut terminated = binding;
+        terminated.commands.get_mut("seedTargets").unwrap().argv.push("--".into());
+        assert!(schema3_seed_command(&terminated, &meta, target).is_err());
     }
 
     #[test]

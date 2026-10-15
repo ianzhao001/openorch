@@ -6,7 +6,10 @@ OpenOrch connects installed AI harnesses to Codex Desktop and DSH Web through on
 shared skill and a bundled local runtime. Choose your own clients/models, consult
 one or several members, and let the current host synthesize their original answers.
 
-Plugin release: [`v0.1.0-alpha.14`](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.14) · runtime binaries: `0.1.0`.
+Source snapshot updated **2026-10-15** — see [Unreleased changes](CHANGELOG.md).
+Latest source tag: [`v0.1.0-alpha.14`](https://github.com/ianzhao001/openorch/tree/v0.1.0-alpha.14).
+Latest downloadable bundle: [`v0.1.0-alpha.13`](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.13).
+Runtime version: `0.1.0`. The source tag, current main and downloadable bundle are different snapshots.
 
 ## 中文
 
@@ -16,14 +19,16 @@ Plugin release: [`v0.1.0-alpha.14`](https://github.com/ianzhao001/openorch/relea
 DSH 插件管理还使用其正常的 Node.js/pnpm 环境，并从官方包源安装声明的技能依赖。
 完整 Release 包已包含运行核心，使用者不需要 Rust，也不需要任何私有仓库。
 
+截至 2026-10-15，`alpha.14` 只有源码标签，没有可下载的 Release 附件。
+[历史 Release](https://github.com/ianzhao001/openorch/releases) 中最新有附件的是 `alpha.13`；
+它不包含当前 main 的未发布修复，也不包含 `alpha.14` 的 DSH `AGENTS.md` 包白名单修复。
+使用历史包时按该包自己的说明和 SHA-256 文件验证；需要当前代码时，使用下方源码构建说明。
+本次只同步源码与文档，不发布或替换任何版本的二进制。
+
+以下安装命令适用于已经下载、校验并解压的完整版本包：
+
 ```sh
-release=v0.1.0-alpha.14
-bundle=openorch-$release-darwin-arm64
-base=https://github.com/ianzhao001/openorch/releases/download/$release
-curl -fLO "$base/$bundle.tar.gz"
-curl -fLO "$base/$bundle.tar.gz.sha256"
-shasum -a 256 -c "$bundle.tar.gz.sha256"
-tar -xzf "$bundle.tar.gz"
+bundle=/absolute/path/to/extracted-release
 python3 "$bundle/install.py" --host both
 ```
 
@@ -56,7 +61,17 @@ Codex 安装后打开新任务使用 OpenOrch。DSH Web 新会话选择包含 Sk
 详细配置、显式成员覆盖、问题文件与项目内文本附件见
 [插件说明](plugins/openorch/README.md)和[助手命令](plugins/openorch/HELPER.md)。
 
-### 当前支持边界
+### 本次源码更新（未发布）
+
+- Consult 保留适配器报告的超时类型，避免以总耗时重新推断失败原因。
+- DSH 已观察到原生终态但最终答卷集合不合法时，保留终态事实，同时继续以退出码 74 拒绝成功。
+- `orch-ui` 按 grapheme 的显示列宽裁切终端文字。
+- 可选 `selfhost` 增加按实际分配空间计量的存储策略、保留窗口和带完整恢复证据的精确清理；
+  归属确认不等于删除许可。默认六命令产品面不增加这些维护入口。
+
+这些是已同步的源码行为，不代表历史安装包已获得更新，也不承诺任意工作区都能满足容量上限。
+
+### 当前源码支持边界
 
 | 类型 | 本版支持 |
 | --- | --- |
@@ -86,8 +101,8 @@ python3 /path/to/release/install.py --host dsh --uninstall
 
 ### 运行时来源与源码
 
-本版从固定产品源码构建，包内 `runtime/provenance.json` 记录源码提交、工具链与
-构建参数，并对应本 Release tag；不能借用其它版本的资格证明。
+完整版本包应从固定产品源码构建；包内 `runtime/provenance.json` 记录该包的源码提交、
+工具链与构建参数，并对应它自己的 Release tag，不能借用其它版本的资格证明。
 全包 `manifest.json` 与包内七资源 `runtime/manifest.json` 用于检测字节变化。
 核心是 macOS ad-hoc 签名，没有 Apple Developer ID 签名或 notarization；不宣称
 可复现构建或不存在的 GitHub attestation。验证示例：
@@ -98,7 +113,7 @@ codesign --verify --strict "$bundle/plugins/openorch/runtime/orch"
 "$bundle/plugins/openorch/runtime/orch" guide --check
 ```
 
-发布验证使用 Rust 1.98.0；暂未声明 MSRV。构建核心可运行：
+历史发布验证使用 Rust 1.98.0；暂未声明 MSRV。构建核心可运行：
 
 ```sh
 cargo build --release -p orch-cli --no-default-features \
@@ -118,14 +133,19 @@ cargo build --release -p orch-cli --no-default-features \
 
 ### Install and use
 
-Use the complete [Release](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.14)
-archive on Apple Silicon macOS. Python3.9+, Git and the native Codex/DSH client are
+As of 2026-10-15, `alpha.14` is a source tag without downloadable Release assets.
+The latest bundle with assets is [alpha.13](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.13);
+it does not include current main's unreleased fixes or alpha.14's DSH `AGENTS.md`
+package-allowlist fix. Follow that bundle's own instructions and checksum when
+using a historical release, or build current source using the commands above.
+This update publishes source and documentation, not new or replacement binaries.
+Complete historical bundles target Apple Silicon macOS. Python3.9+, Git and the native Codex/DSH client are
 required. DSH uses its normal Node.js/pnpm environment and fetches the declared
 filesystem-skill dependency. The bundle includes the runtime; Rust and the private
 development repository are not required. The source checkout alone is not an
 installable runtime bundle.
 
-Verify and extract the archive using the commands above, then run
+Verify the chosen archive against its accompanying SHA-256 file, extract it, then run
 `python3 BUNDLE/install.py --host both`. Select `codex` or `dsh` for one host.
 Optional `--codex-bin`, `--dsh-bin` and `--prefix` accept explicit paths. Reuse the
 same prefix for updates/removal. Native registrations are reported only after
@@ -138,6 +158,15 @@ native model settings and defaults. Discovery calls no models and does not verif
 login. Save one single advisor and optionally two to five fusion aliases. The
 mode0600 personal profile is reused across projects; existing project configuration
 is preserved. Dirty/linked worktrees work, and no initial Git commit is created.
+
+### Current source changes (unreleased)
+
+- Consult preserves adapter-reported timeout identity instead of reclassifying failures from elapsed time.
+- DSH retains the observed native terminal fact when final-answer validation fails, while still refusing success with exit 74.
+- `orch-ui` clips terminal text by grapheme display width.
+- Optional `selfhost` adds allocated-byte storage accounting, retention windows and exact retirement with complete recovery evidence. Ownership classification alone never grants deletion permission; these maintenance commands are not added to the default six-command surface.
+
+These source changes do not update historical bundles or guarantee that every workspace can meet a storage budget.
 
 ### Codex host coordination
 
@@ -174,7 +203,7 @@ The bundled `runtime/provenance.json` identifies fixed source inputs and
 compiler/build details for this Release tag; it does not reuse an older
 release's source-equality claim. The core is ad-hoc signed, not Developer ID signed
 or notarized; no reproducible-build or unavailable attestation claim is made.
-Build-from-source commands and signature checks appear above; Rust1.98.0 was used,
+Build-from-source commands and signature checks appear above; historical release validation used Rust1.98.0,
 and no MSRV is declared.
 
 The public snapshot includes product sources and their relative-path SHA-256
@@ -186,7 +215,7 @@ full private selfhost test history. See the [plugin README](plugins/openorch/REA
 
 ## MCP / ACP
 
-`0.1.0-alpha.14` includes four MCP tools for Codex through a package-local
+The current source includes four MCP tools for Codex through a package-local
 stdio server; DSH retains the shared skill/helper entry and has no MCP claim.
 Rust now owns personal configuration, default selection and setup through the
 same parser and consultation lifecycle as CLI/Web. Python is a verified launcher.

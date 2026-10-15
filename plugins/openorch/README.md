@@ -9,9 +9,15 @@ Git projects.
 
 ## 安装 / Install
 
-本次为 [`0.1.0-alpha.14`](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.14)
-Release。使用经验证的完整 Apple Silicon macOS 安装包；三个核心程序的版本均为 `0.1.0`。
-源码仓本身不含预编译运行时，不能代替完整安装包。
+当前 main 是含未发布变更的源码快照，详见 [公开更新记录](PUBLIC-CHANGELOG.md)。
+截至 2026-10-15，`alpha.14` 仅有[源码标签](https://github.com/ianzhao001/openorch/tree/v0.1.0-alpha.14)，
+没有可下载附件；[alpha.13](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.13)
+是最新带附件的历史包，但不含 alpha.14 的 DSH `AGENTS.md` 白名单修复或 main 的未发布改动。
+三个核心程序版本仍为 `0.1.0`；源码仓不含预编译运行时。
+
+Current main contains unreleased source changes. Alpha.14 has a source tag only;
+the historical alpha.13 bundle does not include its DSH policy-file packaging fix
+or current main's changes. This source sync does not publish new binaries.
 
 Use the verified Release bundle. It includes
 the default CLI, MCP and ACP binaries plus four channel resources. No Rust toolchain is needed.
@@ -148,7 +154,7 @@ public checkout with exact old-ref checks, then verify public downloads and inst
 
 ## MCP / ACP
 
-`0.1.0-alpha.14` includes four MCP tools for Codex through a package-local
+The current source includes four MCP tools for Codex through a package-local
 stdio server; DSH retains the shared skill/helper entry and has no MCP claim.
 Rust now owns personal configuration, default selection and setup through the
 same parser and consultation lifecycle as CLI/Web. Python is a verified launcher.

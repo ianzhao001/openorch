@@ -3104,6 +3104,8 @@ pub struct ResolvedCommandArgvV1 {
     pub binding_command_ref: String,
     /// Empty for a static binding command, or exactly
     /// `-p <safe-package> --test <safe-test>` for one derived Rust test.
+    /// Schema-3 compile-red unit seeds use `-p <safe-package> --lib` under
+    /// `seedTargets` only; no module-name or test-name filter is inferred.
     pub derived_argv: Vec<String>,
 }
 
@@ -3147,6 +3149,15 @@ fn validate_resolved_command_input(command: &ResolvedCommandArgvV1) -> Result<()
         }
         return Ok(());
     }
+    if command.command_ref == "seedTargets"
+        && command.derived_argv.len() == 3
+        && command.derived_argv[0] == "-p"
+        && command.derived_argv[2] == "--lib"
+        && safe_resolved_command_component(&command.derived_argv[1])
+        && !command.derived_argv[1].starts_with('-')
+    {
+        return Ok(());
+    }
     if !matches!(
         command.command_ref.as_str(),
         "seedTargets" | "sourceReaderClosure"
@@ -3157,7 +3168,7 @@ fn validate_resolved_command_input(command: &ResolvedCommandArgvV1) -> Result<()
         || !safe_resolved_command_component(&command.derived_argv[3])
     {
         bail!(
-            "resolved command {} derived argv 必须是 exact `-p <package> --test <test>`",
+            "resolved command {} derived argv 必须是 exact `-p <package> --test <test>` 或 seedTargets-only `-p <package> --lib`",
             command.command_ref
         );
     }
@@ -5281,6 +5292,26 @@ fn validation_event_exists(root: &Path, round: &str, revision: u32, digest: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compile_unit_seed_digest_selector_is_closed_and_seed_only() {
+        let lib = ResolvedCommandArgvV1 {
+            command_ref: "seedTargets".into(), binding_command_ref: "seedTargets".into(),
+            derived_argv: ["-p", "orch-host", "--lib"].map(str::to_string).to_vec(),
+        };
+        validate_resolved_command_input(&lib).unwrap();
+        for argv in [vec!["-p", "orch-host"], vec!["-p", "orch-host", "--lib", "filter"], vec!["-p", "../escape", "--lib"], vec!["-p", "--evil", "--lib"], vec!["--lib", "-p", "orch-host"]] {
+            let mut invalid = lib.clone(); invalid.derived_argv = argv.into_iter().map(str::to_string).collect();
+            assert!(validate_resolved_command_input(&invalid).is_err());
+        }
+        for name in ["sourceReaderClosure", "check", "testFast"] {
+            let mut invalid = lib.clone(); invalid.command_ref = name.into();
+            assert!(validate_resolved_command_input(&invalid).is_err());
+        }
+        let mut integration = lib; integration.derived_argv = ["-p", "orch-host", "--test", "contract"].map(str::to_string).to_vec();
+        validate_resolved_command_input(&integration).unwrap();
+    }
+
 
     const MODE: &str = r#"
 agents:

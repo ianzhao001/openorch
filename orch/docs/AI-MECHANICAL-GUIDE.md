@@ -908,6 +908,173 @@ worktree clean，且提交已被 main 包含或有保全 ref。runtime-owned 对
 而不是默认等待 TTL 或闭轮；shared/user-owned、active、dirty、blocked、debug 或身份不明对象必须保留。
 本实现只管理磁盘，幂等报告 removed/held/failed、逻辑占用与各文件系统可用空间；不探测或回收 RSS，
 不终止进程，不增加后台服务。禁止用 broad 进程名匹配或目录年龄代替 ownership 证明。
+### Project budget, retention and preserved retirement
+
+Optional strict `coordination/STORAGE-POLICY.yaml` has `schemaVersion: 1`, positive
+`maxAllocatedBytes` and `keepRecentRounds` (1-1000). No file and no prior activation preserves
+legacy behavior, including callers using ordinary /var or /tmp aliases. Enabled policies require
+a canonical absolute root; missing-after-activation, unknown fields, invalid limits and incomplete
+observations fail closed. Optional `persistentPaths` names exact non-round `.cowork-temp/<name>`
+workspaces with reasons; it cannot override known expired ownership, and those bytes still count.
+GC apply and close preserve an activation latch; deleting a policy cannot silently disable it.
+
+Whole-project accounting uses lstat, `st_blocks * 512`, and dev/inode dedup without following
+symlinks. Git, source, caches, evidence and on-project backups all count. This is du-style allocated
+usage, not exclusive APFS extent ownership. Existing logical-byte fields keep their meanings.
+Maintenance adds `projectStorage.projectAllocatedBytes/maxAllocatedBytes/retainedRounds/expiredPaths/`
+`unclassifiedPaths/policySatisfied`. Remaining diagnostic targets are unresolved, not an omitted zero.
+The window includes the closing round: keep=3 at r97 retains r95-r97. A cap violation, expired scene
+or unresolved ownership blocks close. Host close checks before protocol effects, before DONE and
+at RoundClosed append, comparing policy identity and reserving 16 MiB for close metadata. Force
+cannot bypass it; TaskRecorded is not rolled back and cleanup remains available above the limit.
+External writes after the final observation are outside this synchronous close guarantee.
+
+Existing unified GC, the direct host reaper and the shared physical boundary retain complete
+worktrees in this window, before native monitor effects. Refusal is per site: another ended
+site with only a target is still reclaimable. Independent target sweeps keep their eligibility
+probe; a read-only target probe is not whole-worktree deletion permission.
+
+For an old managed diagnostic source lacking a historical worksite receipt, optional policy
+`roundCustody` entries declare present-day retention only. Each binds one exact `.cowork-temp`
+source `path`, `round`, current source `device`/`inode`, full `head`, and `evidencePath`/
+`evidenceSha256` for the existing removed diagnostic record with matching root/cwd/head/round purpose.
+The diagnostic target inode is never reused as the source identity. Full existing diagnostic registration must verify as removed, with no reappeared target, and the
+owner round must be closed. Duplicate paths, source/HEAD
+or evidence drift, future rounds and contradictory claims fail closed. This is not a fabricated
+historical lease, snapshot, native terminal or cleanup permission. The source remains counted,
+becomes expired outside the window, and physical retirement retains all existing guards. Remove a
+custody declaration only as part of verified retirement or an independently reviewed identity update.
+Interrupted retirement still binds custody to the exact original manifest identity and requires its
+matching prior receipt plus physical identity/digest/backup checks; a missing source alone is not
+recovery evidence. Ordinary assessment still refuses missing or changed declared source identity.
+
+### Legacy collect-source retention declarations
+
+Optional `legacyCollectSourceCustody` entries in STORAGE-POLICY are present-day declarations,
+not historical producer receipts. Each entry binds `path`, `round`, `task`, `attempt`, `device`,
+`inode`, full `head` and `tree`, `exitReceiptPath`/`exitReceiptSha256`, and `logPath`/`logSha256`.
+The exact independent clean collect-source root, matching completed collection event, original
+failed seal launcher terminal and exact retained-source log line must agree. Evidence paths stay
+in that round's runtime logs; duplicate declarations, overlapping claims or producer receipts,
+changed bytes/identity, a present producer PID or unproved current quiet state all refuse admission.
+A parent's exit alone does not establish descendant termination; current lsof/process checks are
+separate observations. The source can belong to the open current round and remains fully counted.
+It expires with its original round under the normal retention window. This declaration feeds only
+assessment: it grants neither whole-source nor cache retirement, does not satisfy owner_guard,
+and does not invent a lease, native terminal or successful lifecycle event. Missing entries retain
+existing behavior; existing removed-diagnostic roundCustody validation remains unchanged.
+
+Optional `legacyFailedCollectionCustody` is a separate evidence branch for retained failed
+collection sources without launcher receipts. Each entry has strict `source:{path,round,task,
+attempt,device,inode,head,tree}`, `executingEventId`, `releasedEventId`, `completedEventId`,
+`logPath`, `logBytes`, and `logSha256`. Exact unique Executing/Released events must have matching
+runtime actor, task/round, action, owner, lease generation, attempt/agent/base/GO/REPORT/control
+lineage and an actual failed collect/trial gate between them. Claimed-only, outcomeUnknown,
+contradictory success, duplicate or overlapping executions refuse. A distinct later Completed
+event binds the same attempt and REPORT identity to the current HEAD; it does not make the
+original failed action successful or prove its processes ended. Archived attempts remain valid.
+The original round-local log's bytes/digest and exact retained-source line are checked separately
+from the REPORT digest. Their association is a current explicit declaration, not a claim that the
+historical producer cryptographically bound that log to its event. No PID, exit code, finishedAt,
+lease or producer receipt is invented. Shared source identity/conflict checks and current quiet
+remain mandatory. This branch only classifies retention, counts every byte and expires normally;
+classification alone never satisfies owner_guard or authorizes source/cache retirement. The launcher branch requirements are unchanged.
+
+### Explicit recorded legacy debug retirement
+
+Classification never authorizes deletion. Assessment additionally returns `legacyCustody`
+with each validated `source`, `custodyKind` (`sealLauncher` or `failedCollection`) and
+`custodySha256`. The digest is SHA256 of serde_json serialization of the complete typed custody
+entry, including all original evidence references; use the returned digest rather than hashing
+raw YAML. It is an identity binding, not a permit or historical producer receipt.
+
+A separately authorized manifest entry may add strict `legacyDebugRetirement:{taskId,
+custodyKind,custodySha256,recordedEventId,mergeExecutedEventId,recordedAttemptId,recordedHead}`.
+This proof is accepted only for one independent `.cowork-temp/collect-source-*` preserved parent,
+`path` exactly `<parent>/orch/target/debug`, `excludedCaches:["orch/target/debug"]`, directory kind,
+non-null HEAD and no archivePath. It never permits whole source, full target, test-tmp or shared
+main debug. Missing proof retains the old behavior and old receipt serialization.
+
+The selected full custody is revalidated, not merely its digest. Any overlapping claim or
+producer receipt (including same-round terminal ownership) refuses this legacy exception. The
+existing full root-record authorization and seal postcondition validators must prove the exact
+last schema3 local-worktree dispatch and canonical PASS/MergeStarted/MergeExecuted/TaskRecorded
+chain. A thin TaskRecorded row is insufficient; later activity, wrong task/attempt/head/event,
+missing artifacts or ambiguous history hold. Actual Git ancestry must establish source HEAD <=
+recorded candidate <= recorded merge <= the operation's pinned main; shallow, replacement/graft
+history or Git environment ambiguity refuses. This narrow proof may satisfy only the open-owner
+without overlapping task condition; all inventory/WAL/claims/heartbeat/native/use checks remain.
+
+Full independent non-debug source and Git preservation, restored HEAD/status/index and fsck,
+no borrowed objects, no tracked excluded files and no Git markers in debug precede effects.
+Current lsof/process checks are observations, not a claim every historical descendant terminated.
+Known producer/runner presence or uncertain current ownership/use stays HOLD. The task later
+finishing does not rewrite an earlier failed operation into success.
+
+The new proof, parent identity, non-debug/Git bytes, backups and current use are revalidated during
+normal removal, quarantine recovery, absent-cache reconciliation and removed-receipt replay.
+Missing cache is not a preservation shortcut. No prior receipt plus absence holds; reappeared
+cache/quarantine is ABA even if its inode happens to match. A regenerated cache needs a new
+manifest/identity/preservation check. Main and ownership are rechecked at effect boundaries;
+interruption or drift preserves the remaining scene instead of claiming a successful deletion.
+
+`sites gc --retire-manifest <JSON>` handles one exact object, optionally with `--dry-run`, and
+conflicts with `--round`. This branch does not reconcile native receipts. Strict top-level fields
+are `schemaVersion:1`, absolute `projectRoot`, nonempty `authorization`, Unix-seconds `expiresAt`
+and one `entries` item. An entry binds relative `path`, actual owner `round`, directory `device/inode`,
+full `head` (null for non-Git), `kind` (directory/linked-worktree), `sourceDigest`, `backupPath`, and
+`excludedCaches`; optional fields below select bounded recovery behavior.
+
+Allowed subjects are one scratch/worktree child, its fixed Cargo target/debug/test-tmp boundary,
+registered diagnostic targets, and root target test-tmp/release. The main source root, primary Git,
+canonical evidence/config and shared debug are protected. Backups reside under
+`coordination/runtime/site-archives/`, outside the source/deletion boundary, without shared mutable
+source inodes. Digests cover raw path/type/mode/content/symlink bytes, full Git data and unique files;
+they do not promise ACL/xattr/owner/hardlink-topology equality. Transient Git monitor IPC is not data.
+Independent Git backups must actually recover HEAD/status and pass fsck. Linked worktrees require
+`gitPreservation:{commonBackup,commonDigest,privateBackup,privateDigest,restoredWorktree}` and verified
+whole common/private Git, content and index recovery before exact native `git worktree remove`.
+
+`excludedCaches` is empty or exactly one of `orch/target` and `orch/target/debug`; it is allowed only
+with a proved Git source and cannot contain tracked source. Every excluded physical subtree is
+still scanned for Git markers, including its root: an independent experiment or generated Git
+fixture is never silently discarded. To reclaim only an ended cache while keeping its recent
+source, supply `preservationRoot:{path,device,inode}` and set `path` to that root plus the exact
+exclusion. Choosing debug alone preserves test-tmp and all fixture bytes. Fixed owner receipts from
+collect/root-verdict/record are written adjacent to a snapshot before clone and after select/failure/
+removal; callers supply the actual round/task/attempt/purpose, never the clone's stale CURRENT.
+Drop/retained is not native completion; explicit retirement receipts do not invent old clone owners.
+
+Preservation hashes FIFO fixture paths, type and permission mode without opening or reading their
+streams. Intact archival retains them and original-path restoration keeps their historical identity.
+Other unsupported special files still HOLD; the existing transient Git fsmonitor socket exception
+remains limited to Git IPC metadata. This does not certify a FIFO producer as ended.
+
+For an expired directory with raw historical fixture topology, optional `archivePath` selects intact
+relocation to another exact on-project archive path. This mode requires kind=directory, no cache
+exclusions, a complete independently verified backup, and an existing destination parent. It uses
+an exclusive same-filesystem rename, not recursive deletion. Nested valid or malformed Git fixture
+bytes stay intact. Archive-relative fixture usability is not asserted: recover to the original
+absolute path, then verify the saved digest and original Git pointer topology. Linked top-level
+worktrees still use their native removal path; their raw test-tmp child may first be archived intact.
+Raw test-tmp entry retirement is archive-only. Archives remain in the capacity total, and archived/
+already-archived/reconciled-archive report zero newly removed bytes.
+
+Every operation rechecks all-round claims/WAL/intents, current task ownership, snapshot producers,
+heartbeats, process references, strict lsof, source/backup bytes, path/ancestor identities and Git
+layout. Native-bound sites still require trusted quiescence/artifact evidence; local absence alone
+cannot upgrade an unknown persistent native job. No broad kill, shared-service stop or historical
+ledger/session/lease rewrite is authorized. Historical dirty/BLOCKED facts are preserved, not success.
+
+Durable per-manifest receipts live under `storage-maintenance/retirements/`. Ordinary deletion uses
+prepared/renamed/removed and a unique no-clobber quarantine; a cache quarantine lies outside its
+preserved source. Completed replay deletes nothing and rejects reappeared objects. Rename-before-
+receipt can resume only with original identity and full preservation; partial deletion holds for
+backup recovery. Prior intent plus absent source/quarantine only reconciles absence with zero new
+deletions; a remaining linked registry needs native Git recovery. Intact archival uses archive-
+prepared/archived, verifies the relocated original inode and full digest, and has the same no-clobber,
+interruption and replacement boundaries. No prior receipt means absence alone is never success.
+
 <!-- orch-guide-section-end:leases -->
 
 <!-- orch-guide-section:nudge-resume -->
@@ -991,6 +1158,10 @@ Pi、ZCode、DSH 三个受管 stream wrapper 以机器可读
 | 71 | `empty` | `truncated-no-terminal` |
 | 72 | `timedOut` | `hard-deadline` |
 | 74 | `failed` | `identity-drift`（DSH） |
+
+DSH 的 `terminal=yes` 只表示已观察到原生终态；最终候选集合未通过校验时，
+仍以 `cause=unresolved-final-set`、退出码 74 拒绝成功发布。该拒绝不抹去已观察
+的终态事实，也不改变超时、provider 非零退出或缺终帧 EOF 的既有优先级。
 
 manifest 只描述 wrapper 保留码。为兼容既有冻结契约，provider-native 非零退出码仍可逐字
 透传；它们统一归 `failed`，原码与原因保留在 provider/supervisor 证据中，不被伪装成
@@ -1119,6 +1290,20 @@ orch round close --note "<round summary>"
 
 `--allow-stale-binary` 在每个状态变更命令上都存在，但它是**留证逃生舱、不是恢复手段**：
 build imprint 与 main 不一致时的正常动作是用当前源码 locked rebuild，再重试原命令。
+### 编译红 unit seed 的候选执行
+
+schema 3 的 `seeded-red` / `redForm: compile` 可将种子落在规范的
+`orch/crates/<package>/src/<file>.rs`。候选 `seedTargets` 保留已提交 binding 的 argv 前缀与
+超时，派生 `-p <package> --lib` 并纳入原有 resolved-command digest 重算；运行整个包的
+library tests，不从文件名猜 module/test filter。既有 integration selector、其余候选门与完整
+merge 门保持原契约。此处不提供 assertion-red unit seed 的结果归属能力，也不把任意 src 文件
+视为已执行的测试；planner 必须保留 module 可达性并核对具名种子测试实际执行，零测试不是交付证明。
+整包库测试可依赖同一干净快照内的 selfhost CLI：首次 `--lib` seed 门之前额外执行一次
+policy-base 的 `buildSelfhost`，该命令必须同时存在于 committed commands 与 candidate lane；
+缺失时拒绝，不合成构建命令或借用 root 二进制。原候选顺序（含后置构建）全部保留，前置构建
+按正常门失败即停、记录独立 gateRunId，并按实际出现位置计入有序摘要，不按 commandRef 去重。
+`sourceReaderClosure` 仍只接受既有 `--test` 选择器，不借此获得 `--lib` 或任意附加参数。
+
 <!-- orch-guide-section-end:worked-example -->
 
 <!-- orch-guide-section:quick-reference -->

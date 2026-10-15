@@ -1855,6 +1855,9 @@ fn reap_physical(
     freed_bytes: &mut u64,
     sink: &mut JournalSink<'_>,
 ) -> Result<ReapOne> {
+    if let Some(reason) = crate::storage_policy::retained_worktree_reason(root,round,worktree)? {
+        return Ok(ReapOne::quiet_refusal(reason));
+    }
     let bytes_before = reclaim_boundary_bytes(worktree, target)?;
 
     if worktree.exists() {
@@ -2070,6 +2073,11 @@ where
             ) {
                 continue;
             }
+            if let Some(reason)=crate::storage_policy::retained_worktree_reason(root,round,&root.join(&site.worktree))? {
+                outcome.refused.push(format!("{}: {reason}",site.site_id));
+                outcome.refused_details.push((site.site_id.clone(),reason));
+                continue;
+            }
             let mut freed_bytes = 0;
             let result = reap_one(
                 root,
@@ -2197,7 +2205,7 @@ pub(crate) fn maintenance_sites(events: &[EventRecord]) -> (Vec<Site>, Option<St
     )
 }
 
-fn maintenance_evidence(
+pub(crate) fn maintenance_evidence(
     root: &Path,
     round: &str,
     events: &[EventRecord],
@@ -2855,6 +2863,11 @@ fn maintain_one_site_guarded(
     let original_inventory = crate::reclaim::storage_inventory(root);
     let mut pending_monitor = None;
     let observation = (|| -> Result<(PathBuf, PathBuf, PathBuf, Vec<(PathBuf, u64, u64)>)> {
+        if !dry_run {
+            if let Some(reason)=crate::storage_policy::retained_worktree_reason(root,round,&root.join(&site.worktree))? {
+                bail!("{reason}");
+            }
+        }
         if !site.has_production_path_contract() {
             bail!("site paths are not canonical; no adoption");
         }

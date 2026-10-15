@@ -331,6 +331,8 @@ impl AppState {
     }
     /// Pure bounded Buffer rendering, including zero-size and Unicode screens.
     /// Each untrusted field is sanitized before layout clipping.
+    /// Single-line fields retain a whole-grapheme prefix within the display-column
+    /// budget; zero columns render empty and multi-column glyphs are never split.
     pub fn render(&self, width: u16, height: u16) -> Buffer {
         let mut b = Buffer::empty(Rect::new(0, 0, width, height));
         if width == 0 || height == 0 {
@@ -531,7 +533,21 @@ fn safe_json(v: &impl serde::Serialize) -> String {
     safe_observation_text(&serde_json::to_string(v).unwrap_or_else(|_| "unavailable".into()))
 }
 fn clip(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
+    if n == 0 {
+        return String::new();
+    }
+    let line = Line::from(s);
+    let mut out = String::new();
+    let mut width = 0;
+    for grapheme in line.styled_graphemes(Style::default()) {
+        let next = Span::raw(grapheme.symbol).width();
+        if next > n - width {
+            break;
+        }
+        out.push_str(grapheme.symbol);
+        width += next;
+    }
+    out
 }
 fn wrap(s: &str, n: usize) -> Vec<String> {
     let n = n.max(1);

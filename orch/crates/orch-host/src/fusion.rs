@@ -363,7 +363,6 @@ fn run_member(
 
     let tag = format!("member-{}-{}", member.index, member.member);
     let log_dir = skeleton.dir.join("adapter-logs");
-    let adapter_started = Instant::now();
     match adapter::run(
         &member.member,
         prompt,
@@ -403,24 +402,7 @@ fn run_member(
                 }
             }
         }
-        Err(error) => {
-            let timed_out = adapter_started.elapsed() >= timeout;
-            let classified = classify_adapter_outcome(&FailureEvidence {
-                timed_out,
-                ..FailureEvidence::default()
-            });
-            let class = match classified {
-                AdapterOutcome::Failure { class, .. } => class,
-                AdapterOutcome::Success => FailureClass::Unknown,
-            };
-            outcome.status = if timed_out {
-                MemberStatus::TimedOut
-            } else {
-                MemberStatus::Failed
-            };
-            outcome.failure_class = Some(class);
-            outcome.reason = Some(format!("adapter 调用失败：{error:#}"));
-        }
+        Err(error) => apply_adapter_error(&mut outcome, error),
     }
     if let Err(error) = registered_worktree.remove() {
         outcome.status = MemberStatus::Failed;
@@ -430,6 +412,25 @@ fn run_member(
         outcome.reason = Some(format!("成员现场自清理失败：{error:#}"));
     }
     finish_member(skeleton, outcome, started)
+}
+
+fn apply_adapter_error(outcome: &mut MemberOutcome, error: anyhow::Error) {
+    let timed_out = error.downcast_ref::<adapter::AdapterTimeout>().is_some();
+    let classified = classify_adapter_outcome(&FailureEvidence {
+        timed_out,
+        ..FailureEvidence::default()
+    });
+    let class = match classified {
+        AdapterOutcome::Failure { class, .. } => class,
+        AdapterOutcome::Success => FailureClass::Unknown,
+    };
+    outcome.status = if timed_out {
+        MemberStatus::TimedOut
+    } else {
+        MemberStatus::Failed
+    };
+    outcome.failure_class = Some(class);
+    outcome.reason = Some(format!("adapter 调用失败：{error:#}"));
 }
 
 fn finish_member(
@@ -621,6 +622,10 @@ fn is_seed_fixture_root(root: &Path) -> bool {
     text.contains("/orch/target/test-tmp/consult-fusion-")
         || text.contains("/orch/target/test-tmp/consult-artifacts-")
 }
+
+#[cfg(test)]
+#[path = "fusion_timeout_contract.rs"]
+mod timeout_contract;
 
 #[cfg(test)]
 mod tests {

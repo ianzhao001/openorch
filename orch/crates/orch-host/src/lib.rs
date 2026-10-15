@@ -110,6 +110,9 @@ pub mod snapshot;
 pub mod staleness;
 #[cfg(feature = "selfhost")]
 pub mod storage;
+/// Project storage-budget and retirement contracts, available only to selfhost operations.
+#[cfg(feature = "selfhost")]
+pub mod storage_policy;
 #[cfg(feature = "selfhost")]
 pub mod tierf;
 pub mod util;

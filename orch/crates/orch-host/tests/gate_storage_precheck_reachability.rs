@@ -230,8 +230,8 @@ fn fresh_and_held_production_closures_are_complete() {
             production_prefix(&close),
             "attempt_id: &authorization.attempt_id"
         ),
-        9,
-        "four close gates and their records plus recovery-source admission must inherit the durable root authorization attempt"
+        10,
+        "four close gates and their records plus recovery-source admission and owner receipt must inherit the durable root authorization attempt"
     );
 }
 
@@ -242,7 +242,7 @@ fn recovery_source_preparation_has_its_own_authorized_storage_admission() {
     let close = source("close.rs");
     let recovery = item(&close, "fn run_record_locked(");
     let guard = position(recovery, "let permit = crate::storage::guard_gate_operation(");
-    let prepare = position(recovery, "prepare_record_gate_source(root, &gate_wt, &permit)?");
+    let prepare = position(recovery, "prepare_record_gate_source(root, &gate_wt, &permit, crate::storage_policy::SnapshotOwner");
     assert!(guard < prepare, "admission must precede recovery source preparation");
     let admission = &recovery[guard..prepare];
     assert!(admission.contains("root, &round,"));
@@ -250,6 +250,11 @@ fn recovery_source_preparation_has_its_own_authorized_storage_admission() {
     assert!(admission.contains("task_id, attempt_id: &authorization.attempt_id"),
         "source admission must use the durable root task and attempt, not a substitute identity");
     assert!(admission.contains("root.join(\".cowork-temp\"), log_dir.clone()"));
+    assert!(recovery[prepare..].contains("round: &round, task_id, attempt_id: &authorization.attempt_id, purpose: \"record\""),
+        "source owner receipt must inherit the same actual round/task/authorization attempt");
+    let preparation = item(&close, "fn prepare_record_gate_source(");
+    assert!(preparation.contains("CollectSourceSnapshot::new_owned(root, &head, permit, owner)?"));
+
 }
 
 #[test]

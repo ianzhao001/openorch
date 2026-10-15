@@ -445,3 +445,27 @@ commands:
     )
     .is_err());
 }
+
+#[test]
+fn compile_unit_seed_digest_binds_library_selector_and_committed_prefix() {
+    let repo = TestRepo::new();
+    let binding = "commands:\n  seedTargets: {argv: [cargo, test, --all-features, --locked]}\n";
+    let base = commit_binding(repo.path(), binding);
+    let lib = ResolvedCommandArgvV1 {
+        command_ref: "seedTargets".into(), binding_command_ref: "seedTargets".into(),
+        derived_argv: ["-p", "orch-host", "--lib"].map(str::to_string).to_vec(),
+    };
+    let digest = resolved_command_argv_digest_at_policy_base(repo.path(), &base, &[lib.clone()]).unwrap();
+    for args in [vec!["-p", "orch-core", "--lib"], vec!["-p", "orch-host", "--test", "contract"]] {
+        let mut other = lib.clone(); other.derived_argv = args.into_iter().map(str::to_string).collect();
+        assert_ne!(resolved_command_argv_digest_at_policy_base(repo.path(), &base, &[other]).unwrap(), digest);
+    }
+    let mut missing = lib.clone(); missing.derived_argv.clear();
+    assert!(resolved_command_argv_digest_at_policy_base(repo.path(), &base, &[missing]).is_err());
+    let mut closure = lib.clone(); closure.command_ref = "sourceReaderClosure".into();
+    assert!(resolved_command_argv_digest_at_policy_base(repo.path(), &base, &[closure]).is_err());
+    fs::write(repo.path().join("coordination/PROJECT-BINDING.yaml"), binding.replace("cargo, test", "changed, test")).unwrap();
+    assert_eq!(resolved_command_argv_digest_at_policy_base(repo.path(), &base, &[lib.clone()]).unwrap(), digest);
+    let changed = commit_binding(repo.path(), &binding.replace("cargo, test", "changed, test"));
+    assert_ne!(resolved_command_argv_digest_at_policy_base(repo.path(), &changed, &[lib]).unwrap(), digest);
+}

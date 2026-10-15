@@ -263,6 +263,16 @@ fn append_generic_review(
 /// Run the real manual lifecycle with synthetic review facts and local fixture gates.
 /// The original recovery branch remains intact; the normal branch adds live-site GC protection.
 pub fn exercise(recover_post_merge: bool, after_seal: impl FnOnce(&Path, &Path)) {
+    exercise_inner(recover_post_merge, false, after_seal)
+}
+
+/// Opt-in real failed collect/retry before the unchanged complete Recorded lifecycle.
+#[allow(dead_code)] // Other fixture consumers keep the original default lifecycle.
+pub fn exercise_with_failed_collection(after_seal: impl FnOnce(&Path, &Path)) {
+    exercise_inner(false, true, after_seal)
+}
+
+fn exercise_inner(recover_post_merge: bool, fail_collect: bool, after_seal: impl FnOnce(&Path, &Path)) {
     let root = temp_root();
     fs::create_dir_all(root.join("coordination/runtime")).unwrap();
     fs::create_dir_all(root.join("src")).unwrap();
@@ -278,7 +288,17 @@ pub fn exercise(recover_post_merge: bool, after_seal: impl FnOnce(&Path, &Path))
     .unwrap();
     fs::write(
         root.join("coordination/PROJECT-BINDING.yaml"),
-        fixture_binding(recover_post_merge),
+        {
+            let text = fixture_binding(recover_post_merge);
+            if fail_collect {
+                let mut binding: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+                binding["commands"]["check"]["argv"] = serde_yaml::to_value(vec![
+                    "/bin/test".to_string(), "!".into(), "-e".into(),
+                    root.join("coordination/runtime/fail-collect-once").to_string_lossy().into_owned(),
+                ]).unwrap();
+                serde_yaml::to_string(&binding).unwrap()
+            } else { text }
+        },
     )
     .unwrap();
     fs::write(
@@ -375,6 +395,14 @@ requiredEvidence: [proof]\n\
         ],
     );
     let candidate = git(&worktree, &["rev-parse", "HEAD"]);
+    if fail_collect {
+        let marker = root.join("coordination/runtime/fail-collect-once");
+        fs::write(&marker, "intentional fixture gate failure").unwrap();
+        assert!(orch_host::tierf::run_await(&root, "B901", 10, None).is_err());
+        let failed = orch_core::read_ledger(&root.join("coordination/rounds/r83/events.jsonl")).unwrap();
+        assert!(failed.events.iter().any(|e| e.kind == "ReportCollectReleased"));
+        fs::remove_file(marker).unwrap();
+    }
     let collected = orch_host::tierf::run_await(&root, "B901", 10, None).unwrap();
     assert!(matches!(
         collected,

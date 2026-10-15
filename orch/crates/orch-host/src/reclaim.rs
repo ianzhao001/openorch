@@ -900,6 +900,9 @@ pub struct MaintenanceReport {
     pub removed_logical_bytes: u64,
     /// Failure to preserve the latest report; outcomes still remain available to the caller.
     pub report_error: Option<String>,
+    /// Whole-project allocated bytes and retention policy; absent for legacy projects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_storage: Option<serde_json::Value>,
 }
 
 const MAINTENANCE_REPORT: &str = "coordination/runtime/storage-maintenance/latest.json";
@@ -1317,6 +1320,12 @@ fn inspect_legacy(root: &Path, selected: Option<&str>, dry_run: bool) -> Vec<Mai
             if !visited.insert(site.site_id.clone()) {
                 continue;
             }
+            let retained = crate::storage_policy::retained_worktree_reason(root, &round.round, &root.join(&site.worktree));
+            if let Some(reason) = match retained { Ok(reason) => reason, Err(e) => Some(format!("storage policy cannot classify worktree: {e:#}")) } {
+                items.push(MaintenanceItem::held(format!("{}/{}",round.round,site.site_id),
+                    "site",vec![root.join(&site.worktree),root.join(&site.target)],reason));
+                continue;
+            }
             let members = round.sites.iter().filter(|peer| {
                 site.role == crate::sites::SiteRole::Implement
                     && peer.identity() == site.identity()
@@ -1725,7 +1734,12 @@ fn finish_maintenance_report(
         unmeasured_boundaries,
         removed_logical_bytes,
         report_error: None,
+        project_storage: None,
     };
+    match crate::storage_policy::maintenance_assessment(root) {
+        Ok(v) => report.project_storage = v,
+        Err(e) => report.report_error = Some(format!("storage policy assessment failed: {e:#}")),
+    }
     if !dry_run {
         if let Err(e) =
             validate_storage_root(root).and_then(|_| save_maintenance_report(root, &report))
@@ -1756,6 +1770,7 @@ pub fn maintain_storage_for_round(
     dry_run: bool,
 ) -> Result<MaintenanceReport> {
     validate_storage_root(root)?;
+    if !dry_run { crate::storage_policy::activate(root)?; }
     if selected.is_some_and(|r| !safe_round_name(r)) {
         bail!("unsafe maintenance round filter");
     }
@@ -2060,6 +2075,90 @@ mod tests {
         }
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         rows
+    }
+
+    fn retained_policy_fixture(tag: &str) -> (PathBuf, crate::sites::Site) {
+        let (root, site, mut events) = maintenance_fixture(tag);
+        for event in &mut events {
+            event.round = Some("r95".into());
+            if let Some(payload)=event.payload.as_mut() {
+                if let Some(path)=payload.get("outputPath").and_then(|v|v.as_str()) {
+                    payload["outputPath"]=serde_json::json!(path.replace("/rMaint/","/r95/"));
+                }
+            }
+        }
+        fs::rename(root.join("coordination/runtime/review-inbox/rMaint"),root.join("coordination/runtime/review-inbox/r95")).unwrap();
+        fs::remove_dir_all(root.join("coordination/rounds/rMaint")).unwrap();
+        write_maintenance_events(&root, "r95", &events);
+        fs::create_dir_all(root.join("coordination/runtime")).unwrap();
+        fs::write(root.join("coordination/runtime/CURRENT-ROUND"), "r97\n").unwrap();
+        fs::write(root.join("coordination/STORAGE-POLICY.yaml"),
+            "schemaVersion: 1\nmaxAllocatedBytes: 50000000000\nkeepRecentRounds: 3\n").unwrap();
+        (root, site)
+    }
+
+    #[test]
+    fn project_retention_holds_existing_gc_and_direct_reaper_but_allows_old_or_target_only() {
+        for direct in [false, true] {
+            let (root, site) = retained_policy_fixture("policy-retains-existing-reapers");
+            let ledger = root.join("coordination/rounds/r95/events.jsonl");
+            let bytes = fs::read(&ledger).unwrap();
+            if direct {
+                let result = crate::sites::reap_released_sites(&root, "r95").unwrap();
+                assert!(result.refused.iter().any(|s|s.contains("retained round")), "{result:?}");
+            } else {
+                let preview = maintain_storage(&root, true).unwrap();
+                assert!(preview.items.iter().any(|i|i.reason.contains("retained round")&&!i.eligible));
+                let result = maintain_storage(&root, false).unwrap();
+                assert!(result.items.iter().any(|i|i.reason.contains("retained round")));
+            }
+            assert!(root.join(&site.worktree).exists());
+            assert!(root.join(&site.target).exists());
+            assert_eq!(fs::read(ledger).unwrap(),bytes);
+            // With the same immutable ownership facts, advancing the window makes it old.
+            fs::write(root.join("coordination/runtime/CURRENT-ROUND"), "r98\n").unwrap();
+            let result = maintain_storage(&root, false).unwrap();
+            assert!(result.items.iter().any(|i|i.disposition=="removed"),"{result:?}");
+            assert!(!root.join(&site.worktree).exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+        let (root,site) = retained_policy_fixture("policy-target-only-remains-reclaimable");
+        git_test(&root,&["worktree","remove","--force",&site.worktree]);
+        let result = maintain_storage(&root,false).unwrap();
+        assert!(result.items.iter().any(|i|i.disposition=="removed"),"{result:?}");
+        assert!(!root.join(&site.target).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn direct_reaper_retains_one_worktree_without_vetoing_other_target_only_site() {
+        let (root,site)=retained_policy_fixture("policy-mixed-sites");
+        let ledger=root.join("coordination/rounds/r95/events.jsonl");
+        let mut events=read_ledger(&ledger).unwrap().events;
+        let mut extra=Vec::new();
+        for event in &events[..3] {
+            let text=serde_json::to_string(event).unwrap().replace("M1","M2");
+            let mut event: EventRecord=serde_json::from_str(&text).unwrap();
+            event.event_id=ulid::Ulid::new().to_string();
+            extra.push(event);
+        }
+        let terminal_id=extra[1].event_id.clone();
+        extra[2].payload.as_mut().unwrap()["terminationEventId"]=serde_json::json!(terminal_id);
+        let second_target=site.target.replace("M1","M2");
+        fs::create_dir_all(root.join(&second_target)).unwrap();
+        fs::write(root.join(&second_target).join("cache"),b"ended target only").unwrap();
+        fs::copy(root.join("coordination/runtime/review-inbox/r95/M1.md"),
+            root.join("coordination/runtime/review-inbox/r95/M2.md")).unwrap();
+        let closed=events.pop().unwrap();events.extend(extra);events.push(closed);
+        write_maintenance_events(&root,"r95",&events);
+        let before=fs::read(&ledger).unwrap();
+        let result=crate::sites::reap_released_sites(&root,"r95").unwrap();
+        assert!(result.refused.iter().any(|s|s.contains("M1")&&s.contains("retained round")),"{result:?}");
+        assert!(result.removed.iter().any(|s|s.contains("M2")),"{result:?}");
+        assert!(root.join(&site.worktree).exists());
+        assert!(!root.join(second_target).exists());
+        assert_eq!(fs::read(ledger).unwrap(),before);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

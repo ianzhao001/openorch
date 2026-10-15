@@ -668,6 +668,7 @@ fn run_seed_verified_locked(
 
 /// `orch round close`：核账（普通模式全 Recorded；force 仅豁免未收任务）→ DONE.md → RoundClosed → BOARD → O1
 pub fn run_close(root: &Path, force: bool, note: Option<&str>) -> Result<CloseOutcome> {
+    crate::storage_policy::guard_close(root)?;
     crate::close::with_protocol_transition(root, "orch round close", || {
         run_close_locked(root, force, note)
     })
@@ -877,6 +878,7 @@ fn close_active_task_states(
 }
 
 fn run_close_locked(root: &Path, force: bool, note: Option<&str>) -> Result<CloseOutcome> {
+    let storage_policy = crate::storage_policy::guard_close(root)?;
     if force && note.is_none_or(|value| value.trim().is_empty()) {
         bail!("round close --force 必须提供非空 note，逐条记录 FORCE-POLICY 五问结论");
     }
@@ -978,6 +980,8 @@ fn run_close_locked(root: &Path, force: bool, note: Option<&str>) -> Result<Clos
     }
 
     // 步骤 2：轮终信号 DONE.md（design/03 §4.2 步骤 8 + O4 小结落盘路径；已在=崩溃窗恢复，跳过重写）
+    if crate::storage_policy::guard_close(root)? != storage_policy { bail!("storage policy changed before DONE"); }
+    crate::storage_policy::activate(root)?;
     let final_main = gitx::rev_parse(root, "main")?;
     let short = gitx::short(&final_main).to_string();
     let dispatch_dir = root.join(format!("coordination/rounds/{round}/dispatch"));
@@ -1004,6 +1008,7 @@ fn run_close_locked(root: &Path, force: bool, note: Option<&str>) -> Result<Clos
         "frozenContractSupersessionCount": frozen_contract_supersession_count
     });
     ledger::append_checked(root, &round, |events| {
+        if crate::storage_policy::guard_close(root)? != storage_policy { bail!("storage policy changed before RoundClosed"); }
         crate::ledger::validate_runtime_event_history_v1_at_root(root, events, &round)
             .context("RoundClosed append 前 runtime V1 event contract 漂移")?;
         let current = crate::plan::require_active_round_ir(root, &round, events)?;

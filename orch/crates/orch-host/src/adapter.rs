@@ -14,6 +14,18 @@ use crate::redact;
 use anyhow::{bail, Context, Result};
 use wait_timeout::ChildExt;
 
+/// The adapter's own wait expired; keep this fact through anyhow context layers.
+#[derive(Debug)]
+pub(crate) struct AdapterTimeout;
+
+impl std::fmt::Display for AdapterTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("adapter deadline expired")
+    }
+}
+
+impl std::error::Error for AdapterTimeout {}
+
 pub struct RunResult {
     pub exit_code: i32,
     pub duration_secs: u64,
@@ -204,6 +216,12 @@ fn redact_stream<R: Read, W: Write>(input: R, output: W) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Run an adapter with a deadline and drain redacted stdout/stderr into logs.
+///
+/// A deadline error retains `AdapterTimeout` through anyhow context, after the
+/// owned child has been reaped and both log streams have drained. Spawn, wait,
+/// log and model-validation failures retain their own causes; a nonzero process
+/// exit is returned in `RunResult` rather than inferred to be a timeout.
 pub fn run(
     adapter: &str,
     prompt: &str,
@@ -251,11 +269,11 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("stderr redact 线程 panic"))?
         .context("stderr 日志打码落盘失败")?;
     if timed_out {
-        bail!(
+        return Err(anyhow::Error::new(AdapterTimeout).context(format!(
             "{adapter} 超时（>{}s）已 kill；日志: {}",
             timeout.as_secs(),
             log_path.display()
-        );
+        )));
     }
     let duration_secs = start.elapsed().as_secs();
     let evidence = extract_execution_evidence(adapter, &log_path);

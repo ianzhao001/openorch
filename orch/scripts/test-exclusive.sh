@@ -57,6 +57,10 @@ run_exact orch-cli --test wake_signal_isolation_cli four_signal_topology_cells_p
 run_exact orch-host --test gate_reap_convergence successful_kill_converges_under_pressure
 run_exact orch-host --test manual_retirement_safety_v1 manual_lifecycle_wal_and_gc_have_positive_and_negative_evidence
 
+run_exact orch-host --test storage_policy_retirement legacy_debug_retirement_requires_exact_recorded_proof
+run_exact orch-host --test storage_policy_retirement legacy_debug_retirement_recovery_rechecks_preserved_source
+run_exact orch-host --test storage_policy_retirement legacy_debug_failed_collection_kind_has_real_recorded_positive
+
 # One default-product invocation: exact tree plus the narrow standalone safety cases.
 "$cargo_bin" test -p orch-cli --no-default-features --locked --manifest-path orch/Cargo.toml --test feature_command_surface_v1 --test standalone_channel_v1
 

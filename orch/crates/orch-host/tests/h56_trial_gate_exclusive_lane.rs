@@ -1,5 +1,6 @@
 //! B329 replaces only the retired daemon station with one actual manual canary.
 //! The original four process/signal/GC stations keep their exact runner arguments.
+//! B373 adds three storage lifecycle cases without changing those original stations or canary.
 const RUNNER: &str = include_str!("../../../scripts/test-exclusive.sh");
 const CANARY: &str = include_str!("manual_retirement_safety_v1.rs");
 
@@ -12,6 +13,9 @@ fn exclusive_lane_keeps_four_original_stations_and_one_bound_manual_canary() {
         "run_exact orch-cli --test wake_signal_isolation_cli four_signal_topology_cells_pass_ten_consecutive_runs",
         "run_exact orch-host --test gate_reap_convergence successful_kill_converges_under_pressure",
         "run_exact orch-host --test manual_retirement_safety_v1 manual_lifecycle_wal_and_gc_have_positive_and_negative_evidence",
+        "run_exact orch-host --test storage_policy_retirement legacy_debug_retirement_requires_exact_recorded_proof",
+        "run_exact orch-host --test storage_policy_retirement legacy_debug_retirement_recovery_rechecks_preserved_source",
+        "run_exact orch-host --test storage_policy_retirement legacy_debug_failed_collection_kind_has_real_recorded_positive",
     ]);
     let marker = CANARY.find("#[ignore = ").expect("manual canary must stay exclusive");
     let function = CANARY.find("fn manual_lifecycle_wal_and_gc_have_positive_and_negative_evidence")

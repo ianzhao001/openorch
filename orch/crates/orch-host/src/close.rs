@@ -4225,9 +4225,10 @@ fn prepare_record_gate_source(
     root: &Path,
     worktree: &Path,
     permit: &crate::storage::StoragePermit,
+    owner: crate::storage_policy::SnapshotOwner<'_>,
 ) -> Result<(std::path::PathBuf, Option<crate::collect::CollectSourceSnapshot>)> {
     let head = gitx::rev_parse(worktree, "HEAD")?;
-    let source = crate::collect::CollectSourceSnapshot::new(root, &head, permit)?;
+    let source = crate::collect::CollectSourceSnapshot::new_owned(root, &head, permit, owner)?;
     Ok((source.path().to_path_buf(), Some(source)))
 }
 
@@ -4358,7 +4359,7 @@ fn run_record_locked(
                 },
                 &[root.join(".cowork-temp"), log_dir.clone()],
             )?;
-            prepare_record_gate_source(root, &gate_wt, &permit)?
+            prepare_record_gate_source(root, &gate_wt, &permit, crate::storage_policy::SnapshotOwner { round: &round, task_id, attempt_id: &authorization.attempt_id, purpose: "record" })?
         } else { (gate_wt.clone(), None) };
         let subject_tree_sha = gate::capture_gate_subject_tree(root, &gate_wt)?;
         let mut gates = Vec::new();
@@ -7622,7 +7623,12 @@ mod record_gate_fixed_source_tests {
         let worktree = root.join(".worktrees/B900");
         crate::gitx::worktree_add_detached(&root, &worktree, &candidate).unwrap();
         let permit = crate::storage::fixture_gate_permit(&root, &[root.clone()]);
-        let (source_path, mut source) = prepare_record_gate_source(&root, &worktree, &permit).unwrap();
+        let (source_path, mut source) = prepare_record_gate_source(&root, &worktree, &permit, crate::storage_policy::SnapshotOwner { round: "r1", task_id: "B900", attempt_id: "B900-A0001", purpose: "record" }).unwrap();
+        let receipt: serde_json::Value = serde_json::from_slice(&fs::read(source_path.with_extension("receipt.json")).unwrap()).unwrap();
+        assert_eq!(receipt["owner"]["round"],"r1");
+        assert_eq!(receipt["owner"]["attemptId"],"B900-A0001");
+        assert_eq!(receipt["owner"]["purpose"],"record");
+        assert_eq!(receipt["head"],candidate);
         let nongit = source_path.join("scratch/nongit");
         fs::create_dir_all(&nongit).unwrap();
         assert_eq!(git(&nongit, &["rev-parse", "main"]), candidate,

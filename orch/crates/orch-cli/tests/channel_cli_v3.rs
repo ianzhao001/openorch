@@ -107,10 +107,13 @@ fn fixture_with_signoff(signed: bool) -> PathBuf {
     // immutable history, but create fresh protocol inputs for this fixture.
     fs::create_dir_all(root.join("coordination/runtime")).unwrap();
 
+    // Project-specific capacity/custody belongs to the real checkout, not synthetic r9004.
+    remove_file_if_present(&root.join("coordination/STORAGE-POLICY.yaml"));
     remove_file_if_present(&root.join("coordination/agents.yaml"));
     remove_file_if_present(&root.join("coordination/harnesses.yaml"));
     remove_dir_if_present(&root.join("coordination/adapters"));
     remove_dir_if_present(&root.join("coordination/modes"));
+    assert!(!root.join("coordination/STORAGE-POLICY.yaml").exists());
     assert!(!root.join("coordination/agents.yaml").exists());
     assert!(!root.join("coordination/harnesses.yaml").exists());
     assert!(!root.join("coordination/adapters").exists());

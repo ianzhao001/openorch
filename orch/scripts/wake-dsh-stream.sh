@@ -1069,7 +1069,7 @@ if not terminal_seen:
     sys.exit(code)
 
 if final_set_error is not None:
-    diag("terminal=no cause=unresolved-final-set rc=0 exit=74 detail=" + final_set_error)
+    diag("terminal=yes cause=unresolved-final-set rc=0 exit=74 detail=" + final_set_error)
     sys.exit(74)
 
 usage = terminal_record.get("usage") if isinstance(terminal_record, dict) else None

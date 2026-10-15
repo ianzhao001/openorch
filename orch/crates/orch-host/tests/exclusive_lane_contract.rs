@@ -24,6 +24,9 @@ fn expected_cases() -> BTreeSet<String> {
         "four_signal_topology_cells_pass_ten_consecutive_runs",
         "successful_kill_converges_under_pressure",
         "manual_lifecycle_wal_and_gc_have_positive_and_negative_evidence",
+        "legacy_debug_retirement_requires_exact_recorded_proof",
+        "legacy_debug_retirement_recovery_rechecks_preserved_source",
+        "legacy_debug_failed_collection_kind_has_real_recorded_positive",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -37,6 +40,9 @@ fn expected_runner_calls() -> BTreeSet<String> {
         "run_exact orch-cli --test wake_signal_isolation_cli four_signal_topology_cells_pass_ten_consecutive_runs",
         "run_exact orch-host --test gate_reap_convergence successful_kill_converges_under_pressure",
         "run_exact orch-host --test manual_retirement_safety_v1 manual_lifecycle_wal_and_gc_have_positive_and_negative_evidence",
+        "run_exact orch-host --test storage_policy_retirement legacy_debug_retirement_requires_exact_recorded_proof",
+        "run_exact orch-host --test storage_policy_retirement legacy_debug_retirement_recovery_rechecks_preserved_source",
+        "run_exact orch-host --test storage_policy_retirement legacy_debug_failed_collection_kind_has_real_recorded_positive",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -146,7 +152,7 @@ fn binding_runner_allowlist_and_ignore_markers_are_exact() {
 
     let calls = runner_calls();
     let call_set = calls.iter().cloned().collect::<BTreeSet<_>>();
-    assert_eq!(calls.len(), 5, "runner must contain exactly five calls");
+    assert_eq!(calls.len(), 8, "runner must contain exactly eight calls");
     assert_eq!(call_set.len(), calls.len(), "runner calls must be unique");
     assert_eq!(call_set, expected_runner_calls());
     let runner_names = calls
@@ -158,8 +164,8 @@ fn binding_runner_allowlist_and_ignore_markers_are_exact() {
     let marker_set = markers.iter().cloned().collect::<BTreeSet<_>>();
     assert_eq!(
         markers.len(),
-        5,
-        "there must be exactly five ignore markers"
+        8,
+        "there must be exactly eight ignore markers"
     );
     assert_eq!(
         marker_set.len(),

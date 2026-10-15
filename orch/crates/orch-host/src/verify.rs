@@ -11533,9 +11533,10 @@ fn prepare_root_gate_source(
     root: &Path,
     worktree: &Path,
     permit: &crate::storage::StoragePermit,
+    owner: crate::storage_policy::SnapshotOwner<'_>,
 ) -> Result<(std::path::PathBuf, Option<collect::CollectSourceSnapshot>)> {
     let head = crate::gitx::rev_parse(worktree, "HEAD")?;
-    let source = collect::CollectSourceSnapshot::new(root, &head, permit)?;
+    let source = collect::CollectSourceSnapshot::new_owned(root, &head, permit, owner)?;
     Ok((source.path().to_path_buf(), Some(source)))
 }
 
@@ -11567,7 +11568,7 @@ fn run_verdict_gates(
         let permit = crate::storage::guard_gate_operation(root, round,
             ledger::GateAuditIdentity::Attempt { task_id, attempt_id },
             &[root.join(".cowork-temp"), log_dir.clone()])?;
-        prepare_root_gate_source(root, &original_wt, &permit)?
+        prepare_root_gate_source(root, &original_wt, &permit, crate::storage_policy::SnapshotOwner { round, task_id, attempt_id, purpose: "root-verdict" })?
     } else { (original_wt, None) };
     let subject_tree_sha = gate::capture_gate_subject_tree(root, &wt)?;
     let mut results = Vec::with_capacity(names.len());
@@ -15792,7 +15793,12 @@ mod root_gate_fixed_source_tests {
         let worktree = root.join(".worktrees/B900");
         crate::gitx::worktree_add_detached(&root, &worktree, &candidate).unwrap();
         let permit = crate::storage::fixture_gate_permit(&root, &[root.clone()]);
-        let (source_path, mut source) = prepare_root_gate_source(&root, &worktree, &permit).unwrap();
+        let (source_path, mut source) = prepare_root_gate_source(&root, &worktree, &permit, crate::storage_policy::SnapshotOwner { round: "r1", task_id: "B900", attempt_id: "B900-A0001", purpose: "root-verdict" }).unwrap();
+        let receipt: serde_json::Value = serde_json::from_slice(&fs::read(source_path.with_extension("receipt.json")).unwrap()).unwrap();
+        assert_eq!(receipt["owner"]["round"],"r1");
+        assert_eq!(receipt["owner"]["attemptId"],"B900-A0001");
+        assert_eq!(receipt["owner"]["purpose"],"root-verdict");
+        assert_eq!(receipt["head"],candidate);
         let nested = root.join(".cowork-temp/nested");
         fs::create_dir_all(nested.parent().unwrap()).unwrap();
         git(&root, &["clone", "-q", source_path.to_str().unwrap(), nested.to_str().unwrap()]);

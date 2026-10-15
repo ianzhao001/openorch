@@ -6,7 +6,19 @@ This file records the public OpenOrch release line. Internal selfhost rounds, ta
 
 ## 中文
 
-### [v0.1.0-alpha.14](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.14) — 2026-09-22
+### Unreleased — 2026-10-15 源码同步
+
+本次更新公开 main 的产品源码与文档；不创建新版本标签，不替换已发布包。
+
+- Consult 保留适配器的类型化超时事实，避免将其它失败按耗时误判为超时。
+- DSH 最终答卷集合未通过校验时，保留已经观察到的原生终态，仍以退出码 74 拒绝成功。
+- `orch-ui` 按 grapheme 显示列宽裁切文本。
+- **仅 selfhost**：增加可选项目存储策略，按 allocated bytes 计量并对设备/inode 去重，包含项目内归档和备份；支持最近轮次保留窗口及闭轮前容量检查。
+- **仅 selfhost**：精确清理要求固定路径身份、完整源/Git 备份、实际恢复验证和当前无占用证据；支持 FIFO 元数据保全及中断恢复，归属声明不授予删除权限。
+- **仅 selfhost**：编译失败种子支持绑定的 library 目标选择和已签核的 selfhost 预构建。
+- README 区分当前源码、alpha.14 源码标签与 alpha.13 历史安装包；移除不存在的 alpha.14 附件下载命令。
+
+### [v0.1.0-alpha.14](https://github.com/ianzhao001/openorch/tree/v0.1.0-alpha.14) — 2026-09-22
 
 - DSH 包白名单补齐 `AGENTS.md`，使实际 materialized 包覆盖完整发布清单
 
@@ -93,7 +105,19 @@ OpenOrch 现在提供 Codex Desktop 与 DSH Web 共用的插件包。核心版�
 
 ## English
 
-### [v0.1.0-alpha.14](https://github.com/ianzhao001/openorch/releases/tag/v0.1.0-alpha.14) — 2026-09-22
+### Unreleased — source sync, 2026-10-15
+
+Updates public main's product source and documentation; creates no new version tag and replaces no release bundle.
+
+- Preserve typed adapter timeout facts through Consult errors rather than infer timeout from elapsed duration.
+- Preserve DSH's observed native terminal fact when final-answer-set validation fails; success is still refused with exit 74.
+- Clip `orch-ui` text by grapheme display width.
+- **Selfhost only:** optional project storage policy with allocated-byte accounting, device/inode deduplication, on-project archives/backups, recent-round retention and a pre-close capacity check.
+- **Selfhost only:** exact retirement requires fixed path identity, complete source/Git preservation, verified recovery and current-use checks; preserve FIFO metadata and interrupted-operation recovery. Custody declarations do not grant deletion authority.
+- **Selfhost only:** compile-red seeds support a bound library selector and signed selfhost prebuild.
+- Distinguish current source, the alpha.14 source tag and the historical alpha.13 bundle in README; remove nonexistent alpha.14 asset download commands.
+
+### [v0.1.0-alpha.14](https://github.com/ianzhao001/openorch/tree/v0.1.0-alpha.14) — 2026-09-22
 
 - Includes `AGENTS.md` in the DSH package allowlist so materialized files cover the full release inventory
 
